@@ -3,10 +3,23 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "control-frequency-wm"
+name = "wm-adapter-freq"
 version = "0.1.0"
-description = "Control-relevant visual adaptation for latent world models"
+description = "Sequence-Stable Adaptive DCT Adapter for latent world models"
+readme = "README.md"
 requires-python = ">=3.10,<3.11"
+dependencies = [
+    "einops>=0.8",
+    "h5py>=3.10",
+    "hydra-core>=1.3",
+    "numpy>=1.26",
+    "omegaconf>=2.3",
+    "stable-pretraining==0.1.8",
+    "torch>=2.13",
+    "torchvision>=0.28",
+    "tqdm>=4.66",
+    "transformers==5.14.1",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -1,0 +1,25 @@
+backend: prejepa
+base_model_ref: tworoom_prejepa
+cache_path: data/features/prejepa_tworoom.h5
+output_path: checkpoints/adapters/prejepa_tworoom.pt
+adapter_config_path: configs/adapter/sequence_stable_dct.yaml
+identity_probability: 0.2
+canonical_weight: 1.0
+dynamics_weight: 1.0
+
+batch_size: 4
+gradient_accumulation: 8
+epochs: 30
+precision: fp16
+lr: 1.0e-3
+weight_decay: 1.0e-4
+gradient_clip_norm: 1.0
+num_workers: 4
+seed: 42
+device: cuda
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: outputs/hydra/train_prejepa

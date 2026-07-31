@@ -1,71 +1,37 @@
-# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
 build/
 dist/
 
-# IDE
 .vscode/
 .idea/
 
-# Experiment artifacts
 data/
 checkpoints/
 outputs/
 storage/
-
-# Third-party source is pinned separately
 third_party/
-
-# ML logging
 wandb/
 .wandb/
 lightning_logs/
 
-# Hydra
 .hydra/
 multirun/
 
-# Local files
 .env
 *.log
 .DS_Store
 
-# Third-party repositories
-third_party/
-
-# Datasets and caches
-data/
-storage/
 *.lance/
 *.h5
 *.hdf5
 *.npz
 *.mp4
 
-# Model weights
-checkpoints/
 *.pt
 *.pth
 *.ckpt
 *.safetensors
 
-# Experiment outputs
-outputs/
 runs/
-wandb/
-lightning_logs/
-multirun/
-
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-build/
-dist/
-
-# Local configuration
-.env
-.vscode/
-.idea/

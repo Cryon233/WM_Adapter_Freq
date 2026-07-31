@@ -1,0 +1,17 @@
+backend: prejepa
+base_model_ref: tworoom_prejepa
+dataset_name: tworoom.h5
+dataset_cache_dir: null
+output_path: data/features/prejepa_tworoom.h5
+max_windows: 100000
+encoder_batch_size: 8
+num_workers: 4
+seed: 42
+device: cuda
+image_size: 224
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: outputs/hydra/cache_prejepa

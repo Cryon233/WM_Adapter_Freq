@@ -1,0 +1,13 @@
+common:
+  grid_height: 16
+  grid_width: 16
+  modulation_range: 0.5
+  eps: 1.0e-6
+
+backends:
+  prejepa:
+    embed_dim: 384
+    rank: 8
+  lewm:
+    embed_dim: 192
+    rank: 4
