@@ -9,7 +9,7 @@ from wm_adapter_freq.data.appearance_shift import (
 from wm_adapter_freq.data.paired_windows import build_image_preprocessor
 
 
-EVALUATION_PROTOCOL_VERSION = "3.0"
+EVALUATION_PROTOCOL_VERSION = "4.0"
 
 
 class FixedCurrentObservationTransform:

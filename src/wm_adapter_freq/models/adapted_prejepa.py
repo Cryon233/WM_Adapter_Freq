@@ -8,6 +8,9 @@ from wm_adapter_freq.adapters.sequence_stable_dct import (
     SequenceStableAdaptiveDCTAdapter,
 )
 from wm_adapter_freq.encoders.dinov2_split import DINOv2SplitEncoder
+from wm_adapter_freq.models.prejepa_visual_goal import (
+    visual_terminal_goal_mse,
+)
 
 
 class AdaptedPreJEPA(PreJEPA):
@@ -41,3 +44,10 @@ class AdaptedPreJEPA(PreJEPA):
             torch.cat((cls_tokens, patch_tokens), dim=2)
         )
         return final_tokens[:, :, 1:]
+
+    def criterion(
+        self,
+        info_dict: dict[str, Tensor],
+        action_candidates: Tensor,
+    ) -> Tensor:
+        return visual_terminal_goal_mse(info_dict)

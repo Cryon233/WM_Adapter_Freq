@@ -28,9 +28,9 @@ plan:
 
 cem:
   batch_size: 4
-  num_samples: 300
-  n_steps: 10
-  topk: 30
+  num_samples: 128
+  n_steps: 5
+  topk: 16
 
 eval:
   num_eval: 8

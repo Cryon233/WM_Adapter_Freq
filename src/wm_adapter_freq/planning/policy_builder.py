@@ -11,6 +11,7 @@ from wm_adapter_freq.backends.base import build_backend
 from wm_adapter_freq.data.paired_windows import build_image_preprocessor
 from wm_adapter_freq.io.adapter_checkpoint import load_adapter_checkpoint
 from wm_adapter_freq.io.fingerprint import resolve_base_model_identity
+from wm_adapter_freq.models.prejepa_visual_goal import VisualGoalPreJEPA
 from wm_adapter_freq.planning.appearance_transform import (
     FixedCurrentObservationTransform,
 )
@@ -87,11 +88,18 @@ def build_world_model(
             "Adapter checkpoint dimensions do not match the base model."
         )
 
-    model = (
-        model_backend.build_online_model(adapter)
-        if use_adapter
-        else base_model
-    )
+    if backend == "prejepa":
+        model = (
+            model_backend.build_online_model(adapter)
+            if use_adapter
+            else VisualGoalPreJEPA(base_model)
+        )
+    else:
+        model = (
+            model_backend.build_online_model(adapter)
+            if use_adapter
+            else base_model
+        )
     model.to(target_device)
     model.eval()
     setattr(model, "base_model_fingerprint", identity.combined_fingerprint)
@@ -115,9 +123,9 @@ def build_tworoom_mpc_policy(
     history_len: int = 3,
     action_block: int = 5,
     warm_start: bool = True,
-    num_samples: int = 300,
-    cem_steps: int = 10,
-    topk: int = 30,
+    num_samples: int = 128,
+    cem_steps: int = 5,
+    topk: int = 16,
     batch_size: int = 4,
     seed: int = 42,
 ) -> Any:
@@ -140,9 +148,23 @@ def build_tworoom_mpc_policy(
     if backend == "prejepa":
         cost: Any = model
         history_keys = ("pixels", "proprio")
+        planning_objective_metadata = {
+            "name": "visual_terminal_latent_mse",
+            "latent_type": "patch",
+            "goal_modalities": ["pixels"],
+            "uses_goal_proprio_in_cost": False,
+            "proprio_role": "dynamics_conditioning_only",
+        }
     else:
         cost = ShootingCostEvaluator(model, GoalMSE())
         history_keys = ("pixels",)
+        planning_objective_metadata = {
+            "name": "visual_terminal_latent_mse",
+            "latent_type": "global",
+            "goal_modalities": ["pixels"],
+            "uses_goal_proprio_in_cost": False,
+            "proprio_role": "unused",
+        }
 
     solver = CEMSolver(
         cost=cost,
@@ -196,4 +218,10 @@ def build_tworoom_mpc_policy(
         "model_variant",
         getattr(model, "model_variant"),
     )
+    setattr(
+        policy,
+        "planning_objective_metadata",
+        planning_objective_metadata,
+    )
+    setattr(policy, "planner_profile", "low_compute_16gb_v1")
     return policy

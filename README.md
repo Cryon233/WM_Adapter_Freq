@@ -125,13 +125,24 @@ python scripts/train_adapter.py \
 
 ## TwoRoom clean 与在线 OOD MPC
 
-规划继续使用上游 `CEMSolver`、`WorldModelPolicy` 和 `PlanConfig`。默认 `history_len=3`、`action_block=5`、`horizon=5`、`receding_horizon=1`；PreJEPA history keys 为 pixels/proprio，LeWM 为 pixels。base 对照使用完全未挂载 Adapter 的原始基础模型，adapter 条件使用训练后的 Adapter；两者都从同一 Adapter checkpoint 恢复 fingerprint、normalization 和训练 appearance 元数据。
+规划继续使用上游 `CEMSolver`、`WorldModelPolicy` 和 `PlanConfig`。默认 `history_len=3`、`action_block=5`、`horizon=5`、`receding_horizon=1`；PreJEPA history keys 为 pixels/proprio，LeWM 为 pixels。base 对照不挂载 Adapter，adapter 条件使用训练后的 Adapter；两者都从同一 Adapter checkpoint 恢复 fingerprint、normalization 和训练 appearance 元数据。
 
-最终 evaluation protocol 版本为 `3.0`：current-only fixed appearance shift、clean goal、base/adapter 直接对照、episode-disjoint Adapter 训练与评估，以及 held-out episode-balanced evaluation。planning 默认 `appearance.seed: 2026`，它与训练 cache 的 seed 42 分离，用来定义默认未见测试域。修改 `appearance.seed` 可以生成其他固定 OOD 域；比较不同 backend、base 和 adapter 时必须使用相同的 `appearance.seed`。
+两个 backend 统一采用 visual-only terminal latent MSE。PreJEPA cost 只比较最后预测时刻的 patch-level pixel latent 与 clean goal pixel latent；current proprio 和 action 仍作为冻结 predictor 的动力学条件。`goal_proprio` 只用于 `_set_goal_state` 设置 TwoRoom 真实环境目标并满足上游接口，不进入 world-model planning cost。LeWM 继续通过 `GoalMSE` 比较 global visual latent。
+
+最终 evaluation protocol 版本为 `4.0`：current-only fixed appearance shift、clean image goal、visual-only terminal latent MSE、goal proprio 不进入 cost、PreJEPA current proprio 仅作 dynamics conditioning、base/adapter 直接对照、episode-disjoint Adapter 训练与评估、held-out episode-balanced evaluation，以及 `low_compute_16gb_v1` CEM 预算。planning 默认 `appearance.seed: 2026`，它与训练 cache 的 seed 42 分离，用来定义默认未见测试域。修改 `appearance.seed` 可以生成其他固定 OOD 域；比较不同 backend、base 和 adapter 时必须使用相同的 `appearance.seed`。
 
 同一次规划运行中的所有环境、episode、history 帧和 current observation 复用同一个 `AppearanceShiftSpec`。appearance shift 在 policy 的 current pixels transform 中、标准 resize 和 ImageNet normalization 之前执行，因此 dataset-driven evaluation 注入的第一帧和后续环境帧都会且只会被处理一次。goal 使用独立的 clean 标准预处理器，不经过 appearance shift。
 
 规划从 Adapter checkpoint 恢复 episode split 配置并重新得到 held-out eval partition，只在其中筛选长度满足 goal offset 的 episode。随后无放回选择不同 eval episode，并从每个 episode 的合法范围随机选择一个 start step；传给上游 `World.evaluate` 的是 dataset episode 索引，而不是数据列中的 ID。`results.json` 会记录完整 episode split 摘要、实际 eval episode 索引、start steps、goal offset、评估预算和 evaluation seed。
+
+面向 RTX 5070 Ti 16GB 的默认 CEM 配置：
+
+| 后端 | batch size | num samples | CEM steps | top-k |
+|---|---:|---:|---:|---:|
+| PreJEPA | 1 | 128 | 5 | 16 |
+| LeWM | 4 | 128 | 5 | 16 |
+
+两个 backend 的每环境搜索预算完全相同。`batch_size` 只表示 CEM 同时处理的环境数量；PreJEPA 每个候选包含 3×256 个 patch tokens，因此使用 1，LeWM 的 global latent 较小，因此保留 4。本次规划协议修改不改变 Adapter checkpoint，不需要重新构建 feature cache 或重新训练 Adapter，已有 checkpoint 可直接用于 protocol v4。
 
 ### PreJEPA 四个条件
 
@@ -239,19 +250,19 @@ python scripts/plan.py \
 ```text
 outputs/plan/prejepa_tworoom/
 ├── base/
-│   ├── clean/protocol_v3/eval_seed42/results.json
-│   └── composed_severity1p0_seed2026/protocol_v3/eval_seed42/results.json
+│   ├── clean/protocol_v4/eval_seed42/results.json
+│   └── composed_severity1p0_seed2026/protocol_v4/eval_seed42/results.json
 └── adapter/
-    ├── clean/protocol_v3/eval_seed42/results.json
-    └── composed_severity1p0_seed2026/protocol_v3/eval_seed42/results.json
+    ├── clean/protocol_v4/eval_seed42/results.json
+    └── composed_severity1p0_seed2026/protocol_v4/eval_seed42/results.json
 
 outputs/plan/lewm_tworoom/
 ├── base/
-│   ├── clean/protocol_v3/eval_seed42/results.json
-│   └── composed_severity1p0_seed2026/protocol_v3/eval_seed42/results.json
+│   ├── clean/protocol_v4/eval_seed42/results.json
+│   └── composed_severity1p0_seed2026/protocol_v4/eval_seed42/results.json
 └── adapter/
-    ├── clean/protocol_v3/eval_seed42/results.json
-    └── composed_severity1p0_seed2026/protocol_v3/eval_seed42/results.json
+    ├── clean/protocol_v4/eval_seed42/results.json
+    └── composed_severity1p0_seed2026/protocol_v4/eval_seed42/results.json
 ```
 
 配置中的 `seed` 是 evaluation seed，同时控制 episode/start 选择、CEM 和 Torch 随机数。不同 seed 写入不同目录，不会互相覆盖，例如：
@@ -270,4 +281,4 @@ python scripts/plan.py \
     seed=43
 ```
 
-默认 `output.video=false`，因为上游 panel video 显示环境 clean render，而 appearance shift 发生在 policy input 中；`results.json` 的评价使用真实 shifted policy input，当前版本不把模型看到的 OOD 图像写入 panel video。结果还记录 model variant、基础模型 fingerprint、Adapter checkpoint、训练数据选择摘要、episode split、实际 held-out 评估样本、训练/评估 appearance 域、evaluation protocol version、planning 配置和 CEM 配置。数据、checkpoint 与规划输出均由 `.gitignore` 排除。
+默认 `output.video=false`，因为上游 panel video 显示环境 clean render，而 appearance shift 发生在 policy input 中；`results.json` 的评价使用真实 shifted policy input，当前版本不把模型看到的 OOD 图像写入 panel video。结果还记录 planning objective、planner profile、model variant、基础模型 fingerprint、Adapter checkpoint、训练数据选择摘要、episode split、实际 held-out 评估样本、训练/评估 appearance 域、evaluation protocol version、planning 配置和 CEM 配置。数据、checkpoint 与规划输出均由 `.gitignore` 排除。

@@ -217,6 +217,11 @@ def main(cfg: DictConfig) -> None:
         "output_directory": str(run_dir),
         "model_variant": model_variant,
         "use_adapter": bool(cfg.model.use_adapter),
+        "planning_objective": getattr(
+            policy,
+            "planning_objective_metadata",
+        ),
+        "planner_profile": getattr(policy, "planner_profile"),
         "evaluation_protocol_version": EVALUATION_PROTOCOL_VERSION,
         "evaluation_seed": int(cfg.seed),
         "evaluation_samples": {
