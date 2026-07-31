@@ -109,14 +109,22 @@ class SequenceStableAdaptiveDCTAdapter(PEFTMethod):
         )
         sequence_logits = frame_logits.mean(dim=1, keepdim=True)
         mask = 1.0 + self.mask_scale * torch.tanh(sequence_logits)
-        adapted = coefficients.float().reshape(
+        coefficient_grid = coefficients.float().reshape(
             batch, time, dimension, self.grid_height, self.grid_width
-        ) * mask
-        reconstructed = self.dct.inverse(
-            adapted.reshape(batch * time, dimension, self.grid_height, self.grid_width)
         )
-        reconstructed = reconstructed.reshape(batch * time, dimension, patches).transpose(1, 2)
-        return reconstructed.reshape(batch, time, patches, dimension).to(dtype=patch_tokens.dtype)
+        delta_coefficients = coefficient_grid * (mask - 1.0)
+        # Inverse-transform only the learned frequency delta so zero initialization is exactly identity.
+        delta = self.dct.inverse(
+            delta_coefficients.reshape(
+                batch * time,
+                dimension,
+                self.grid_height,
+                self.grid_width,
+            )
+        )
+        delta = delta.reshape(batch * time, dimension, patches).transpose(1, 2)
+        delta = delta.reshape(batch, time, patches, dimension)
+        return patch_tokens + delta.to(dtype=patch_tokens.dtype)
 
     def forward(self, patch_tokens: Tensor) -> Tensor:
         return self.apply_patch_tokens(patch_tokens)

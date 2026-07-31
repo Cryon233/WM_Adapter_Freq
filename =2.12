@@ -1,0 +1,5 @@
+Looking in indexes: https://pypi.mirrors.ustc.edu.cn/simple/
+Collecting pybind11
+  Downloading pybind11-3.0.4-py3-none-any.whl (314 kB)
+Installing collected packages: pybind11
+Successfully installed pybind11-3.0.4

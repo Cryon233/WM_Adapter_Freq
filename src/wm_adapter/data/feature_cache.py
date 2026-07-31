@@ -21,7 +21,7 @@ FEATURE_KEYS = (
     "clean_future_latent",
 )
 ARRAY_KEYS = FEATURE_KEYS + ("actions", "episode_id", "window_id", "appearance_seed")
-CACHE_SCHEMA_VERSION = "jepa_wm_robocasa_feature_cache_v1"
+CACHE_SCHEMA_VERSION = "jepa_wm_robocasa_feature_cache_v2"
 
 
 def _json_value(value: Any) -> str:
@@ -46,7 +46,11 @@ class FeatureCacheWriter:
 
     @staticmethod
     def _dtype_for(key: str) -> np.dtype[Any]:
-        if key in FEATURE_KEYS:
+        # Prefix tokens are taken before the final DINOv3 block/norm and can
+        # exceed the finite fp16 range. Store them losslessly in float32.
+        if key in {"clean_prefix_tokens", "ood_prefix_tokens"}:
+            return np.dtype(np.float32)
+        if key in {"clean_context_final_latent", "clean_future_latent"}:
             return np.dtype(np.float16)
         if key == "actions":
             return np.dtype(np.float32)
