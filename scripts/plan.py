@@ -99,6 +99,7 @@ def main() -> None:
         "cache_fingerprint": cache_fingerprint,
         "upstream_commits": backend.upstream_commits,
         "training_appearance": training_appearance,
+        "planning_history_len": int(cfg.planning.history_len),
         "cem": {
             **OmegaConf.to_container(
                 backend.official_planning_template.planner,

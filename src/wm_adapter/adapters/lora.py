@@ -27,10 +27,10 @@ class FusedQKVLoRA(nn.Module):
         self.out_features = 3 * embed_dim
         self.rank = rank
         self.scaling = alpha / rank
-        self.q_a = nn.Parameter(torch.empty(rank, embed_dim))
-        self.q_b = nn.Parameter(torch.zeros(embed_dim, rank))
-        self.v_a = nn.Parameter(torch.empty(rank, embed_dim))
-        self.v_b = nn.Parameter(torch.zeros(embed_dim, rank))
+        self.q_a = nn.Parameter(torch.empty(rank, embed_dim, device=weight.device, dtype=weight.dtype))
+        self.q_b = nn.Parameter(torch.zeros(embed_dim, rank, device=weight.device, dtype=weight.dtype))
+        self.v_a = nn.Parameter(torch.empty(rank, embed_dim, device=weight.device, dtype=weight.dtype))
+        self.v_b = nn.Parameter(torch.zeros(embed_dim, rank, device=weight.device, dtype=weight.dtype))
         nn.init.kaiming_uniform_(self.q_a, a=math.sqrt(5))
         nn.init.kaiming_uniform_(self.v_a, a=math.sqrt(5))
         for parameter in self.base_projection.parameters():
@@ -68,6 +68,7 @@ class LastBlockAttentionLoRA(PEFTMethod):
         self.alpha = alpha
         self.dropout = dropout
         self.qkv_lora: FusedQKVLoRA | None = None
+        self.attach_identity_max_abs_error: float | None = None
 
     def attach_backend(self, backend: nn.Module) -> None:
         attention = backend.last_block.attn
@@ -79,7 +80,40 @@ class LastBlockAttentionLoRA(PEFTMethod):
             if attention.qkv is not self.qkv_lora:
                 raise RuntimeError("The DINOv3 last block is already attached to another LoRA method")
             return
-        self.qkv_lora = FusedQKVLoRA(attention.qkv, self.embed_dim, self.rank, self.alpha)
+        original_qkv = attention.qkv
+        qkv_lora = FusedQKVLoRA(original_qkv, self.embed_dim, self.rank, self.alpha)
+        weight = original_qkv.weight
+        probe = torch.linspace(
+            -1.0,
+            1.0,
+            steps=2 * 3 * self.embed_dim,
+            device=weight.device,
+            dtype=weight.dtype,
+        ).reshape(2, 3, self.embed_dim)
+        with torch.no_grad():
+            original_output = original_qkv(probe)
+            lora_output = qkv_lora(probe)
+        if original_output.shape != lora_output.shape:
+            raise RuntimeError(
+                "LoRA QKV identity shape mismatch before attachment: "
+                f"original={tuple(original_output.shape)}, lora={tuple(lora_output.shape)}"
+            )
+        low_precision = weight.dtype in {torch.float16, torch.bfloat16}
+        atol, rtol = (2.0e-3, 2.0e-3) if low_precision else (1.0e-6, 1.0e-5)
+        max_error = float((original_output.float() - lora_output.float()).abs().max().cpu())
+        if not torch.allclose(
+            original_output.float(),
+            lora_output.float(),
+            atol=atol,
+            rtol=rtol,
+        ):
+            raise RuntimeError(
+                "LoRA QKV identity failed before attachment: "
+                f"max_abs_error={max_error}, original_shape={tuple(original_output.shape)}, "
+                f"lora_shape={tuple(lora_output.shape)}, atol={atol}, rtol={rtol}"
+            )
+        self.qkv_lora = qkv_lora
+        self.attach_identity_max_abs_error = max_error
         attention.qkv = self.qkv_lora
 
     def trainable_parameters(self) -> Iterable[nn.Parameter]:

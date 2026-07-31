@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from wm_adapter.adapters.base import BaseMethod, PEFTMethod
+from wm_adapter.adapters.lora import LastBlockAttentionLoRA
 from wm_adapter.backends.jepa_wm_droid import JEPAWMDroidBackend
 from wm_adapter.utils.checkpoints import atomic_torch_save
 
@@ -91,6 +92,12 @@ class AdapterTrainer:
     def _identity_invariant(self, first_batch: dict[str, Tensor]) -> None:
         self.backend.eval()
         self.method.eval()
+        if isinstance(self.method, LastBlockAttentionLoRA):
+            error = self.method.attach_identity_max_abs_error
+            if error is None:
+                raise RuntimeError("LoRA QKV identity was not checked before attachment")
+            print(f"Identity invariant passed: method={self.method.method_name}, max_abs_error={error}")
+            return
         prefix = first_batch["ood_prefix_tokens"][:1].to(self.device, non_blocking=True).float()
         with torch.no_grad(), self._autocast():
             base_latent = self._encode_cached(prefix, BaseMethod().to(self.device))

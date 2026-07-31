@@ -52,6 +52,15 @@ def _encode_batch(
     clean_latent = backend.encode_from_prefix(
         clean_prefix, BaseMethod().to(backend.device), batch_size, sequence_length
     )
+    return _encoded_batch(batch, clean_prefix, ood_prefix, clean_latent)
+
+
+def _encoded_batch(
+    batch: dict[str, torch.Tensor],
+    clean_prefix: torch.Tensor,
+    ood_prefix: torch.Tensor,
+    clean_latent: torch.Tensor,
+) -> dict[str, torch.Tensor]:
     return {
         "clean_prefix_tokens": clean_prefix,
         "ood_prefix_tokens": ood_prefix,
@@ -62,6 +71,72 @@ def _encode_batch(
         "window_id": batch["window_id"],
         "appearance_seed": batch["appearance_seed"],
     }
+
+
+@torch.no_grad()
+def _assert_split_encoder_parity(
+    backend: JEPAWMDroidBackend,
+    images: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    normalized = backend._normalize_images(images)
+    batch_size, sequence_length = normalized.shape[:2]
+    flattened = normalized.reshape(
+        batch_size * sequence_length,
+        3,
+        backend.image_size,
+        backend.image_size,
+    )
+    official_features = backend.encoder.forward_features(flattened)
+    if not isinstance(official_features, dict) or "x_norm_patchtokens" not in official_features:
+        raise RuntimeError(
+            "Official DINOv3 forward_features did not return x_norm_patchtokens: "
+            f"type={type(official_features).__name__}"
+        )
+    official_flat = official_features["x_norm_patchtokens"]
+    expected_flat_shape = (
+        batch_size * sequence_length,
+        backend.num_patch_tokens,
+        backend.token_dim,
+    )
+    if tuple(official_flat.shape) != expected_flat_shape:
+        raise RuntimeError(
+            "Official DINOv3 patch latent shape mismatch: "
+            f"expected={expected_flat_shape}, actual={tuple(official_flat.shape)}"
+        )
+    official = official_flat.reshape(
+        batch_size,
+        sequence_length,
+        backend.num_patch_tokens,
+        backend.token_dim,
+    )
+    split_prefix = backend._encode_normalized_prefix(normalized)
+    split = backend.encode_from_prefix(
+        split_prefix,
+        BaseMethod().to(backend.device),
+        batch_size,
+        sequence_length,
+    )
+    if official.shape != split.shape:
+        raise RuntimeError(
+            "Split encoder parity shape mismatch: "
+            f"official={tuple(official.shape)}, split={tuple(split.shape)}"
+        )
+    low_precision = official.dtype in {torch.float16, torch.bfloat16} or split.dtype in {
+        torch.float16,
+        torch.bfloat16,
+    }
+    atol, rtol = (2.0e-3, 2.0e-3) if low_precision else (1.0e-6, 1.0e-5)
+    official_float = official.float()
+    split_float = split.float()
+    max_error = float((official_float - split_float).abs().max().cpu())
+    if not torch.allclose(official_float, split_float, atol=atol, rtol=rtol):
+        raise RuntimeError(
+            "Split encoder parity failed: "
+            f"max_abs_error={max_error}, official_shape={tuple(official.shape)}, "
+            f"split_shape={tuple(split.shape)}, atol={atol}, rtol={rtol}"
+        )
+    print(f"Split encoder parity passed: max_abs_error={max_error}")
+    return split_prefix, split
 
 
 def main() -> None:
@@ -116,7 +191,12 @@ def main() -> None:
     )
     iterator = iter(loader)
     first_batch = next(iterator)
-    first_encoded = _encode_batch(backend, first_batch)
+    clean_prefix, clean_latent = _assert_split_encoder_parity(
+        backend,
+        first_batch["clean_images"],
+    )
+    ood_prefix = backend.encode_prefix(first_batch["ood_images"])
+    first_encoded = _encoded_batch(first_batch, clean_prefix, ood_prefix, clean_latent)
     layout = backend.token_layout
     appearance_metadata = ComposedPhotometricShift.metadata(
         float(cfg.appearance.severity), int(cfg.appearance.training_seed)

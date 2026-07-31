@@ -239,6 +239,18 @@ class JEPAWMDroidBackend(nn.Module):
 
     def encode_prefix(self, images: Tensor) -> Tensor:
         normalized = self._normalize_images(images)
+        return self._encode_normalized_prefix(normalized)
+
+    def _encode_normalized_prefix(self, normalized: Tensor) -> Tensor:
+        if normalized.ndim != 5 or normalized.shape[2:] != (
+            3,
+            self.image_size,
+            self.image_size,
+        ):
+            raise ValueError(
+                "Preprocessed images must have shape "
+                f"[B,T,3,{self.image_size},{self.image_size}], received {tuple(normalized.shape)}"
+            )
         batch, sequence_length = normalized.shape[:2]
         flattened = rearrange(normalized, "b t c h w -> (b t) c h w")
         tokens, grid = self.encoder.prepare_tokens_with_masks(flattened)
@@ -246,7 +258,7 @@ class JEPAWMDroidBackend(nn.Module):
         if (grid_height, grid_width) != (self.grid_height, self.grid_width):
             raise RuntimeError(
                 f"DINOv3 patch grid mismatch: expected {(self.grid_height, self.grid_width)}, "
-                f"found {(grid_height, grid_width)} for images {tuple(images.shape)}"
+                f"found {(grid_height, grid_width)} for preprocessed images {tuple(normalized.shape)}"
             )
         patch_tokens = grid_height * grid_width
         prefix_tokens = tokens.shape[1] - patch_tokens

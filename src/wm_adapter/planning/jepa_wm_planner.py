@@ -101,15 +101,61 @@ def _build_official_agent(
     model: JEPAWMPlanningModel,
     dataset: Any,
     candidate_chunk_size: int,
+    history_len: int,
 ) -> Any:
     from evals.simu_env_planning.planning.gc_agent import GC_Agent
     from evals.simu_env_planning.planning.planning.planner import CEMPlanner
 
-    class FixedGoalAgent(GC_Agent):
+    class HistoryAwareFixedGoalAgent(GC_Agent):
+        def __init__(self, *args: Any, current_history_len: int, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            if current_history_len != 3:
+                raise ValueError(
+                    "RoboCasa sequence-shared planning requires planning.history_len=3, "
+                    f"received {current_history_len}"
+                )
+            self.current_history_len = current_history_len
+            self._current_history: list[Tensor] = []
+
         @torch.no_grad()
         def set_goal(self, goal_state: Tensor) -> None:
+            self._current_history.clear()
             with self.model.goal_encoding():
                 super().set_goal(goal_state)
+
+        @torch.no_grad()
+        def act(self, obs: Tensor, steps_left: int | None = None) -> Tensor:
+            if self.cfg.task_specification.obs != "rgb":
+                raise ValueError(
+                    "History-aware RoboCasa planning requires task_specification.obs=rgb, "
+                    f"received {self.cfg.task_specification.obs!r}"
+                )
+            if obs.ndim != 4 or obs.shape[1] != 3:
+                raise ValueError(
+                    "Current RGB observation must have shape [T,3,H,W], "
+                    f"received {tuple(obs.shape)}"
+                )
+            current = obs[-1].detach().clone()
+            self._current_history.append(current)
+            self._current_history = self._current_history[-self.current_history_len :]
+            history = [self._current_history[0]] * (
+                self.current_history_len - len(self._current_history)
+            ) + self._current_history
+            observations = torch.stack(history, dim=0).unsqueeze(0)
+            expected = (
+                1,
+                self.current_history_len,
+                3,
+                int(current.shape[-2]),
+                int(current.shape[-1]),
+            )
+            if tuple(observations.shape) != expected:
+                raise RuntimeError(
+                    f"Planning current history has shape {tuple(observations.shape)}, expected {expected}"
+                )
+            observations = observations.to(self.device, non_blocking=True)
+            latent = self.model.encode(observations, act=True)
+            return self.plan(latent, steps_left=steps_left).cpu()
 
     class CandidateChunkedCEMPlanner(CEMPlanner):
         def __init__(self, *args: Any, chunk_size: int, **kwargs: Any) -> None:
@@ -132,7 +178,13 @@ def _build_official_agent(
                 )
             return result
 
-    agent = FixedGoalAgent(cfg, model, dset=dataset, preprocessor=model.preprocessor)
+    agent = HistoryAwareFixedGoalAgent(
+        cfg,
+        model,
+        dset=dataset,
+        preprocessor=model.preprocessor,
+        current_history_len=history_len,
+    )
     planner_values = OmegaConf.to_container(cfg.planner, resolve=True)
     if not isinstance(planner_values, dict):
         raise TypeError(f"Planner config must be a mapping, found {type(planner_values).__name__}")
@@ -198,7 +250,7 @@ def run_robocasa_planning(
         task_name=str(experiment_config.data.task_name),
         camera_view=str(experiment_config.data.camera_view),
         output_environment_info=True,
-        transform=backend.preprocessor.transform,
+        transform=None,
     )
     _, evaluation_episodes = split_episode_indices(
         len(source_dataset),
@@ -220,6 +272,7 @@ def run_robocasa_planning(
         planning_model,
         dataset,
         int(experiment_config.planning.candidate_chunk_size),
+        int(experiment_config.planning.history_len),
     )
     environment = make_env(official_cfg)
     evaluator = PlanEvaluator(official_cfg, agent)

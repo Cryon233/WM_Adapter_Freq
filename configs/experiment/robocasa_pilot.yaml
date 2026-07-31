@@ -50,6 +50,7 @@ training:
 
 planning:
   task_slug: place
+  history_len: 3
   candidate_chunk_size: 16
 
 evaluation:
