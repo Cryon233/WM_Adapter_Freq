@@ -10,8 +10,8 @@ domain: ood
 device: cuda
 
 paths:
-  dataset_root: ${oc.env:JEPAWM_DSET,}
-  robocasa_hdf5: ${oc.env:JEPAWM_ROBOCASA_HDF5,}
+  dataset_root: ${oc.env:JEPAWM_DSET,''}
+  robocasa_hdf5: ${oc.env:JEPAWM_ROBOCASA_HDF5,''}
   feature_cache: storage/feature_cache/jepa_wm_droid_robocasa_pilot.h5
   method_checkpoint: checkpoints/jepa_wm_droid/robocasa/${method}_final.pt
 

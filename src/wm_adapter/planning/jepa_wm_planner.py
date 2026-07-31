@@ -222,9 +222,13 @@ def run_robocasa_planning(
     seed_everything(evaluation_seed)
     output = resolve_path(output_directory)
     output.mkdir(parents=True, exist_ok=True)
+    # Upstream uses `${JEPAWM_LOGS}` as a config-key interpolation; this direct
+    # runner owns its output directory, so replace the legacy folder before resolving.
     official_cfg = OmegaConf.create(
-        OmegaConf.to_container(backend.official_planning_template, resolve=True)
+        OmegaConf.to_container(backend.official_planning_template, resolve=False)
     )
+    official_cfg.folder = str(output)
+    OmegaConf.resolve(official_cfg)
     official_cfg.work_dir = output
     official_cfg.meta.seed = evaluation_seed
     official_cfg.meta.eval_episodes = int(experiment_config.evaluation.num_episodes)
