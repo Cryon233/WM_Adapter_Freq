@@ -14,4 +14,3 @@ export DINOV3_VITL16_CKPT="$DINOV3_DIR/dinov3_vitl16_pretrain_lvd1689m-7c1da9a5.
 
 export MUJOCO_GL=egl
 export PYOPENGL_PLATFORM=egl
-export CUDA_VISIBLE_DEVICES=0
