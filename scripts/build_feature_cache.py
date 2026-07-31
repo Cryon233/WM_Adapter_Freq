@@ -1,286 +1,176 @@
 from __future__ import annotations
 
 import hashlib
-import json
-from pathlib import Path
 from typing import Any
 
-import hydra
 import numpy as np
 import torch
-from omegaconf import DictConfig
-from torch import Tensor
-from torch.utils.data import DataLoader, Subset
+from omegaconf import OmegaConf
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from wm_adapter_freq.backends.base import BaseWorldModelBackend, build_backend
-from wm_adapter_freq.data.appearance_shift import (
-    SHIFT_NAMES,
-    SHIFT_PIPELINE_VERSION,
-)
-from wm_adapter_freq.data.feature_cache import FeatureCacheWriter
-from wm_adapter_freq.data.paired_windows import (
+from wm_adapter.adapters.base import BaseMethod
+from wm_adapter.appearance.composed_photometric import ComposedPhotometricShift
+from wm_adapter.backends.jepa_wm_droid import JEPAWMDroidBackend
+from wm_adapter.data.feature_cache import FeatureCacheWriter
+from wm_adapter.data.robocasa_windows import (
     EPISODE_SPLIT_STRATEGY,
     WINDOW_SELECTION_STRATEGY,
-    build_image_preprocessor,
-    load_paired_two_room_windows,
-    select_episode_balanced_window_indices,
+    RoboCasaWindowDataset,
+    build_robocasa_dataset,
+    select_episode_balanced_windows,
     split_episode_indices,
 )
-from wm_adapter_freq.io.fingerprint import (
-    STABLE_WORLDMODEL_COMMIT,
-    resolve_base_model_identity,
-)
+from wm_adapter.utils.checkpoints import sha256_file
+from wm_adapter.utils.reproducibility import load_experiment_config, resolve_path, seed_everything
 
 
-def _fit_scaler(dataset: Any, key: str) -> tuple[Any, int]:
-    from stable_worldmodel.data.normalization import get_scaler
-
-    values = np.asarray(dataset.get_col_data(key))
-    feature_dim = int(values.shape[-1])
-    values = values.reshape(-1, feature_dim)
-    values = values[~np.isnan(values).any(axis=1)]
-    scaler = get_scaler("zscore")
-    scaler.fit(values)
-    return scaler, feature_dim
+def _sha256_array(array: np.ndarray) -> str:
+    return hashlib.sha256(np.asarray(array, dtype=np.int64).tobytes()).hexdigest()
 
 
-def _normalize(values: Tensor, scaler: Any, feature_dim: int) -> Tensor:
-    shape = values.shape
-    normalized = scaler.transform(values.reshape(-1, feature_dim))
-    return normalized.reshape(shape).float()
+def _backend(cfg: Any) -> JEPAWMDroidBackend:
+    return JEPAWMDroidBackend(
+        third_party_root=cfg.model.third_party_root,
+        jepa_checkpoint=cfg.model.jepa_checkpoint,
+        dinov3_checkpoint=cfg.model.dinov3_checkpoint,
+        official_planning_config=cfg.model.official_planning_config,
+        device=cfg.device,
+    )
 
 
-def _scaler_metadata(scaler: Any, feature_dim: int) -> dict[str, object]:
+@torch.no_grad()
+def _encode_batch(
+    backend: JEPAWMDroidBackend,
+    batch: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    clean_images = batch["clean_images"]
+    ood_images = batch["ood_images"]
+    batch_size, sequence_length = clean_images.shape[:2]
+    clean_prefix = backend.encode_prefix(clean_images)
+    ood_prefix = backend.encode_prefix(ood_images)
+    clean_latent = backend.encode_from_prefix(
+        clean_prefix, BaseMethod().to(backend.device), batch_size, sequence_length
+    )
     return {
-        "method": "zscore",
-        "mean": np.asarray(scaler.mean).reshape(-1).tolist(),
-        "std": np.asarray(scaler.std).reshape(-1).tolist(),
-        "eps": float(scaler.eps),
-        "feature_dim": int(feature_dim),
+        "clean_prefix_tokens": clean_prefix,
+        "ood_prefix_tokens": ood_prefix,
+        "clean_context_final_latent": clean_latent[:, :3],
+        "clean_future_latent": clean_latent[:, 3:4],
+        "actions": batch["actions"],
+        "episode_id": batch["episode_id"],
+        "window_id": batch["window_id"],
+        "appearance_seed": batch["appearance_seed"],
     }
 
 
-def _preprocess(
-    pixels: Tensor, image_size: int
-) -> Tensor:
-    preprocess = build_image_preprocessor(image_size)
-    flat = pixels.reshape(-1, *pixels.shape[-3:])
-    processed = preprocess(flat)
-    return processed.reshape(*pixels.shape[:-3], *processed.shape[-3:])
-
-
-def _encode_chunks(
-    backend: BaseWorldModelBackend,
-    pixels: Tensor,
-    chunk_size: int,
-    device: torch.device,
-    clean_target: bool,
-) -> Tensor:
-    outputs = []
-    for start in range(0, pixels.shape[0], chunk_size):
-        chunk = pixels[start : start + chunk_size].to(
-            device, non_blocking=True
-        )
-        if clean_target:
-            output = backend.encode_clean_target(chunk)
-        else:
-            output = backend.encode_prefix(chunk)
-        outputs.append(output.cpu())
-    return torch.cat(outputs)
-
-
-@hydra.main(
-    version_base=None,
-    config_path="../configs/cache",
-    config_name="prejepa_tworoom",
-)
-def main(cfg: DictConfig) -> None:
-    from stable_worldmodel.wm.utils import load_pretrained
-
-    if str(cfg.window_selection.strategy) != WINDOW_SELECTION_STRATEGY:
+def main() -> None:
+    cfg = load_experiment_config()
+    if str(cfg.appearance.pipeline_version) != "composed_photometric_v1":
         raise ValueError(
-            "window_selection.strategy must be "
-            f"'{WINDOW_SELECTION_STRATEGY}'"
+            f"Unsupported appearance pipeline version: {cfg.appearance.pipeline_version}"
         )
-    if str(cfg.episode_split.strategy) != EPISODE_SPLIT_STRATEGY:
-        raise ValueError(
-            "episode_split.strategy must be "
-            f"'{EPISODE_SPLIT_STRATEGY}'"
+    seed_everything(int(cfg.data.window_seed))
+    backend = _backend(cfg)
+    source = build_robocasa_dataset(
+        jepa_wms_root=backend.jepa_repo,
+        dataset_root=cfg.paths.dataset_root,
+        hdf5_path=cfg.paths.robocasa_hdf5,
+        task_name=str(cfg.data.task_name),
+        camera_view=str(cfg.data.camera_view),
+        output_environment_info=False,
+        transform=None,
+    )
+    train_episodes, evaluation_episodes = split_episode_indices(
+        len(source), float(cfg.data.train_fraction), int(cfg.data.split_seed)
+    )
+    candidates = RoboCasaWindowDataset.all_candidates(
+        source, int(cfg.data.num_frames), int(cfg.data.frameskip)
+    )
+    selected = select_episode_balanced_windows(
+        candidates,
+        train_episodes,
+        int(cfg.data.num_train_windows),
+        int(cfg.data.window_seed),
+    )
+    if len(selected) != int(cfg.data.num_train_windows):
+        raise RuntimeError(
+            f"Requested {cfg.data.num_train_windows} train windows, but only {len(selected)} "
+            "eligible episode-disjoint RoboCasa windows are available"
         )
-
-    torch.manual_seed(int(cfg.seed))
-    device = torch.device(str(cfg.device))
-    identity = resolve_base_model_identity(str(cfg.base_model_ref))
-    base_model = load_pretrained(identity.resolved_weights_path)
-    base_model.eval()
-    base_model.requires_grad_(False)
-    base_model.to(device)
-    backend = build_backend(str(cfg.backend), base_model)
-
-    paired_dataset, source_dataset = load_paired_two_room_windows(
-        str(cfg.dataset_name),
-        cache_dir=cfg.get("dataset_cache_dir"),
-        seed=int(cfg.seed),
-        severity=float(cfg.appearance.severity),
+    windows = RoboCasaWindowDataset(
+        source,
+        selected,
+        num_frames=int(cfg.data.num_frames),
+        frameskip=int(cfg.data.frameskip),
+        appearance_seed=int(cfg.appearance.training_seed),
+        appearance_severity=float(cfg.appearance.severity),
     )
-    train_episode_indices, eval_episode_indices = split_episode_indices(
-        num_episodes=len(source_dataset.lengths),
-        train_fraction=float(cfg.episode_split.train_fraction),
-        seed=int(cfg.episode_split.seed),
-    )
-    selected_window_indices = select_episode_balanced_window_indices(
-        source_dataset,
-        allowed_episode_indices=train_episode_indices,
-        max_windows=int(cfg.max_windows),
-        seed=int(cfg.window_selection.seed),
-    )
-    windows = Subset(paired_dataset, selected_window_indices)
-    data_loader = DataLoader(
+    loader = DataLoader(
         windows,
-        batch_size=int(cfg.encoder_batch_size),
+        batch_size=int(cfg.cache.encoder_batch_size),
         shuffle=False,
-        num_workers=int(cfg.num_workers),
-        pin_memory=device.type == "cuda",
-        persistent_workers=int(cfg.num_workers) > 0,
+        num_workers=int(cfg.cache.num_workers),
+        pin_memory=True,
+        persistent_workers=int(cfg.cache.num_workers) > 0,
     )
-    action_scaler, action_dim = _fit_scaler(source_dataset, "action")
-    proprio_scaler, proprio_dim = _fit_scaler(source_dataset, "proprio")
-    action_normalization = _scaler_metadata(action_scaler, action_dim)
-    proprio_normalization = _scaler_metadata(
-        proprio_scaler,
-        proprio_dim,
+    iterator = iter(loader)
+    first_batch = next(iterator)
+    first_encoded = _encode_batch(backend, first_batch)
+    layout = backend.token_layout
+    appearance_metadata = ComposedPhotometricShift.metadata(
+        float(cfg.appearance.severity), int(cfg.appearance.training_seed)
     )
-
-    output_path = Path(str(cfg.output_path)).expanduser()
-    selected_indices_sha256 = hashlib.sha256(
-        np.asarray(
-            selected_window_indices,
-            dtype=np.int64,
-        ).tobytes()
-    ).hexdigest()
-    train_episode_indices_sha256 = hashlib.sha256(
-        np.asarray(train_episode_indices, dtype=np.int64).tobytes()
-    ).hexdigest()
-    eval_episode_indices_sha256 = hashlib.sha256(
-        np.asarray(eval_episode_indices, dtype=np.int64).tobytes()
-    ).hexdigest()
-    selected_pairs = [
-        source_dataset.clip_indices[index]
-        for index in selected_window_indices
-    ]
-    selected_window_pairs_sha256 = hashlib.sha256(
-        np.asarray(selected_pairs, dtype=np.int64).tobytes()
-    ).hexdigest()
-    metadata: dict[str, str | int | float] = {
-        "backend": str(cfg.backend),
-        "base_model_ref": str(cfg.base_model_ref),
-        "base_model_fingerprint": identity.combined_fingerprint,
-        "stable_worldmodel_commit": STABLE_WORLDMODEL_COMMIT,
-        "dataset_name": str(cfg.dataset_name),
-        "image_size": int(cfg.image_size),
-        "patch_size": 14,
-        "token_dim": backend.token_dim,
-        "latent_dim": backend.latent_dim,
-        "history_size": 3,
-        "num_preds": 1,
-        "frameskip": 5,
-        "variants_per_window": len(SHIFT_NAMES),
-        "appearance_severity": float(cfg.appearance.severity),
-        "appearance_shift_names": json.dumps(
-            list(SHIFT_NAMES),
-            separators=(",", ":"),
-        ),
-        "appearance_pipeline_version": SHIFT_PIPELINE_VERSION,
-        "episode_split_strategy": EPISODE_SPLIT_STRATEGY,
-        "episode_split_seed": int(cfg.episode_split.seed),
-        "episode_split_train_fraction": float(
-            cfg.episode_split.train_fraction
-        ),
-        "source_episode_count": len(source_dataset.lengths),
-        "train_episode_count": len(train_episode_indices),
-        "eval_episode_count": len(eval_episode_indices),
-        "train_episode_indices_sha256": train_episode_indices_sha256,
-        "eval_episode_indices_sha256": eval_episode_indices_sha256,
-        "window_selection_strategy": WINDOW_SELECTION_STRATEGY,
-        "window_selection_seed": int(cfg.window_selection.seed),
-        "source_window_count": len(source_dataset.clip_indices),
-        "selected_window_count": len(selected_window_indices),
-        "selected_window_indices_sha256": selected_indices_sha256,
-        "selected_window_pairs_sha256": selected_window_pairs_sha256,
-        "normalization_method": "zscore",
-        "action_normalization": json.dumps(
-            action_normalization,
-            separators=(",", ":"),
-        ),
-        "proprio_normalization": json.dumps(
-            proprio_normalization,
-            separators=(",", ":"),
-        ),
+    preprocessing_metadata = {
+        "implementation": "jepa-wms.app.plan_common.datasets.transforms.make_transforms",
+        "image_size": backend.image_size,
+        "patch_size": backend.patch_size,
+        "normalize": OmegaConf.to_container(backend.official_planning_template.model_kwargs.data_aug.normalize),
+        "random_horizontal_flip": False,
+        "random_resize_scale": [1.0, 1.0],
+        "random_resize_aspect_ratio": [1.0, 1.0],
     }
-    with (
-        torch.inference_mode(),
-        FeatureCacheWriter(
-            output_path,
-            metadata=metadata,
-            chunk_size=int(cfg.writer_chunk_size),
-        ) as writer,
-    ):
-        for batch in tqdm(data_loader, desc=f"Caching {cfg.backend} features"):
-            clean_pixels = _preprocess(batch["clean_pixels"], int(cfg.image_size))
-            shifted_pixels = _preprocess(
-                batch["shifted_pixels"], int(cfg.image_size)
-            )
-            batch_size, num_views, sequence_length = shifted_pixels.shape[:3]
-
-            clean_prefix = _encode_chunks(
-                backend,
-                clean_pixels,
-                int(cfg.encoder_batch_size),
-                device,
-                clean_target=False,
-            )
-            clean_targets = _encode_chunks(
-                backend,
-                clean_pixels,
-                int(cfg.encoder_batch_size),
-                device,
-                clean_target=True,
-            )
-            shifted_flat = shifted_pixels.reshape(
-                batch_size * num_views,
-                sequence_length,
-                *shifted_pixels.shape[-3:],
-            )
-            shifted_prefix = _encode_chunks(
-                backend,
-                shifted_flat,
-                int(cfg.encoder_batch_size),
-                device,
-                clean_target=False,
-            ).reshape(
-                batch_size,
-                num_views,
-                sequence_length,
-                clean_prefix.shape[-2],
-                clean_prefix.shape[-1],
-            )
-
-            writer.append(
-                {
-                    "clean_prefix_tokens": clean_prefix,
-                    "shifted_prefix_tokens": shifted_prefix,
-                    "clean_targets": clean_targets,
-                    "action": _normalize(
-                        batch["action"], action_scaler, action_dim
-                    ),
-                    "proprio": _normalize(
-                        batch["proprio"], proprio_scaler, proprio_dim
-                    ),
-                    "shift_type": batch["shift_type"],
-                    "shift_seed": batch["shift_seed"],
-                }
-            )
+    metadata = {
+        "backend": "jepa_wm_droid",
+        "dataset": str(resolve_path(cfg.paths.robocasa_hdf5)),
+        "dataset_sha256": sha256_file(resolve_path(cfg.paths.robocasa_hdf5)),
+        "base_checkpoint_sha256": backend.base_checkpoint_sha256,
+        "dinov3_checkpoint_sha256": backend.dinov3_checkpoint_sha256,
+        "upstream_commits": backend.upstream_commits,
+        "appearance_metadata": appearance_metadata,
+        "preprocessing_metadata": preprocessing_metadata,
+        "token_layout": {
+            "total_tokens": layout.total_tokens,
+            "prefix_tokens": layout.prefix_tokens,
+            "patch_tokens": layout.patch_tokens,
+            "grid_height": layout.grid_height,
+            "grid_width": layout.grid_width,
+            "token_dim": layout.token_dim,
+        },
+        "episode_split_strategy": EPISODE_SPLIT_STRATEGY,
+        "episode_split_seed": int(cfg.data.split_seed),
+        "episode_split_train_fraction": float(cfg.data.train_fraction),
+        "source_episode_count": len(source),
+        "train_episode_count": len(train_episodes),
+        "evaluation_episode_count": len(evaluation_episodes),
+        "train_episode_indices_sha256": _sha256_array(train_episodes),
+        "evaluation_episode_indices_sha256": _sha256_array(evaluation_episodes),
+        "window_selection_strategy": WINDOW_SELECTION_STRATEGY,
+        "window_selection_seed": int(cfg.data.window_seed),
+        "selected_window_pairs_sha256": _sha256_array(np.asarray(selected, dtype=np.int64)),
+    }
+    output_path = resolve_path(cfg.paths.feature_cache)
+    writer = FeatureCacheWriter(output_path, metadata)
+    try:
+        writer.append(first_encoded)
+        for batch in tqdm(iterator, total=len(loader) - 1, desc="building feature cache"):
+            writer.append(_encode_batch(backend, batch))
+        fingerprint = writer.finalize()
+    except BaseException:
+        writer.close_unfinalized()
+        raise
+    print(f"Feature cache written: {output_path}")
+    print(f"Cache fingerprint: {fingerprint}")
 
 
 if __name__ == "__main__":

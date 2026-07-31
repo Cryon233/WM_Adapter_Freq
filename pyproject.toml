@@ -3,15 +3,14 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "wm-adapter-freq"
+name = "wm-adapter"
 version = "0.1.0"
-description = "Sequence-Stable Adaptive DCT Adapter for latent world models"
+description = "Parameter-efficient adaptation of the official DROID/RoboCasa JEPA-WM"
 readme = "README.md"
 requires-python = ">=3.10,<3.11"
 dependencies = [
     "einops>=0.8",
     "h5py>=3.10",
-    "hydra-core>=1.3",
     "numpy>=1.26",
     "omegaconf>=2.3",
     "tqdm>=4.66",
