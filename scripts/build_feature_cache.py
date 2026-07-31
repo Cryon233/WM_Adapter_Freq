@@ -20,10 +20,12 @@ from wm_adapter_freq.data.appearance_shift import (
 )
 from wm_adapter_freq.data.feature_cache import FeatureCacheWriter
 from wm_adapter_freq.data.paired_windows import (
+    EPISODE_SPLIT_STRATEGY,
     WINDOW_SELECTION_STRATEGY,
     build_image_preprocessor,
     load_paired_two_room_windows,
     select_episode_balanced_window_indices,
+    split_episode_indices,
 )
 from wm_adapter_freq.io.fingerprint import (
     STABLE_WORLDMODEL_COMMIT,
@@ -101,6 +103,11 @@ def main(cfg: DictConfig) -> None:
             "window_selection.strategy must be "
             f"'{WINDOW_SELECTION_STRATEGY}'"
         )
+    if str(cfg.episode_split.strategy) != EPISODE_SPLIT_STRATEGY:
+        raise ValueError(
+            "episode_split.strategy must be "
+            f"'{EPISODE_SPLIT_STRATEGY}'"
+        )
 
     torch.manual_seed(int(cfg.seed))
     device = torch.device(str(cfg.device))
@@ -117,10 +124,15 @@ def main(cfg: DictConfig) -> None:
         seed=int(cfg.seed),
         severity=float(cfg.appearance.severity),
     )
-    max_windows = min(int(cfg.max_windows), len(paired_dataset))
+    train_episode_indices, eval_episode_indices = split_episode_indices(
+        num_episodes=len(source_dataset.lengths),
+        train_fraction=float(cfg.episode_split.train_fraction),
+        seed=int(cfg.episode_split.seed),
+    )
     selected_window_indices = select_episode_balanced_window_indices(
         source_dataset,
-        max_windows=max_windows,
+        allowed_episode_indices=train_episode_indices,
+        max_windows=int(cfg.max_windows),
         seed=int(cfg.window_selection.seed),
     )
     windows = Subset(paired_dataset, selected_window_indices)
@@ -147,6 +159,19 @@ def main(cfg: DictConfig) -> None:
             dtype=np.int64,
         ).tobytes()
     ).hexdigest()
+    train_episode_indices_sha256 = hashlib.sha256(
+        np.asarray(train_episode_indices, dtype=np.int64).tobytes()
+    ).hexdigest()
+    eval_episode_indices_sha256 = hashlib.sha256(
+        np.asarray(eval_episode_indices, dtype=np.int64).tobytes()
+    ).hexdigest()
+    selected_pairs = [
+        source_dataset.clip_indices[index]
+        for index in selected_window_indices
+    ]
+    selected_window_pairs_sha256 = hashlib.sha256(
+        np.asarray(selected_pairs, dtype=np.int64).tobytes()
+    ).hexdigest()
     metadata: dict[str, str | int | float] = {
         "backend": str(cfg.backend),
         "base_model_ref": str(cfg.base_model_ref),
@@ -167,11 +192,22 @@ def main(cfg: DictConfig) -> None:
             separators=(",", ":"),
         ),
         "appearance_pipeline_version": SHIFT_PIPELINE_VERSION,
+        "episode_split_strategy": EPISODE_SPLIT_STRATEGY,
+        "episode_split_seed": int(cfg.episode_split.seed),
+        "episode_split_train_fraction": float(
+            cfg.episode_split.train_fraction
+        ),
+        "source_episode_count": len(source_dataset.lengths),
+        "train_episode_count": len(train_episode_indices),
+        "eval_episode_count": len(eval_episode_indices),
+        "train_episode_indices_sha256": train_episode_indices_sha256,
+        "eval_episode_indices_sha256": eval_episode_indices_sha256,
         "window_selection_strategy": WINDOW_SELECTION_STRATEGY,
         "window_selection_seed": int(cfg.window_selection.seed),
         "source_window_count": len(source_dataset.clip_indices),
         "selected_window_count": len(selected_window_indices),
         "selected_window_indices_sha256": selected_indices_sha256,
+        "selected_window_pairs_sha256": selected_window_pairs_sha256,
         "normalization_method": "zscore",
         "action_normalization": json.dumps(
             action_normalization,

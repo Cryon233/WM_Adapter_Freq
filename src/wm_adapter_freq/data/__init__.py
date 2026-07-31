@@ -9,15 +9,18 @@ from wm_adapter_freq.data.feature_cache import (
     PairedFeatureDataset,
 )
 from wm_adapter_freq.data.paired_windows import (
+    EPISODE_SPLIT_STRATEGY,
     PairedAppearanceWindowDataset,
     WINDOW_SELECTION_STRATEGY,
     build_image_preprocessor,
     load_paired_two_room_windows,
     select_episode_balanced_window_indices,
+    split_episode_indices,
 )
 
 __all__ = [
     "AppearanceShiftSpec",
+    "EPISODE_SPLIT_STRATEGY",
     "FeatureCacheWriter",
     "PairedAppearanceWindowDataset",
     "PairedFeatureDataset",
@@ -28,4 +31,5 @@ __all__ = [
     "build_image_preprocessor",
     "load_paired_two_room_windows",
     "select_episode_balanced_window_indices",
+    "split_episode_indices",
 ]

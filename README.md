@@ -84,9 +84,11 @@ python scripts/build_feature_cache.py \
 - `data/features/prejepa_tworoom.h5`
 - `data/features/lewm_tworoom.h5`
 
-每个 clean 四帧物理窗口只读取一次，并从同一轨迹生成 photometric、background texture、palette shift 和 composed 四个序列级外观视图。cache 配置中的 `seed: 42` 用于生成这些训练 appearance views。窗口不再取数据集开头的一段连续样本，而是使用 `episode_balanced_round_robin_v1`：先确定性打乱 episode 和各 episode 内的候选窗口，再逐轮从每个 episode 最多取一个窗口，直至达到配置数量。
+每个 clean 四帧物理窗口只读取一次，并从同一轨迹生成 photometric、background texture、palette shift 和 composed 四个序列级外观视图。cache 配置中的 `seed: 42` 用于生成这些训练 appearance views。
 
-PreJEPA 和 LeWM 均使用 `window_selection.seed: 42` 选择相同的 2,000 个物理窗口；在同一数据集上构建的两个 cache，其 `selected_window_indices_sha256` 应相同。cache 使用 float16 token/latent、chunked HDF5 和 LZF 压缩。分块方式与训练访问一致：clean feature 和 clean target 按单个 window 分块，shifted feature 按单个 window、单个 view 分块；action、proprio、shift type 和 shift seed 使用最多 64 个 window 的 chunk。
+Adapter cache 与最终规划评估采用 episode-disjoint 协议。`deterministic_episode_partition_v1` 使用 split seed 42 确定性打乱由 `dataset.lengths` 定义的 episode 索引，默认前 `floor(80%)` 为 Adapter train partition，其余约 20% 只用于最终规划评估。窗口选择只在 train episode 内执行 `episode_balanced_round_robin_v1`：确定性打乱允许的 episode 和各 episode 内候选窗口，再逐轮从每个 episode 最多取一个窗口，直至达到配置数量。
+
+PreJEPA 和 LeWM 使用完全相同的 split seed、train episode、window seed 和 2,000 个物理窗口。在同一数据集上构建的两个 cache，其 `train_episode_indices_sha256`、`eval_episode_indices_sha256` 和正式物理窗口标识 `selected_window_pairs_sha256` 应相同；`selected_window_indices_sha256` 作为列表位置摘要继续保留。cache 使用 float16 token/latent、chunked HDF5 和 LZF 压缩。分块方式与训练访问一致：clean feature 和 clean target 按单个 window 分块，shifted feature 按单个 window、单个 view 分块；action、proprio、shift type 和 shift seed 使用最多 64 个 window 的 chunk。
 
 默认规模及未压缩 feature 体积估算：
 
@@ -95,7 +97,7 @@ PreJEPA 和 LeWM 均使用 `window_selection.seed: 42` 选择相同的 2,000 个
 | PreJEPA | 2,000 | 8 | 64 | 约 8.8 GiB |
 | LeWM | 2,000 | 32 | 64 | 约 3.7 GiB |
 
-`writer_chunk_size` 只控制这些小字段；大 feature tensor 始终使用上述访问对齐布局。实际文件大小取决于 LZF 压缩率，并另有少量 action、proprio 和 HDF5 元数据开销。cache 根元数据会记录 appearance severity、shift names、shift pipeline version，以及窗口选择策略、seed、源/选中窗口数和选择索引 SHA256。
+`writer_chunk_size` 只控制这些小字段；大 feature tensor 始终使用上述访问对齐布局。实际文件大小取决于 LZF 压缩率，并另有少量 action、proprio 和 HDF5 元数据开销。cache 根元数据会记录 appearance 信息、episode split 策略与 partition 摘要、窗口选择策略，以及列表位置和实际 `(episode_index, start_step)` 对的 SHA256。action/proprio normalization 继续在完整 source dataset 上拟合，以保持基础世界模型输入契约；episode split 只约束 Adapter 配对训练样本。
 
 ## 训练 Adapter
 
@@ -112,7 +114,7 @@ python scripts/train_adapter.py \
 - `checkpoints/adapters/prejepa_tworoom.pt`
 - `checkpoints/adapters/lewm_tworoom.pt`
 
-基础模型保持冻结，loss 只包含 clean canonical latent 对齐和原 dynamics predictor 对齐。cache 使用的 action/proprio z-score 统计随 Adapter checkpoint 保存，规划阶段直接恢复同一份统计，不从评估数据重新拟合。Adapter checkpoint 同时记录训练 cache 的 appearance severity、shift names、shift pipeline version 和窗口选择摘要，不保存完整窗口索引。
+基础模型保持冻结，loss 只包含 clean canonical latent 对齐和原 dynamics predictor 对齐。基础世界模型本身仍是 clean-domain 模型；80/20 episode split 约束的是 Adapter 配对训练与最终规划评估。cache 使用的 action/proprio z-score 统计随 Adapter checkpoint 保存，规划阶段直接恢复同一份统计，不从评估数据重新拟合。Adapter checkpoint 同时记录训练 cache 的 appearance、episode partition 和窗口选择摘要，不保存完整 episode 或窗口列表。
 
 16GB 显卡默认配置：
 
@@ -125,11 +127,11 @@ python scripts/train_adapter.py \
 
 规划继续使用上游 `CEMSolver`、`WorldModelPolicy` 和 `PlanConfig`。默认 `history_len=3`、`action_block=5`、`horizon=5`、`receding_horizon=1`；PreJEPA history keys 为 pixels/proprio，LeWM 为 pixels。base 对照使用完全未挂载 Adapter 的原始基础模型，adapter 条件使用训练后的 Adapter；两者都从同一 Adapter checkpoint 恢复 fingerprint、normalization 和训练 appearance 元数据。
 
-最终 OOD 协议为 fixed appearance domain，版本为 `2.0`。planning 默认 `appearance.seed: 2026`，它与训练 cache 的 seed 42 分离，用来定义默认未见测试域。修改 `appearance.seed` 可以生成其他固定 OOD 域；比较不同 backend、base 和 adapter 时必须使用相同的 `appearance.seed`。
+最终 evaluation protocol 版本为 `3.0`：current-only fixed appearance shift、clean goal、base/adapter 直接对照、episode-disjoint Adapter 训练与评估，以及 held-out episode-balanced evaluation。planning 默认 `appearance.seed: 2026`，它与训练 cache 的 seed 42 分离，用来定义默认未见测试域。修改 `appearance.seed` 可以生成其他固定 OOD 域；比较不同 backend、base 和 adapter 时必须使用相同的 `appearance.seed`。
 
 同一次规划运行中的所有环境、episode、history 帧和 current observation 复用同一个 `AppearanceShiftSpec`。appearance shift 在 policy 的 current pixels transform 中、标准 resize 和 ImageNet normalization 之前执行，因此 dataset-driven evaluation 注入的第一帧和后续环境帧都会且只会被处理一次。goal 使用独立的 clean 标准预处理器，不经过 appearance shift。
 
-评估采样先在满足 goal offset 的 episode 中无放回选择不同 episode，再从每个 episode 的合法位置随机选择一个 start step；每个 episode 在一次运行中最多贡献一个样本，长 episode 不会获得更高的 episode 级权重。`results.json` 会记录实际 episode IDs、start steps、goal offset、评估预算和 evaluation seed。
+规划从 Adapter checkpoint 恢复 episode split 配置并重新得到 held-out eval partition，只在其中筛选长度满足 goal offset 的 episode。随后无放回选择不同 eval episode，并从每个 episode 的合法范围随机选择一个 start step；传给上游 `World.evaluate` 的是 dataset episode 索引，而不是数据列中的 ID。`results.json` 会记录完整 episode split 摘要、实际 eval episode 索引、start steps、goal offset、评估预算和 evaluation seed。
 
 ### PreJEPA 四个条件
 
@@ -232,24 +234,24 @@ python scripts/plan.py \
 | LeWM | adapter | clean |
 | LeWM | adapter | OOD |
 
-输出按模型 variant、appearance domain 和 evaluation seed 自动隔离：
+输出按模型 variant、appearance domain、protocol 和 evaluation seed 自动隔离：
 
 ```text
 outputs/plan/prejepa_tworoom/
 ├── base/
-│   ├── clean/eval_seed42/results.json
-│   └── composed_severity1p0_seed2026/eval_seed42/results.json
+│   ├── clean/protocol_v3/eval_seed42/results.json
+│   └── composed_severity1p0_seed2026/protocol_v3/eval_seed42/results.json
 └── adapter/
-    ├── clean/eval_seed42/results.json
-    └── composed_severity1p0_seed2026/eval_seed42/results.json
+    ├── clean/protocol_v3/eval_seed42/results.json
+    └── composed_severity1p0_seed2026/protocol_v3/eval_seed42/results.json
 
 outputs/plan/lewm_tworoom/
 ├── base/
-│   ├── clean/eval_seed42/results.json
-│   └── composed_severity1p0_seed2026/eval_seed42/results.json
+│   ├── clean/protocol_v3/eval_seed42/results.json
+│   └── composed_severity1p0_seed2026/protocol_v3/eval_seed42/results.json
 └── adapter/
-    ├── clean/eval_seed42/results.json
-    └── composed_severity1p0_seed2026/eval_seed42/results.json
+    ├── clean/protocol_v3/eval_seed42/results.json
+    └── composed_severity1p0_seed2026/protocol_v3/eval_seed42/results.json
 ```
 
 配置中的 `seed` 是 evaluation seed，同时控制 episode/start 选择、CEM 和 Torch 随机数。不同 seed 写入不同目录，不会互相覆盖，例如：
@@ -268,4 +270,4 @@ python scripts/plan.py \
     seed=43
 ```
 
-默认 `output.video=false`，因为上游 panel video 显示环境 clean render，而 appearance shift 发生在 policy input 中；`results.json` 的评价使用真实 shifted policy input，当前版本不把模型看到的 OOD 图像写入 panel video。结果还记录 model variant、基础模型 fingerprint、Adapter checkpoint、训练数据选择摘要、实际评估样本、训练/评估 appearance 域、evaluation protocol version、planning 配置和 CEM 配置。数据、checkpoint 与规划输出均由 `.gitignore` 排除。
+默认 `output.video=false`，因为上游 panel video 显示环境 clean render，而 appearance shift 发生在 policy input 中；`results.json` 的评价使用真实 shifted policy input，当前版本不把模型看到的 OOD 图像写入 panel video。结果还记录 model variant、基础模型 fingerprint、Adapter checkpoint、训练数据选择摘要、episode split、实际 held-out 评估样本、训练/评估 appearance 域、evaluation protocol version、planning 配置和 CEM 配置。数据、checkpoint 与规划输出均由 `.gitignore` 排除。

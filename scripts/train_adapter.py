@@ -132,14 +132,35 @@ def main(cfg: DictConfig) -> None:
                 ),
             },
             "data_selection": {
-                "strategy": str(
+                "episode_split_strategy": str(
+                    dataset.metadata["episode_split_strategy"]
+                ),
+                "episode_split_seed": int(
+                    dataset.metadata["episode_split_seed"]
+                ),
+                "episode_split_train_fraction": float(
+                    dataset.metadata["episode_split_train_fraction"]
+                ),
+                "source_episode_count": int(
+                    dataset.metadata["source_episode_count"]
+                ),
+                "train_episode_count": int(
+                    dataset.metadata["train_episode_count"]
+                ),
+                "eval_episode_count": int(
+                    dataset.metadata["eval_episode_count"]
+                ),
+                "train_episode_indices_sha256": str(
+                    dataset.metadata["train_episode_indices_sha256"]
+                ),
+                "eval_episode_indices_sha256": str(
+                    dataset.metadata["eval_episode_indices_sha256"]
+                ),
+                "window_selection_strategy": str(
                     dataset.metadata["window_selection_strategy"]
                 ),
-                "seed": int(
+                "window_selection_seed": int(
                     dataset.metadata["window_selection_seed"]
-                ),
-                "source_window_count": int(
-                    dataset.metadata["source_window_count"]
                 ),
                 "selected_window_count": int(
                     dataset.metadata["selected_window_count"]
@@ -148,6 +169,9 @@ def main(cfg: DictConfig) -> None:
                     dataset.metadata[
                         "selected_window_indices_sha256"
                     ]
+                ),
+                "selected_window_pairs_sha256": str(
+                    dataset.metadata["selected_window_pairs_sha256"]
                 ),
             },
         },

@@ -14,6 +14,11 @@ image_size: 224
 appearance:
   severity: 1.0
 
+episode_split:
+  strategy: deterministic_episode_partition_v1
+  seed: 42
+  train_fraction: 0.8
+
 window_selection:
   strategy: episode_balanced_round_robin_v1
   seed: 42

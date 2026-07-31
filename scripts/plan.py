@@ -11,62 +11,55 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 
+from wm_adapter_freq.data.paired_windows import (
+    EPISODE_SPLIT_STRATEGY,
+    split_episode_indices,
+)
 from wm_adapter_freq.planning.appearance_transform import (
     EVALUATION_PROTOCOL_VERSION,
 )
 from wm_adapter_freq.planning.policy_builder import build_tworoom_mpc_policy
 
 
-def _episode_column(dataset: Any) -> str:
-    names = set(dataset.column_names)
-    names.update(getattr(dataset, "_schema_names", ()))
-    return "episode_idx" if "episode_idx" in names else "ep_idx"
-
-
-def _select_episode_balanced_eval_rows(
-    episode_ids: np.ndarray,
-    step_ids: np.ndarray,
+def _select_heldout_eval_samples(
+    episode_lengths: np.ndarray,
+    eval_episode_indices: np.ndarray,
     goal_offset_steps: int,
     num_eval: int,
     seed: int,
-) -> np.ndarray:
-    """Select one valid start row from each sampled episode."""
-    episode_values = np.asarray(episode_ids)
-    step_values = np.asarray(step_ids)
-    valid_rows_by_episode: dict[int, np.ndarray] = {}
-    for episode_id in np.unique(episode_values):
-        episode_rows = np.flatnonzero(episode_values == episode_id)
-        max_step = int(step_values[episode_rows].max())
-        valid_rows = episode_rows[
-            step_values[episode_rows]
-            <= max_step - int(goal_offset_steps)
-        ]
-        if valid_rows.size > 0:
-            valid_rows_by_episode[int(episode_id)] = valid_rows
-
+) -> tuple[np.ndarray, np.ndarray]:
+    """Select one valid start step from each sampled held-out episode."""
+    lengths = np.asarray(episode_lengths, dtype=np.int64)
+    eval_episodes = np.asarray(eval_episode_indices, dtype=np.int64)
+    eligible_episodes = eval_episodes[
+        lengths[eval_episodes] >= int(goal_offset_steps) + 1
+    ]
     generator = np.random.default_rng(int(seed))
-    eligible_episodes = np.asarray(
-        list(valid_rows_by_episode),
-        dtype=np.int64,
-    )
     selection_count = min(int(num_eval), eligible_episodes.size)
     if selection_count <= 0:
-        return np.empty(0, dtype=np.int64)
+        empty = np.empty(0, dtype=np.int64)
+        return empty, empty.copy()
 
     selected_episodes = generator.choice(
         eligible_episodes,
         size=selection_count,
         replace=False,
     )
-    selected_rows = np.asarray(
+    selected_start_steps = np.asarray(
         [
-            generator.choice(valid_rows_by_episode[int(episode_id)])
-            for episode_id in selected_episodes
+            generator.integers(
+                low=0,
+                high=(
+                    int(lengths[int(episode_index)])
+                    - int(goal_offset_steps)
+                ),
+            )
+            for episode_index in selected_episodes
         ],
         dtype=np.int64,
     )
-    order = np.argsort(episode_values[selected_rows], kind="stable")
-    return selected_rows[order]
+    order = np.argsort(selected_episodes, kind="stable")
+    return selected_episodes[order], selected_start_steps[order]
 
 
 def _json_value(value: Any) -> Any:
@@ -137,29 +130,52 @@ def main(cfg: DictConfig) -> None:
         seed=int(cfg.seed),
     )
 
-    episode_column = _episode_column(dataset)
-    episode_ids = np.asarray(dataset.get_col_data(episode_column))
-    step_ids = np.asarray(dataset.get_col_data("step_idx"))
-    selected_rows = _select_episode_balanced_eval_rows(
-        episode_ids=episode_ids,
-        step_ids=step_ids,
+    checkpoint_metadata = getattr(
+        policy,
+        "adapter_checkpoint_metadata",
+    )
+    data_selection = checkpoint_metadata["data_selection"]
+    if (
+        str(data_selection["episode_split_strategy"])
+        != EPISODE_SPLIT_STRATEGY
+    ):
+        raise RuntimeError(
+            "Adapter checkpoint episode split strategy is unsupported."
+        )
+    if int(data_selection["source_episode_count"]) != len(dataset.lengths):
+        raise RuntimeError(
+            "Planning dataset episode count does not match the Adapter "
+            "checkpoint."
+        )
+    _, eval_episode_indices = split_episode_indices(
+        num_episodes=len(dataset.lengths),
+        train_fraction=float(
+            data_selection["episode_split_train_fraction"]
+        ),
+        seed=int(data_selection["episode_split_seed"]),
+    )
+    eval_episodes, eval_steps = _select_heldout_eval_samples(
+        episode_lengths=np.asarray(dataset.lengths, dtype=np.int64),
+        eval_episode_indices=eval_episode_indices,
         goal_offset_steps=int(cfg.eval.goal_offset_steps),
         num_eval=int(cfg.eval.num_eval),
         seed=int(cfg.seed),
     )
-    eval_episodes = episode_ids[selected_rows].astype(np.int64)
-    eval_steps = step_ids[selected_rows].astype(np.int64)
 
     output_root = Path(str(cfg.output.root_dir)).expanduser()
     model_variant = (
         "adapter" if bool(cfg.model.use_adapter) else "base"
     )
     run_name = _planning_run_name(cfg)
+    protocol_name = (
+        f"protocol_v{EVALUATION_PROTOCOL_VERSION.split('.', maxsplit=1)[0]}"
+    )
     evaluation_run_name = f"eval_seed{int(cfg.seed)}"
     run_dir = (
         output_root
         / model_variant
         / run_name
+        / protocol_name
         / evaluation_run_name
     )
     result_path = run_dir / "results.json"
@@ -184,10 +200,6 @@ def main(cfg: DictConfig) -> None:
     world.close()
 
     run_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_metadata = getattr(
-        policy,
-        "adapter_checkpoint_metadata",
-    )
     result = {
         **{
             key: _json_value(value)
@@ -208,11 +220,34 @@ def main(cfg: DictConfig) -> None:
         "evaluation_protocol_version": EVALUATION_PROTOCOL_VERSION,
         "evaluation_seed": int(cfg.seed),
         "evaluation_samples": {
-            "episode_ids": eval_episodes.tolist(),
+            "episode_partition": "eval",
+            "episode_indices": eval_episodes.tolist(),
             "start_steps": eval_steps.tolist(),
             "goal_offset_steps": int(cfg.eval.goal_offset_steps),
             "eval_budget": int(cfg.eval.eval_budget),
             "num_eval": len(eval_episodes),
+        },
+        "episode_split": {
+            "strategy": data_selection["episode_split_strategy"],
+            "seed": data_selection["episode_split_seed"],
+            "train_fraction": data_selection[
+                "episode_split_train_fraction"
+            ],
+            "source_episode_count": data_selection[
+                "source_episode_count"
+            ],
+            "train_episode_count": data_selection[
+                "train_episode_count"
+            ],
+            "eval_episode_count": data_selection[
+                "eval_episode_count"
+            ],
+            "train_episode_indices_sha256": data_selection[
+                "train_episode_indices_sha256"
+            ],
+            "eval_episode_indices_sha256": data_selection[
+                "eval_episode_indices_sha256"
+            ],
         },
         "training_data_selection": checkpoint_metadata[
             "data_selection"

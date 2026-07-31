@@ -16,25 +16,46 @@ from wm_adapter_freq.data.appearance_shift import (
 )
 
 
+EPISODE_SPLIT_STRATEGY = "deterministic_episode_partition_v1"
 WINDOW_SELECTION_STRATEGY = "episode_balanced_round_robin_v1"
+
+
+def split_episode_indices(
+    num_episodes: int,
+    train_fraction: float,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Partition dataset episode indices into deterministic train/eval sets."""
+    episode_indices = np.arange(num_episodes, dtype=np.int64)
+    generator = np.random.default_rng(seed)
+    permuted_indices = generator.permutation(episode_indices)
+    train_count = int(np.floor(num_episodes * train_fraction))
+    train_episode_indices = np.sort(permuted_indices[:train_count])
+    eval_episode_indices = np.sort(permuted_indices[train_count:])
+    return train_episode_indices, eval_episode_indices
 
 
 def select_episode_balanced_window_indices(
     dataset: Any,
+    allowed_episode_indices: np.ndarray,
     max_windows: int,
     seed: int,
 ) -> list[int]:
     """Select clip indices evenly across episodes with deterministic shuffling."""
     clip_indices = dataset.clip_indices
-    target_count = min(int(max_windows), len(clip_indices))
-    if target_count <= 0:
-        return []
-
+    allowed_episodes = set(
+        np.asarray(allowed_episode_indices, dtype=np.int64).tolist()
+    )
     windows_by_episode: dict[int, list[int]] = {}
     for window_index, (episode_index, _) in enumerate(clip_indices):
-        windows_by_episode.setdefault(int(episode_index), []).append(
-            window_index
-        )
+        episode = int(episode_index)
+        if episode in allowed_episodes:
+            windows_by_episode.setdefault(episode, []).append(window_index)
+
+    candidate_count = sum(map(len, windows_by_episode.values()))
+    target_count = min(int(max_windows), candidate_count)
+    if target_count <= 0:
+        return []
 
     generator = np.random.default_rng(int(seed))
     episode_order = generator.permutation(
