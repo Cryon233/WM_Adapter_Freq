@@ -6,12 +6,15 @@ dataset_cache_dir: null
 device: cuda
 seed: 42
 
+model:
+  use_adapter: true
+
 appearance:
   enabled: true
   protocol: fixed
   shift_type: composed
   severity: 1.0
-  seed: 42
+  seed: 2026
 
 world:
   env_name: swm/TwoRoom-v1
@@ -44,7 +47,7 @@ eval:
           value: goal_proprio
 
 output:
-  video: true
+  video: false
   root_dir: outputs/plan/lewm_tworoom
 
 hydra:

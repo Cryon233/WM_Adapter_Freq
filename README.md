@@ -32,11 +32,10 @@ src/wm_adapter_freq/
   encoders/  # DINOv2、LeWM ViT 的显式拆分
   backends/  # 两种基础世界模型接口
   data/      # 序列外观扰动、paired windows、HDF5 cache
-  envs/      # 原始 render 阶段的在线 OOD wrapper
   models/    # 上游规划兼容的 adapted models
   objectives/
   training/
-  planning/
+  planning/  # current-only OOD transform 与 MPC policy 构建
   io/        # Adapter checkpoint 与基础模型 fingerprint
 scripts/
   build_feature_cache.py
@@ -85,7 +84,7 @@ python scripts/build_feature_cache.py \
 - `data/features/prejepa_tworoom.h5`
 - `data/features/lewm_tworoom.h5`
 
-每个 clean 四帧物理窗口只读取一次，并从同一轨迹生成 photometric、background texture、palette shift 和 composed 四个序列级外观视图。cache 使用 float16 token/latent、chunked HDF5 和 LZF 压缩。分块方式与训练访问一致：clean feature 和 clean target 按单个 window 分块，shifted feature 按单个 window、单个 view 分块；action、proprio、shift type 和 shift seed 使用最多 64 个 window 的 chunk。
+每个 clean 四帧物理窗口只读取一次，并从同一轨迹生成 photometric、background texture、palette shift 和 composed 四个序列级外观视图。cache 配置中的 `seed: 42` 用于生成这些训练 appearance views。cache 使用 float16 token/latent、chunked HDF5 和 LZF 压缩。分块方式与训练访问一致：clean feature 和 clean target 按单个 window 分块，shifted feature 按单个 window、单个 view 分块；action、proprio、shift type 和 shift seed 使用最多 64 个 window 的 chunk。
 
 默认规模及未压缩 feature 体积估算：
 
@@ -122,47 +121,131 @@ python scripts/train_adapter.py \
 
 ## TwoRoom clean 与在线 OOD MPC
 
-规划继续使用上游 `CEMSolver`、`WorldModelPolicy` 和 `PlanConfig`。默认 `history_len=3`、`action_block=5`、`horizon=5`、`receding_horizon=1`；PreJEPA history keys 为 pixels/proprio，LeWM 为 pixels。
+规划继续使用上游 `CEMSolver`、`WorldModelPolicy` 和 `PlanConfig`。默认 `history_len=3`、`action_block=5`、`horizon=5`、`receding_horizon=1`；PreJEPA history keys 为 pixels/proprio，LeWM 为 pixels。base 对照使用完全未挂载 Adapter 的原始基础模型，adapter 条件使用训练后的 Adapter；两者都从同一 Adapter checkpoint 恢复 fingerprint、normalization 和训练 appearance 元数据。
 
-clean 规划：
+最终 OOD 协议为 fixed appearance domain，版本为 `2.0`。planning 默认 `appearance.seed: 2026`，它与训练 cache 的 seed 42 分离，用来定义默认未见测试域。修改 `appearance.seed` 可以生成其他固定 OOD 域；比较不同 backend、base 和 adapter 时必须使用相同的 `appearance.seed`。
 
-```bash
-python scripts/plan.py \
-    --config-name prejepa_tworoom \
-    appearance.enabled=false
+同一次规划运行中的所有环境、episode、history 帧和 current observation 复用同一个 `AppearanceShiftSpec`。appearance shift 在 policy 的 current pixels transform 中、标准 resize 和 ImageNet normalization 之前执行，因此 dataset-driven evaluation 注入的第一帧和后续环境帧都会且只会被处理一次。goal 使用独立的 clean 标准预处理器，不经过 appearance shift。
 
-python scripts/plan.py \
-    --config-name lewm_tworoom \
-    appearance.enabled=false
-```
+### PreJEPA 四个条件
 
-OOD 规划：
+Base Clean：
 
 ```bash
 python scripts/plan.py \
     --config-name prejepa_tworoom \
-    appearance.enabled=true \
-    appearance.shift_type=composed \
-    appearance.severity=1.0 \
-    appearance.seed=42
-
-python scripts/plan.py \
-    --config-name lewm_tworoom \
-    appearance.enabled=true \
-    appearance.shift_type=composed \
-    appearance.severity=1.0 \
-    appearance.seed=42
+    model.use_adapter=false \
+    appearance.enabled=false
 ```
 
-最终 OOD 协议为 fixed appearance domain。`appearance.seed` 唯一确定整个评估运行的视觉域；所有并行环境、所有 episode、所有 history 帧和所有 current observation 使用同一个 `AppearanceShiftSpec`，因此不同模型和 Adapter 面对完全相同的 OOD 域。
+Base OOD：
 
-该协议继续采用 clean-goal 设定：在线 current observation 在 TwoRoom 原始 HWC `uint8` render 阶段施加固定 shift，之后才进入上游 resize 和 ImageNet normalization；dataset 提供的 goal image 保持 clean。shifted current 与 clean goal 都通过同一个训练后 Adapter。wrapper 不改变 state、proprio、goal state、action、reward、碰撞或终止条件。
+```bash
+python scripts/plan.py \
+    --config-name prejepa_tworoom \
+    model.use_adapter=false \
+    appearance.enabled=true \
+    appearance.shift_type=composed \
+    appearance.severity=1.0 \
+    appearance.seed=2026
+```
 
-clean 与不同 OOD 域的输出会自动隔离，同一配置重复运行则覆盖同一实验目录：
+Adapter Clean：
 
-- `outputs/plan/prejepa_tworoom/clean/results.json`
-- `outputs/plan/prejepa_tworoom/composed_severity1p0_seed42/results.json`
-- `outputs/plan/lewm_tworoom/clean/results.json`
-- `outputs/plan/lewm_tworoom/composed_severity1p0_seed42/results.json`
+```bash
+python scripts/plan.py \
+    --config-name prejepa_tworoom \
+    model.use_adapter=true \
+    appearance.enabled=false
+```
 
-各目录下的视频保存到 `videos/`。结果 JSON 同时记录基础模型 fingerprint、Adapter checkpoint、run name、输出目录、训练 appearance 域、评估 appearance 域、planning 配置和 CEM 配置。数据、feature cache、基础权重、Adapter checkpoint、规划输出及视频均由 `.gitignore` 排除。
+Adapter OOD：
+
+```bash
+python scripts/plan.py \
+    --config-name prejepa_tworoom \
+    model.use_adapter=true \
+    appearance.enabled=true \
+    appearance.shift_type=composed \
+    appearance.severity=1.0 \
+    appearance.seed=2026
+```
+
+### LeWM 四个条件
+
+Base Clean：
+
+```bash
+python scripts/plan.py \
+    --config-name lewm_tworoom \
+    model.use_adapter=false \
+    appearance.enabled=false
+```
+
+Base OOD：
+
+```bash
+python scripts/plan.py \
+    --config-name lewm_tworoom \
+    model.use_adapter=false \
+    appearance.enabled=true \
+    appearance.shift_type=composed \
+    appearance.severity=1.0 \
+    appearance.seed=2026
+```
+
+Adapter Clean：
+
+```bash
+python scripts/plan.py \
+    --config-name lewm_tworoom \
+    model.use_adapter=true \
+    appearance.enabled=false
+```
+
+Adapter OOD：
+
+```bash
+python scripts/plan.py \
+    --config-name lewm_tworoom \
+    model.use_adapter=true \
+    appearance.enabled=true \
+    appearance.shift_type=composed \
+    appearance.severity=1.0 \
+    appearance.seed=2026
+```
+
+最小实验矩阵：
+
+| backend | model | domain |
+|---|---|---|
+| PreJEPA | base | clean |
+| PreJEPA | base | OOD |
+| PreJEPA | adapter | clean |
+| PreJEPA | adapter | OOD |
+| LeWM | base | clean |
+| LeWM | base | OOD |
+| LeWM | adapter | clean |
+| LeWM | adapter | OOD |
+
+输出按模型 variant 和 domain 自动隔离：
+
+```text
+outputs/plan/prejepa_tworoom/
+├── base/
+│   ├── clean/results.json
+│   └── composed_severity1p0_seed2026/results.json
+└── adapter/
+    ├── clean/results.json
+    └── composed_severity1p0_seed2026/results.json
+
+outputs/plan/lewm_tworoom/
+├── base/
+│   ├── clean/results.json
+│   └── composed_severity1p0_seed2026/results.json
+└── adapter/
+    ├── clean/results.json
+    └── composed_severity1p0_seed2026/results.json
+```
+
+默认 `output.video=false`，因为上游 panel video 显示环境 clean render，而 appearance shift 发生在 policy input 中；`results.json` 的评价使用真实 shifted policy input，当前版本不把模型看到的 OOD 图像写入 panel video。结果还记录 model variant、基础模型 fingerprint、Adapter checkpoint、训练/评估 appearance 域、evaluation protocol version、planning 配置和 CEM 配置。数据、checkpoint 与规划输出均由 `.gitignore` 排除。

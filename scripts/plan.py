@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import functools
 import json
 import math
 from decimal import Decimal
@@ -12,8 +11,8 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from wm_adapter_freq.envs.appearance_render_wrapper import (
-    TwoRoomAppearanceRenderWrapper,
+from wm_adapter_freq.planning.appearance_transform import (
+    EVALUATION_PROTOCOL_VERSION,
 )
 from wm_adapter_freq.planning.policy_builder import build_tworoom_mpc_policy
 
@@ -74,6 +73,11 @@ def main(cfg: DictConfig) -> None:
         backend=str(cfg.backend),
         base_model_ref=str(cfg.base_model_ref),
         adapter_checkpoint=Path(str(cfg.adapter_checkpoint)).expanduser(),
+        use_adapter=bool(cfg.model.use_adapter),
+        appearance_enabled=bool(cfg.appearance.enabled),
+        appearance_shift_type=str(cfg.appearance.shift_type),
+        appearance_severity=float(cfg.appearance.severity),
+        appearance_seed=int(cfg.appearance.seed),
         device=str(cfg.device),
         horizon=int(cfg.plan.horizon),
         receding_horizon=int(cfg.plan.receding_horizon),
@@ -116,8 +120,11 @@ def main(cfg: DictConfig) -> None:
     eval_steps = step_ids[selected_rows].astype(np.int64)
 
     output_root = Path(str(cfg.output.root_dir)).expanduser()
+    model_variant = (
+        "adapter" if bool(cfg.model.use_adapter) else "base"
+    )
     run_name = _planning_run_name(cfg)
-    run_dir = output_root / run_name
+    run_dir = output_root / model_variant / run_name
     result_path = run_dir / "results.json"
     video_path = run_dir / "videos" if bool(cfg.output.video) else None
 
@@ -126,15 +133,6 @@ def main(cfg: DictConfig) -> None:
         num_envs=int(cfg.eval.num_eval),
         max_episode_steps=2 * int(cfg.eval.eval_budget),
         image_shape=(224, 224),
-        pre_wrappers=[
-            functools.partial(
-                TwoRoomAppearanceRenderWrapper,
-                enabled=bool(cfg.appearance.enabled),
-                shift_type=str(cfg.appearance.shift_type),
-                severity=float(cfg.appearance.severity),
-                base_seed=int(cfg.appearance.seed),
-            )
-        ],
     )
     world.set_policy(policy)
     metrics = world.evaluate(
@@ -167,6 +165,9 @@ def main(cfg: DictConfig) -> None:
         ),
         "run_name": run_name,
         "output_directory": str(run_dir),
+        "model_variant": model_variant,
+        "use_adapter": bool(cfg.model.use_adapter),
+        "evaluation_protocol_version": EVALUATION_PROTOCOL_VERSION,
         "training_appearance": checkpoint_metadata[
             "appearance_training"
         ],

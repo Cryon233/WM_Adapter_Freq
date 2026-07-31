@@ -11,6 +11,9 @@ from wm_adapter_freq.backends.base import build_backend
 from wm_adapter_freq.data.paired_windows import build_image_preprocessor
 from wm_adapter_freq.io.adapter_checkpoint import load_adapter_checkpoint
 from wm_adapter_freq.io.fingerprint import resolve_base_model_identity
+from wm_adapter_freq.planning.appearance_transform import (
+    FixedCurrentObservationTransform,
+)
 
 
 def _normalizers_from_checkpoint(
@@ -43,13 +46,14 @@ def _normalizers_from_checkpoint(
     return scalers
 
 
-def build_adapted_model(
+def build_world_model(
     backend: str,
     base_model_ref: str,
     adapter_checkpoint: str | Path,
+    use_adapter: bool,
     device: torch.device | str,
 ) -> nn.Module:
-    """Attach a fingerprint-matched adapter to its frozen base model."""
+    """Build a fingerprint-matched base or adapted world model."""
     from stable_worldmodel.wm.utils import load_pretrained
 
     target_device = torch.device(device)
@@ -83,11 +87,16 @@ def build_adapted_model(
             "Adapter checkpoint dimensions do not match the base model."
         )
 
-    model = model_backend.build_online_model(adapter)
+    model = (
+        model_backend.build_online_model(adapter)
+        if use_adapter
+        else base_model
+    )
     model.to(target_device)
     model.eval()
     setattr(model, "base_model_fingerprint", identity.combined_fingerprint)
     setattr(model, "adapter_checkpoint_metadata", metadata)
+    setattr(model, "model_variant", "adapter" if use_adapter else "base")
     return model
 
 
@@ -95,6 +104,11 @@ def build_tworoom_mpc_policy(
     backend: str,
     base_model_ref: str,
     adapter_checkpoint: str | Path,
+    use_adapter: bool,
+    appearance_enabled: bool,
+    appearance_shift_type: str,
+    appearance_severity: float,
+    appearance_seed: int,
     device: torch.device | str,
     horizon: int = 5,
     receding_horizon: int = 1,
@@ -115,10 +129,11 @@ def build_tworoom_mpc_policy(
     )
     from stable_worldmodel.policy import PlanConfig, WorldModelPolicy
 
-    model = build_adapted_model(
+    model = build_world_model(
         backend,
         base_model_ref,
         adapter_checkpoint,
+        use_adapter,
         device,
     )
     checkpoint_metadata = getattr(model, "adapter_checkpoint_metadata")
@@ -145,7 +160,14 @@ def build_tworoom_mpc_policy(
         action_block=action_block,
         warm_start=warm_start,
     )
-    image_preprocessor = build_image_preprocessor(224)
+    current_transform = FixedCurrentObservationTransform(
+        enabled=appearance_enabled,
+        shift_type=appearance_shift_type,
+        severity=appearance_severity,
+        seed=appearance_seed,
+        image_size=224,
+    )
+    goal_transform = build_image_preprocessor(224)
     policy = WorldModelPolicy(
         solver=solver,
         config=plan_config,
@@ -153,8 +175,8 @@ def build_tworoom_mpc_policy(
             checkpoint_metadata["normalization"]
         ),
         transform={
-            "pixels": image_preprocessor,
-            "goal": image_preprocessor,
+            "pixels": current_transform,
+            "goal": goal_transform,
         },
         history_keys=history_keys,
         seed=seed,
@@ -168,5 +190,10 @@ def build_tworoom_mpc_policy(
         policy,
         "adapter_checkpoint_metadata",
         checkpoint_metadata,
+    )
+    setattr(
+        policy,
+        "model_variant",
+        getattr(model, "model_variant"),
     )
     return policy
