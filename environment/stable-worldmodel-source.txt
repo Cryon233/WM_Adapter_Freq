@@ -1,0 +1,9 @@
+remote:
+origin	https://github.com/galilai-group/stable-worldmodel.git (fetch)
+origin	https://github.com/galilai-group/stable-worldmodel.git (push)
+
+branch:
+main
+
+commit:
+73dade035ff789e007194971ca5a59b3c3f77e6b

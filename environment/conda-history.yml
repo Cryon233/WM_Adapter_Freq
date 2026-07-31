@@ -1,0 +1,8 @@
+name: wm
+channels:
+  - conda-forge
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/free/
+  - defaults
+dependencies:
+  - python==3.10
+prefix: /home/zhaoyang/anaconda3/envs/wm
