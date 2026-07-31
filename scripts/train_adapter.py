@@ -131,6 +131,25 @@ def main(cfg: DictConfig) -> None:
                     dataset.metadata["appearance_pipeline_version"]
                 ),
             },
+            "data_selection": {
+                "strategy": str(
+                    dataset.metadata["window_selection_strategy"]
+                ),
+                "seed": int(
+                    dataset.metadata["window_selection_seed"]
+                ),
+                "source_window_count": int(
+                    dataset.metadata["source_window_count"]
+                ),
+                "selected_window_count": int(
+                    dataset.metadata["selected_window_count"]
+                ),
+                "selected_window_indices_sha256": str(
+                    dataset.metadata[
+                        "selected_window_indices_sha256"
+                    ]
+                ),
+            },
         },
     )
 

@@ -25,6 +25,7 @@ def save_adapter_checkpoint(
     dataset_name: str,
     normalization: dict[str, dict[str, Any]],
     appearance_training: dict[str, Any],
+    data_selection: dict[str, Any],
     history_size: int = 3,
     image_size: int = 224,
     patch_size: int = 14,
@@ -64,6 +65,7 @@ def save_adapter_checkpoint(
         "dataset_name": dataset_name,
         "normalization": normalization,
         "appearance_training": appearance_training,
+        "data_selection": data_selection,
     }
     torch.save(checkpoint, output_path)
 

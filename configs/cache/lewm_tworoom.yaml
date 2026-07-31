@@ -3,7 +3,7 @@ base_model_ref: tworoom_lewm
 dataset_name: tworoom.h5
 dataset_cache_dir: null
 output_path: data/features/lewm_tworoom.h5
-max_windows: 5000
+max_windows: 2000
 encoder_batch_size: 32
 writer_chunk_size: 64
 num_workers: 4
@@ -13,6 +13,10 @@ image_size: 224
 
 appearance:
   severity: 1.0
+
+window_selection:
+  strategy: episode_balanced_round_robin_v1
+  seed: 42
 
 hydra:
   job:

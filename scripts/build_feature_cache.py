@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -19,8 +20,10 @@ from wm_adapter_freq.data.appearance_shift import (
 )
 from wm_adapter_freq.data.feature_cache import FeatureCacheWriter
 from wm_adapter_freq.data.paired_windows import (
+    WINDOW_SELECTION_STRATEGY,
     build_image_preprocessor,
     load_paired_two_room_windows,
+    select_episode_balanced_window_indices,
 )
 from wm_adapter_freq.io.fingerprint import (
     STABLE_WORLDMODEL_COMMIT,
@@ -93,6 +96,12 @@ def _encode_chunks(
 def main(cfg: DictConfig) -> None:
     from stable_worldmodel.wm.utils import load_pretrained
 
+    if str(cfg.window_selection.strategy) != WINDOW_SELECTION_STRATEGY:
+        raise ValueError(
+            "window_selection.strategy must be "
+            f"'{WINDOW_SELECTION_STRATEGY}'"
+        )
+
     torch.manual_seed(int(cfg.seed))
     device = torch.device(str(cfg.device))
     identity = resolve_base_model_identity(str(cfg.base_model_ref))
@@ -109,7 +118,12 @@ def main(cfg: DictConfig) -> None:
         severity=float(cfg.appearance.severity),
     )
     max_windows = min(int(cfg.max_windows), len(paired_dataset))
-    windows = Subset(paired_dataset, range(max_windows))
+    selected_window_indices = select_episode_balanced_window_indices(
+        source_dataset,
+        max_windows=max_windows,
+        seed=int(cfg.window_selection.seed),
+    )
+    windows = Subset(paired_dataset, selected_window_indices)
     data_loader = DataLoader(
         windows,
         batch_size=int(cfg.encoder_batch_size),
@@ -127,6 +141,12 @@ def main(cfg: DictConfig) -> None:
     )
 
     output_path = Path(str(cfg.output_path)).expanduser()
+    selected_indices_sha256 = hashlib.sha256(
+        np.asarray(
+            selected_window_indices,
+            dtype=np.int64,
+        ).tobytes()
+    ).hexdigest()
     metadata: dict[str, str | int | float] = {
         "backend": str(cfg.backend),
         "base_model_ref": str(cfg.base_model_ref),
@@ -147,6 +167,11 @@ def main(cfg: DictConfig) -> None:
             separators=(",", ":"),
         ),
         "appearance_pipeline_version": SHIFT_PIPELINE_VERSION,
+        "window_selection_strategy": WINDOW_SELECTION_STRATEGY,
+        "window_selection_seed": int(cfg.window_selection.seed),
+        "source_window_count": len(source_dataset.clip_indices),
+        "selected_window_count": len(selected_window_indices),
+        "selected_window_indices_sha256": selected_indices_sha256,
         "normalization_method": "zscore",
         "action_normalization": json.dumps(
             action_normalization,

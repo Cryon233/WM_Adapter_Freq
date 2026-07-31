@@ -23,6 +23,52 @@ def _episode_column(dataset: Any) -> str:
     return "episode_idx" if "episode_idx" in names else "ep_idx"
 
 
+def _select_episode_balanced_eval_rows(
+    episode_ids: np.ndarray,
+    step_ids: np.ndarray,
+    goal_offset_steps: int,
+    num_eval: int,
+    seed: int,
+) -> np.ndarray:
+    """Select one valid start row from each sampled episode."""
+    episode_values = np.asarray(episode_ids)
+    step_values = np.asarray(step_ids)
+    valid_rows_by_episode: dict[int, np.ndarray] = {}
+    for episode_id in np.unique(episode_values):
+        episode_rows = np.flatnonzero(episode_values == episode_id)
+        max_step = int(step_values[episode_rows].max())
+        valid_rows = episode_rows[
+            step_values[episode_rows]
+            <= max_step - int(goal_offset_steps)
+        ]
+        if valid_rows.size > 0:
+            valid_rows_by_episode[int(episode_id)] = valid_rows
+
+    generator = np.random.default_rng(int(seed))
+    eligible_episodes = np.asarray(
+        list(valid_rows_by_episode),
+        dtype=np.int64,
+    )
+    selection_count = min(int(num_eval), eligible_episodes.size)
+    if selection_count <= 0:
+        return np.empty(0, dtype=np.int64)
+
+    selected_episodes = generator.choice(
+        eligible_episodes,
+        size=selection_count,
+        replace=False,
+    )
+    selected_rows = np.asarray(
+        [
+            generator.choice(valid_rows_by_episode[int(episode_id)])
+            for episode_id in selected_episodes
+        ],
+        dtype=np.int64,
+    )
+    order = np.argsort(episode_values[selected_rows], kind="stable")
+    return selected_rows[order]
+
+
 def _json_value(value: Any) -> Any:
     if isinstance(value, np.ndarray):
         return value.tolist()
@@ -92,29 +138,14 @@ def main(cfg: DictConfig) -> None:
     )
 
     episode_column = _episode_column(dataset)
-    episode_ids = dataset.get_col_data(episode_column)
-    step_ids = dataset.get_col_data("step_idx")
-    unique_episodes = np.unique(episode_ids)
-    max_start = {
-        episode: int(step_ids[episode_ids == episode].max())
-        - int(cfg.eval.goal_offset_steps)
-        for episode in unique_episodes
-    }
-    valid_rows = np.flatnonzero(
-        np.asarray(
-            [
-                step <= max_start[episode]
-                for episode, step in zip(episode_ids, step_ids)
-            ]
-        )
-    )
-    generator = np.random.default_rng(int(cfg.seed))
-    selected_rows = np.sort(
-        generator.choice(
-            valid_rows,
-            size=int(cfg.eval.num_eval),
-            replace=False,
-        )
+    episode_ids = np.asarray(dataset.get_col_data(episode_column))
+    step_ids = np.asarray(dataset.get_col_data("step_idx"))
+    selected_rows = _select_episode_balanced_eval_rows(
+        episode_ids=episode_ids,
+        step_ids=step_ids,
+        goal_offset_steps=int(cfg.eval.goal_offset_steps),
+        num_eval=int(cfg.eval.num_eval),
+        seed=int(cfg.seed),
     )
     eval_episodes = episode_ids[selected_rows].astype(np.int64)
     eval_steps = step_ids[selected_rows].astype(np.int64)
@@ -124,13 +155,19 @@ def main(cfg: DictConfig) -> None:
         "adapter" if bool(cfg.model.use_adapter) else "base"
     )
     run_name = _planning_run_name(cfg)
-    run_dir = output_root / model_variant / run_name
+    evaluation_run_name = f"eval_seed{int(cfg.seed)}"
+    run_dir = (
+        output_root
+        / model_variant
+        / run_name
+        / evaluation_run_name
+    )
     result_path = run_dir / "results.json"
     video_path = run_dir / "videos" if bool(cfg.output.video) else None
 
     world = swm.World(
         str(cfg.world.env_name),
-        num_envs=int(cfg.eval.num_eval),
+        num_envs=len(eval_episodes),
         max_episode_steps=2 * int(cfg.eval.eval_budget),
         image_shape=(224, 224),
     )
@@ -164,10 +201,22 @@ def main(cfg: DictConfig) -> None:
             Path(str(cfg.adapter_checkpoint)).expanduser()
         ),
         "run_name": run_name,
+        "evaluation_run_name": evaluation_run_name,
         "output_directory": str(run_dir),
         "model_variant": model_variant,
         "use_adapter": bool(cfg.model.use_adapter),
         "evaluation_protocol_version": EVALUATION_PROTOCOL_VERSION,
+        "evaluation_seed": int(cfg.seed),
+        "evaluation_samples": {
+            "episode_ids": eval_episodes.tolist(),
+            "start_steps": eval_steps.tolist(),
+            "goal_offset_steps": int(cfg.eval.goal_offset_steps),
+            "eval_budget": int(cfg.eval.eval_budget),
+            "num_eval": len(eval_episodes),
+        },
+        "training_data_selection": checkpoint_metadata[
+            "data_selection"
+        ],
         "training_appearance": checkpoint_metadata[
             "appearance_training"
         ],

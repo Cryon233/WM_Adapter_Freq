@@ -4,6 +4,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 from stable_pretraining import data as spt_data
 from torch import Tensor
@@ -13,6 +14,57 @@ from wm_adapter_freq.data.appearance_shift import (
     SHIFT_NAMES,
     TwoRoomAppearanceShift,
 )
+
+
+WINDOW_SELECTION_STRATEGY = "episode_balanced_round_robin_v1"
+
+
+def select_episode_balanced_window_indices(
+    dataset: Any,
+    max_windows: int,
+    seed: int,
+) -> list[int]:
+    """Select clip indices evenly across episodes with deterministic shuffling."""
+    clip_indices = dataset.clip_indices
+    target_count = min(int(max_windows), len(clip_indices))
+    if target_count <= 0:
+        return []
+
+    windows_by_episode: dict[int, list[int]] = {}
+    for window_index, (episode_index, _) in enumerate(clip_indices):
+        windows_by_episode.setdefault(int(episode_index), []).append(
+            window_index
+        )
+
+    generator = np.random.default_rng(int(seed))
+    episode_order = generator.permutation(
+        np.asarray(list(windows_by_episode), dtype=np.int64)
+    ).tolist()
+    shuffled_windows = {
+        episode_index: generator.permutation(
+            np.asarray(
+                windows_by_episode[episode_index],
+                dtype=np.int64,
+            )
+        ).tolist()
+        for episode_index in episode_order
+    }
+
+    selected: list[int] = []
+    round_index = 0
+    while len(selected) < target_count:
+        added_in_round = False
+        for episode_index in episode_order:
+            episode_windows = shuffled_windows[episode_index]
+            if round_index < len(episode_windows):
+                selected.append(int(episode_windows[round_index]))
+                added_in_round = True
+                if len(selected) == target_count:
+                    break
+        if not added_in_round:
+            break
+        round_index += 1
+    return selected
 
 
 class PairedAppearanceWindowDataset(Dataset[dict[str, Tensor]]):
