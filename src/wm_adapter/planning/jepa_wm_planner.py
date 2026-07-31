@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -24,6 +25,7 @@ from wm_adapter.utils.reproducibility import resolve_path, seed_everything
 
 EVALUATION_PROTOCOL_VERSION = "2.0"
 EVALUATION_PROTOCOL_DIRECTORY = "protocol_v2"
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -214,6 +216,9 @@ def run_robocasa_planning(
     from evals.simu_env_planning.planning.common.parser import parse_cfg
     from evals.simu_env_planning.planning.plan_evaluator import PlanEvaluator
 
+    method_name = str(experiment_config.method)
+    domain_name = str(experiment_config.domain)
+    total_episodes = int(experiment_config.evaluation.num_episodes)
     evaluation_seed = int(experiment_config.evaluation.eval_seed)
     if str(experiment_config.appearance.pipeline_version) != APPEARANCE_PIPELINE_VERSION:
         raise ValueError(
@@ -279,7 +284,31 @@ def run_robocasa_planning(
         int(experiment_config.planning.candidate_chunk_size),
         int(experiment_config.planning.history_len),
     )
+    LOGGER.info(
+        "PLANNING_PROGRESS "
+        "phase=job status=started "
+        "method=%s domain=%s total_episodes=%d",
+        method_name,
+        domain_name,
+        total_episodes,
+    )
+    environment_started = time.perf_counter()
+    LOGGER.info(
+        "PLANNING_PROGRESS "
+        "phase=environment status=started "
+        "method=%s domain=%s",
+        method_name,
+        domain_name,
+    )
     environment = make_env(official_cfg)
+    LOGGER.info(
+        "PLANNING_PROGRESS "
+        "phase=environment status=completed "
+        "method=%s domain=%s elapsed_seconds=%.3f",
+        method_name,
+        domain_name,
+        time.perf_counter() - environment_started,
+    )
     evaluator = PlanEvaluator(official_cfg, agent)
     successes: list[bool] = []
     environment_seeds: list[int] = []
@@ -287,14 +316,59 @@ def run_robocasa_planning(
         torch.cuda.reset_peak_memory_stats(backend.device)
     started = time.perf_counter()
     try:
-        for episode in range(int(experiment_config.evaluation.num_episodes)):
+        for episode in range(total_episodes):
             episode_seed = (evaluation_seed * evaluation_seed + episode * evaluation_seed) % (2**32 - 2)
+            episode_number = episode + 1
+            episode_started = time.perf_counter()
+            LOGGER.info(
+                "PLANNING_PROGRESS "
+                "phase=episode status=started "
+                "method=%s domain=%s "
+                "episode=%d total=%d completed=%d "
+                "success_count=%d",
+                method_name,
+                domain_name,
+                episode_number,
+                total_episodes,
+                episode,
+                sum(successes),
+            )
             result = evaluator.eval(official_cfg, agent, environment, task_idx=-1, ep=episode)
-            successes.append(bool(result[1]))
+            episode_success = bool(result[1])
+            successes.append(episode_success)
             environment_seeds.append(int(episode_seed))
+            LOGGER.info(
+                "PLANNING_PROGRESS "
+                "phase=episode status=completed "
+                "method=%s domain=%s "
+                "episode=%d total=%d completed=%d "
+                "success=%s success_count=%d "
+                "elapsed_seconds=%.3f",
+                method_name,
+                domain_name,
+                episode_number,
+                total_episodes,
+                len(successes),
+                str(episode_success).lower(),
+                sum(successes),
+                time.perf_counter() - episode_started,
+            )
     finally:
         environment.close()
     elapsed = time.perf_counter() - started
+    LOGGER.info(
+        "PLANNING_PROGRESS "
+        "phase=job status=completed "
+        "method=%s domain=%s "
+        "completed=%d total=%d "
+        "success_count=%d elapsed_seconds=%.3f",
+        method_name,
+        domain_name,
+        len(successes),
+        total_episodes,
+        sum(successes),
+        elapsed,
+    )
     peak_memory = (
         int(torch.cuda.max_memory_allocated(backend.device)) if backend.device.type == "cuda" else 0
     )
