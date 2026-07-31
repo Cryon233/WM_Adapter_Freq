@@ -110,6 +110,44 @@ python scripts/build_feature_cache.py \
 
 默认引用为 `tworoom_prejepa` 和 `tworoom_lewm`，它们作为上游 checkpoint cache 短名称解析；`owner/repo` 形式仍按上游 Hugging Face 规则解析。可在相应命令后用 `base_model_ref="$PREJEPA_CKPT"` 或 `base_model_ref="$LEWM_CKPT"` 覆盖。构建 cache、训练和规划必须引用同一基础 checkpoint：cache 和 Adapter checkpoint 会记录权重、配置及固定上游 commit 的组合 SHA256，加载时不一致会直接拒绝组合。
 
+## 训练 clean PreJEPA 基础模型
+
+固定上游 commit `73dade035ff789e007194971ca5a59b3c3f77e6b` 的 `third_party/stable-worldmodel/scripts/train/prejepa.py` 存在 singleton validation batch 限制。其 `dinowm_forward` 对 action/proprio 执行无参数 `squeeze()`；当验证集最后一个 batch 的 batch size 为 1 时，输入会从 `[1, 4, 2]` 变为 `[4, 2]`，随后 PreJEPA `Embedder` 的 `x.permute(0, 2, 1)` 会因缺少 batch 维而失败。
+
+这是固定上游训练脚本的问题，不表示 TwoRoom 数据损坏，也不是 CUDA OOM。本项目不修改 `third_party`，也不修改验证 DataLoader。当前 10,000 条 TwoRoom 采集数据在 `batch_size=8`、`train_split=0.9` 和 seed 42 下共有 5,650 个验证 batch，最后一个是 singleton batch。使用 `trainer.limit_val_batches=5649` 只跳过该批次中的一个验证样本，不会额外丢弃或改变训练数据。
+
+如果重新生成数据，或修改 split、batch size，验证 batch 总数可能变化，不能盲目复用 `5649`。当前数据与参数对应的可靠运行命令为：
+
+```bash
+export STABLEWM_HOME="$HOME/control-frequency-wm/storage/stable-worldmodel"
+unset LOCAL_DATASET_DIR
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+python third_party/stable-worldmodel/scripts/train/prejepa.py \
+    dataset_name=tworoom.h5 \
+    output_model_name=tworoom_prejepa \
+    subdir=tworoom_prejepa_base \
+    trainer.devices=1 \
+    trainer.strategy=auto \
+    trainer.limit_val_batches=5649 \
+    batch_size=8 \
+    num_workers=4
+```
+
+上游训练管理器会在下面的位置查找可恢复的 Lightning checkpoint；运行训练前可先检查：
+
+```bash
+export PREJEPA_RESUME_CKPT="$STABLEWM_HOME/checkpoints/tworoom_prejepa_base/tworoom_prejepa_weights.ckpt"
+
+if test -f "$PREJEPA_RESUME_CKPT"; then
+    echo "Resume checkpoint exists:"
+    ls -lh "$PREJEPA_RESUME_CKPT"
+else
+    echo "No resume checkpoint; training will restart from epoch 0."
+fi
+```
+
 ## 构建配对 feature cache
 
 ```bash
