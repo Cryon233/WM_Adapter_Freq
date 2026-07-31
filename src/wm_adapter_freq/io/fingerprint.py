@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
 
 STABLE_WORLDMODEL_COMMIT = "73dade035ff789e007194971ca5a59b3c3f77e6b"
+_UNEXPANDED_ENV_PATTERN = re.compile(
+    r"\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[^}]+\})"
+)
 
 
 @dataclass(frozen=True)
@@ -28,35 +32,122 @@ def _streaming_sha256(path: Path) -> str:
 
 
 def _expand_reference(reference: str) -> str:
-    return os.path.expandvars(os.path.expanduser(reference))
+    if not isinstance(reference, str):
+        raise TypeError("Base-model checkpoint reference must be a string.")
+    stripped = reference.strip()
+    if not stripped:
+        raise ValueError(
+            "Base-model checkpoint reference is empty.\n"
+            "Set base_model_ref to a real local .pt file, a valid checkpoint "
+            "cache name, or an owner/repo Hugging Face reference."
+        )
+    expanded = os.path.expanduser(os.path.expandvars(stripped))
+    if _UNEXPANDED_ENV_PATTERN.search(expanded):
+        raise ValueError(
+            "Base-model checkpoint reference contains an undefined "
+            "environment variable:\n"
+            f"reference: {reference}"
+        )
+    if not expanded:
+        raise ValueError(
+            "Base-model checkpoint reference is empty.\n"
+            "Set base_model_ref to a real local .pt file, a valid checkpoint "
+            "cache name, or an owner/repo Hugging Face reference."
+        )
+    return expanded
 
 
-def _is_explicit_local_reference(reference: str) -> bool:
-    expanded = _expand_reference(reference)
-    path = Path(expanded)
+def _is_explicit_local_reference(
+    original_reference: str,
+    expanded_reference: str,
+) -> bool:
+    path = Path(expanded_reference)
     return (
         path.is_absolute()
-        or reference.startswith("~")
-        or reference.startswith(".")
-        or path.suffix == ".pt"
+        or original_reference.startswith("~")
+        or original_reference.startswith(".")
+        or path.suffix.lower() == ".pt"
+        or path.exists()
     )
 
 
-def _normalized_reference(reference: str) -> str:
-    expanded_reference = _expand_reference(reference)
-    expanded_path = Path(expanded_reference)
-    if _is_explicit_local_reference(reference):
-        resolved_path = expanded_path.resolve()
-        if not expanded_path.exists():
-            raise FileNotFoundError(
-                "Local base-model checkpoint does not exist:\n"
-                f"reference: {reference}\n"
-                f"resolved path: {resolved_path}"
+def _resolve_explicit_local_checkpoint(
+    original_reference: str,
+    expanded_reference: str,
+) -> tuple[Path, Path]:
+    path = Path(expanded_reference).resolve()
+    if not path.exists():
+        raise FileNotFoundError(
+            "Local base-model checkpoint does not exist:\n"
+            f"reference: {original_reference}\n"
+            f"resolved path: {path}"
+        )
+
+    if path.is_file():
+        if path.suffix.lower() != ".pt":
+            raise ValueError(
+                "Local base-model checkpoint file is not a .pt file:\n"
+                f"{path}"
             )
-        return str(resolved_path)
-    if expanded_path.exists():
-        return str(expanded_path.resolve())
-    return expanded_reference
+        weights_path = path
+        config_path = path.parent / "config.json"
+    elif path.is_dir():
+        pt_files = sorted(
+            item.resolve()
+            for item in path.glob("*.pt")
+            if item.is_file()
+        )
+        if not pt_files:
+            raise FileNotFoundError(
+                "No .pt checkpoint file found in local checkpoint "
+                "directory:\n"
+                f"{path}"
+            )
+        if len(pt_files) > 1:
+            candidates = "\n".join(str(item) for item in pt_files)
+            raise ValueError(
+                "Ambiguous local checkpoint directory: multiple .pt files "
+                "found.\n"
+                "Specify one .pt file directly:\n"
+                f"{candidates}"
+            )
+        weights_path = pt_files[0]
+        config_path = path / "config.json"
+    else:
+        raise FileNotFoundError(
+            "Local base-model checkpoint is neither a file nor a "
+            "directory:\n"
+            f"{path}"
+        )
+
+    if not config_path.is_file():
+        raise FileNotFoundError(
+            f"config.json missing beside checkpoint: {config_path.resolve()}"
+        )
+    return weights_path, config_path
+
+
+def _validate_resolved_checkpoint(
+    weights_path: Path,
+    config_path: Path,
+) -> tuple[Path, Path]:
+    resolved_weights_path = weights_path.resolve()
+    resolved_config_path = config_path.resolve()
+    if not resolved_weights_path.is_file():
+        raise FileNotFoundError(
+            f"resolved weights file missing: {resolved_weights_path}"
+        )
+    if resolved_weights_path.suffix.lower() != ".pt":
+        raise ValueError(
+            "resolved checkpoint is not a .pt file: "
+            f"{resolved_weights_path}"
+        )
+    if not resolved_config_path.is_file():
+        raise FileNotFoundError(
+            "config.json missing beside checkpoint: "
+            f"{resolved_config_path}"
+        )
+    return resolved_weights_path, resolved_config_path
 
 
 def resolve_base_model_identity(
@@ -66,23 +157,25 @@ def resolve_base_model_identity(
     from stable_worldmodel.data import get_cache_dir
     from stable_worldmodel.wm.utils import _resolve
 
-    normalized_reference = _normalized_reference(base_model_ref)
-    checkpoint_root = get_cache_dir(sub_folder="checkpoints")
-    weights_path, _ = _resolve(normalized_reference, checkpoint_root)
-    weights_path = weights_path.resolve()
-    if not weights_path.is_file():
-        raise FileNotFoundError(
-            f"resolved weights file missing: {weights_path}"
+    original_reference = base_model_ref
+    expanded_reference = _expand_reference(original_reference)
+    if _is_explicit_local_reference(
+        original_reference,
+        expanded_reference,
+    ):
+        weights_path, config_path = _resolve_explicit_local_checkpoint(
+            original_reference,
+            expanded_reference,
         )
-    if weights_path.suffix != ".pt":
-        raise ValueError(
-            f"resolved checkpoint is not a .pt file: {weights_path}"
-        )
-    config_path = (weights_path.parent / "config.json").resolve()
-    if not config_path.is_file():
-        raise FileNotFoundError(
-            f"config.json missing beside checkpoint: {config_path}"
-        )
+    else:
+        checkpoint_root = get_cache_dir(sub_folder="checkpoints")
+        weights_path, _ = _resolve(expanded_reference, checkpoint_root)
+        config_path = weights_path.parent / "config.json"
+
+    weights_path, config_path = _validate_resolved_checkpoint(
+        weights_path,
+        config_path,
+    )
 
     weights_sha256 = _streaming_sha256(weights_path)
     config_sha256 = _streaming_sha256(config_path)

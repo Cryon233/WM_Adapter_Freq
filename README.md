@@ -65,14 +65,39 @@ checkpoint_dir/
 └── config.json
 ```
 
-推荐把具体 `.pt` 文件直接作为 `base_model_ref`；同目录必须存在 `config.json`。如果目录中有多个 `.pt` 文件，必须指定具体文件，不能只传目录。以下路径只是格式示例，必须替换为本机真实存在的文件：
+推荐把具体 `.pt` 绝对路径直接作为 `base_model_ref`；同目录必须存在 `config.json`。目录引用必须恰好包含一个 `.pt` 文件，如果目录中有多个 `.pt`，必须指定具体文件。本地相对路径必须以 `./` 开头；不带路径标记的短名称交给上游 checkpoint cache，`owner/repo` 形式表示 Hugging Face 引用。
+
+以下环境变量仍然只是格式示例，必须替换为本机真实存在的文件，并在使用前确认变量非空：
 
 ```bash
 export PREJEPA_CKPT="$HOME/checkpoints/tworoom_prejepa/weights_epoch_10.pt"
 export LEWM_CKPT="$HOME/checkpoints/tworoom_lewm/weights_epoch_10.pt"
 ```
 
-环境变量和 `~` 会在解析前展开；不存在的绝对路径、以 `~` 或 `.` 开头的路径以及不存在的明确 `.pt` 路径会立即抛出 `FileNotFoundError`，不会被当作 Hugging Face repo。PreJEPA checkpoint 必须包含 DINOv2-Small backbone、predictor 以及 action/proprio extra encoders；LeWM checkpoint 必须包含 Tiny ViT、原 projector、action encoder、predictor 和 pred projection。
+替换为真实路径后，先检查变量、权重文件和同目录配置，再构建 cache：
+
+```bash
+test -n "$PREJEPA_CKPT" || {
+    echo "PREJEPA_CKPT is not set"
+    exit 1
+}
+
+test -f "$PREJEPA_CKPT" || {
+    echo "Checkpoint does not exist: $PREJEPA_CKPT"
+    exit 1
+}
+
+test -f "$(dirname "$PREJEPA_CKPT")/config.json" || {
+    echo "config.json is missing beside checkpoint"
+    exit 1
+}
+
+python scripts/build_feature_cache.py \
+    --config-name prejepa_tworoom \
+    base_model_ref="$PREJEPA_CKPT"
+```
+
+环境变量和 `~` 会在解析前展开。空引用、未定义的环境变量、不存在的明确本地路径、非 `.pt` 本地文件、缺少或包含多个 `.pt` 的目录，以及缺少 `config.json` 的本地 checkpoint 都会在任何 Hugging Face 联网前报错。PreJEPA checkpoint 必须包含 DINOv2-Small backbone、predictor 以及 action/proprio extra encoders；LeWM checkpoint 必须包含 Tiny ViT、原 projector、action encoder、predictor 和 pred projection。
 
 默认引用为 `tworoom_prejepa` 和 `tworoom_lewm`，它们作为上游 checkpoint cache 短名称解析；`owner/repo` 形式仍按上游 Hugging Face 规则解析。可在相应命令后用 `base_model_ref="$PREJEPA_CKPT"` 或 `base_model_ref="$LEWM_CKPT"` 覆盖。构建 cache、训练和规划必须引用同一基础 checkpoint：cache 和 Adapter checkpoint 会记录权重、配置及固定上游 commit 的组合 SHA256，加载时不一致会直接拒绝组合。
 
