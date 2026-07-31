@@ -57,17 +57,24 @@ python -m pip install -e .
 
 ## 基础 checkpoint
 
-本地 checkpoint 目录必须包含：
+本地 checkpoint 目录必须包含 `config.json` 和恰好一个 `.pt` 权重文件：
 
 ```text
 checkpoint_dir/
-├── weights.pt
+├── weights_epoch_10.pt
 └── config.json
 ```
 
-也可把明确的 `.pt` 文件作为 `base_model_ref`，此时同目录仍须包含 `config.json`。PreJEPA checkpoint 必须包含 DINOv2-Small backbone、predictor 以及 action/proprio extra encoders；LeWM checkpoint 必须包含 Tiny ViT、原 projector、action encoder、predictor 和 pred projection。
+推荐把具体 `.pt` 文件直接作为 `base_model_ref`；同目录必须存在 `config.json`。如果目录中有多个 `.pt` 文件，必须指定具体文件，不能只传目录。以下路径只是格式示例，必须替换为本机真实存在的文件：
 
-默认引用为 `tworoom_prejepa` 和 `tworoom_lewm`。可在相应命令后用 `base_model_ref=/path/to/checkpoint_dir` 覆盖。构建 cache、训练和规划必须引用同一基础 checkpoint：cache 和 Adapter checkpoint 会记录权重、配置及固定上游 commit 的组合 SHA256，加载时不一致会直接拒绝组合。
+```bash
+export PREJEPA_CKPT="$HOME/checkpoints/tworoom_prejepa/weights_epoch_10.pt"
+export LEWM_CKPT="$HOME/checkpoints/tworoom_lewm/weights_epoch_10.pt"
+```
+
+环境变量和 `~` 会在解析前展开；不存在的绝对路径、以 `~` 或 `.` 开头的路径以及不存在的明确 `.pt` 路径会立即抛出 `FileNotFoundError`，不会被当作 Hugging Face repo。PreJEPA checkpoint 必须包含 DINOv2-Small backbone、predictor 以及 action/proprio extra encoders；LeWM checkpoint 必须包含 Tiny ViT、原 projector、action encoder、predictor 和 pred projection。
+
+默认引用为 `tworoom_prejepa` 和 `tworoom_lewm`，它们作为上游 checkpoint cache 短名称解析；`owner/repo` 形式仍按上游 Hugging Face 规则解析。可在相应命令后用 `base_model_ref="$PREJEPA_CKPT"` 或 `base_model_ref="$LEWM_CKPT"` 覆盖。构建 cache、训练和规划必须引用同一基础 checkpoint：cache 和 Adapter checkpoint 会记录权重、配置及固定上游 commit 的组合 SHA256，加载时不一致会直接拒绝组合。
 
 ## 构建配对 feature cache
 

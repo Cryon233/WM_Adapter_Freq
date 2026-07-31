@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,14 +27,36 @@ def _streaming_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _expand_reference(reference: str) -> str:
+    return os.path.expandvars(os.path.expanduser(reference))
+
+
+def _is_explicit_local_reference(reference: str) -> bool:
+    expanded = _expand_reference(reference)
+    path = Path(expanded)
+    return (
+        path.is_absolute()
+        or reference.startswith("~")
+        or reference.startswith(".")
+        or path.suffix == ".pt"
+    )
+
+
 def _normalized_reference(reference: str) -> str:
-    expanded = Path(reference).expanduser()
-    if (
-        expanded.exists()
-        or reference.startswith(("~", ".", "/"))
-    ):
-        return str(expanded.resolve())
-    return reference
+    expanded_reference = _expand_reference(reference)
+    expanded_path = Path(expanded_reference)
+    if _is_explicit_local_reference(reference):
+        resolved_path = expanded_path.resolve()
+        if not expanded_path.exists():
+            raise FileNotFoundError(
+                "Local base-model checkpoint does not exist:\n"
+                f"reference: {reference}\n"
+                f"resolved path: {resolved_path}"
+            )
+        return str(resolved_path)
+    if expanded_path.exists():
+        return str(expanded_path.resolve())
+    return expanded_reference
 
 
 def resolve_base_model_identity(
@@ -47,7 +70,19 @@ def resolve_base_model_identity(
     checkpoint_root = get_cache_dir(sub_folder="checkpoints")
     weights_path, _ = _resolve(normalized_reference, checkpoint_root)
     weights_path = weights_path.resolve()
+    if not weights_path.is_file():
+        raise FileNotFoundError(
+            f"resolved weights file missing: {weights_path}"
+        )
+    if weights_path.suffix != ".pt":
+        raise ValueError(
+            f"resolved checkpoint is not a .pt file: {weights_path}"
+        )
     config_path = (weights_path.parent / "config.json").resolve()
+    if not config_path.is_file():
+        raise FileNotFoundError(
+            f"config.json missing beside checkpoint: {config_path}"
+        )
 
     weights_sha256 = _streaming_sha256(weights_path)
     config_sha256 = _streaming_sha256(config_path)
