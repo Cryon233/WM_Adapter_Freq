@@ -65,7 +65,16 @@ checkpoint_dir/
 └── config.json
 ```
 
-推荐把具体 `.pt` 绝对路径直接作为 `base_model_ref`；同目录必须存在 `config.json`。目录引用必须恰好包含一个 `.pt` 文件，如果目录中有多个 `.pt`，必须指定具体文件。本地相对路径必须以 `./` 开头；不带路径标记的短名称交给上游 checkpoint cache，`owner/repo` 形式表示 Hugging Face 引用。
+推荐把具体 `.pt` 绝对路径直接作为 `base_model_ref`；权重后缀必须严格使用小写 `.pt`，同目录必须存在 `config.json`。目录引用必须恰好包含一个 `.pt` 文件，如果目录中有多个 `.pt`，必须指定具体文件。本地相对路径必须以 `./`、`../` 或 `~` 开头；裸名称 `tworoom_prejepa` 按上游 checkpoint cache 名称解析，裸名称 `tworoom_prejepa.pt` 按上游 checkpoint cache 文件解析，只有 `./tworoom_prejepa.pt` 才表示当前目录文件。`owner/repo` 形式表示 Hugging Face 引用。
+
+| 引用 | 解析位置 |
+|---|---|
+| `/home/user/model/weights.pt` | 本地绝对路径 |
+| `./model/weights.pt` | 当前目录相对路径 |
+| `~/model/weights.pt` | 用户目录路径 |
+| `tworoom_prejepa` | 上游 checkpoint cache |
+| `tworoom_prejepa.pt` | 上游 checkpoint cache 文件 |
+| `owner/repo` | Hugging Face |
 
 以下环境变量仍然只是格式示例，必须替换为本机真实存在的文件，并在使用前确认变量非空：
 

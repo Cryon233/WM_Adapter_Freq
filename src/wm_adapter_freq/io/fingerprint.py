@@ -61,12 +61,13 @@ def _is_explicit_local_reference(
     original_reference: str,
     expanded_reference: str,
 ) -> bool:
+    stripped_reference = original_reference.strip()
     path = Path(expanded_reference)
     return (
         path.is_absolute()
-        or original_reference.startswith("~")
-        or original_reference.startswith(".")
-        or path.suffix.lower() == ".pt"
+        or stripped_reference.startswith("~")
+        or stripped_reference.startswith("./")
+        or stripped_reference.startswith("../")
         or path.exists()
     )
 
@@ -84,10 +85,12 @@ def _resolve_explicit_local_checkpoint(
         )
 
     if path.is_file():
-        if path.suffix.lower() != ".pt":
+        if path.suffix != ".pt":
             raise ValueError(
                 "Local base-model checkpoint file is not a .pt file:\n"
-                f"{path}"
+                f"{path}\n"
+                "Checkpoint filename must use the exact lowercase '.pt' "
+                "suffix."
             )
         weights_path = path
         config_path = path.parent / "config.json"
@@ -137,10 +140,11 @@ def _validate_resolved_checkpoint(
         raise FileNotFoundError(
             f"resolved weights file missing: {resolved_weights_path}"
         )
-    if resolved_weights_path.suffix.lower() != ".pt":
+    if resolved_weights_path.suffix != ".pt":
         raise ValueError(
             "resolved checkpoint is not a .pt file: "
-            f"{resolved_weights_path}"
+            f"{resolved_weights_path}\n"
+            "Checkpoint filename must use the exact lowercase '.pt' suffix."
         )
     if not resolved_config_path.is_file():
         raise FileNotFoundError(
