@@ -3,8 +3,9 @@ base_model_ref: tworoom_prejepa
 dataset_name: tworoom.h5
 dataset_cache_dir: null
 output_path: data/features/prejepa_tworoom.h5
-max_windows: 100000
+max_windows: 2000
 encoder_batch_size: 8
+writer_chunk_size: 8
 num_workers: 4
 seed: 42
 device: cuda

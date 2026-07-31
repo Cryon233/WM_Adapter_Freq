@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -17,11 +18,10 @@ from wm_adapter_freq.data.paired_windows import (
     build_image_preprocessor,
     load_paired_two_room_windows,
 )
-
-
-def _model_reference(value: str) -> str:
-    path = Path(value).expanduser()
-    return str(path) if path.exists() or value.startswith(("~", ".")) else value
+from wm_adapter_freq.io.fingerprint import (
+    STABLE_WORLDMODEL_COMMIT,
+    resolve_base_model_identity,
+)
 
 
 def _fit_scaler(dataset: Any, key: str) -> tuple[Any, int]:
@@ -40,6 +40,16 @@ def _normalize(values: Tensor, scaler: Any, feature_dim: int) -> Tensor:
     shape = values.shape
     normalized = scaler.transform(values.reshape(-1, feature_dim))
     return normalized.reshape(shape).float()
+
+
+def _scaler_metadata(scaler: Any, feature_dim: int) -> dict[str, object]:
+    return {
+        "method": "zscore",
+        "mean": np.asarray(scaler.mean).reshape(-1).tolist(),
+        "std": np.asarray(scaler.std).reshape(-1).tolist(),
+        "eps": float(scaler.eps),
+        "feature_dim": int(feature_dim),
+    }
 
 
 def _preprocess(
@@ -81,7 +91,8 @@ def main(cfg: DictConfig) -> None:
 
     torch.manual_seed(int(cfg.seed))
     device = torch.device(str(cfg.device))
-    base_model = load_pretrained(_model_reference(str(cfg.base_model_ref)))
+    identity = resolve_base_model_identity(str(cfg.base_model_ref))
+    base_model = load_pretrained(identity.resolved_weights_path)
     base_model.eval()
     base_model.requires_grad_(False)
     base_model.to(device)
@@ -104,14 +115,43 @@ def main(cfg: DictConfig) -> None:
     )
     action_scaler, action_dim = _fit_scaler(source_dataset, "action")
     proprio_scaler, proprio_dim = _fit_scaler(source_dataset, "proprio")
+    action_normalization = _scaler_metadata(action_scaler, action_dim)
+    proprio_normalization = _scaler_metadata(
+        proprio_scaler,
+        proprio_dim,
+    )
 
     output_path = Path(str(cfg.output_path)).expanduser()
+    metadata: dict[str, str | int | float] = {
+        "backend": str(cfg.backend),
+        "base_model_ref": str(cfg.base_model_ref),
+        "base_model_fingerprint": identity.combined_fingerprint,
+        "stable_worldmodel_commit": STABLE_WORLDMODEL_COMMIT,
+        "dataset_name": str(cfg.dataset_name),
+        "image_size": int(cfg.image_size),
+        "patch_size": 14,
+        "token_dim": backend.token_dim,
+        "latent_dim": backend.latent_dim,
+        "history_size": 3,
+        "num_preds": 1,
+        "frameskip": 5,
+        "variants_per_window": 4,
+        "normalization_method": "zscore",
+        "action_normalization": json.dumps(
+            action_normalization,
+            separators=(",", ":"),
+        ),
+        "proprio_normalization": json.dumps(
+            proprio_normalization,
+            separators=(",", ":"),
+        ),
+    }
     with (
         torch.inference_mode(),
         FeatureCacheWriter(
             output_path,
-            backend=str(cfg.backend),
-            chunk_size=1,
+            metadata=metadata,
+            chunk_size=int(cfg.writer_chunk_size),
         ) as writer,
     ):
         for batch in tqdm(data_loader, desc=f"Caching {cfg.backend} features"):

@@ -7,17 +7,17 @@ dist/
 .vscode/
 .idea/
 
-data/
-checkpoints/
-outputs/
-storage/
-third_party/
-wandb/
-.wandb/
-lightning_logs/
+/data/
+/checkpoints/
+/outputs/
+/storage/
+/third_party/
+/wandb/
+/.wandb/
+/lightning_logs/
 
-.hydra/
-multirun/
+/.hydra/
+/multirun/
 
 .env
 *.log
@@ -34,4 +34,4 @@ multirun/
 *.ckpt
 *.safetensors
 
-runs/
+/runs/

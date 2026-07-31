@@ -8,6 +8,10 @@ import torch
 from wm_adapter_freq.adapters.sequence_stable_dct import (
     SequenceStableAdaptiveDCTAdapter,
 )
+from wm_adapter_freq.io.fingerprint import (
+    STABLE_WORLDMODEL_COMMIT,
+    BaseModelIdentity,
+)
 
 
 def save_adapter_checkpoint(
@@ -15,11 +19,15 @@ def save_adapter_checkpoint(
     adapter: SequenceStableAdaptiveDCTAdapter,
     backend: str,
     base_model_ref: str,
+    base_model_identity: BaseModelIdentity,
     token_dim: int,
     latent_dim: int,
+    dataset_name: str,
+    normalization: dict[str, dict[str, Any]],
     history_size: int = 3,
     image_size: int = 224,
     patch_size: int = 14,
+    stable_worldmodel_commit: str = STABLE_WORLDMODEL_COMMIT,
 ) -> None:
     """Save only adapter weights and the metadata needed to reattach them."""
     output_path = Path(path)
@@ -39,11 +47,21 @@ def save_adapter_checkpoint(
         },
         "backend": backend,
         "base_model_ref": base_model_ref,
+        "base_model_identity": {
+            "weights_sha256": base_model_identity.weights_sha256,
+            "config_sha256": base_model_identity.config_sha256,
+            "combined_fingerprint": (
+                base_model_identity.combined_fingerprint
+            ),
+        },
+        "stable_worldmodel_commit": stable_worldmodel_commit,
         "history_size": history_size,
         "image_size": image_size,
         "patch_size": patch_size,
         "token_dim": token_dim,
         "latent_dim": latent_dim,
+        "dataset_name": dataset_name,
+        "normalization": normalization,
     }
     torch.save(checkpoint, output_path)
 

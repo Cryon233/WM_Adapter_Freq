@@ -16,15 +16,11 @@ from wm_adapter_freq.data.feature_cache import PairedFeatureDataset
 from wm_adapter_freq.objectives.canonical_dynamics import (
     CanonicalDynamicsObjective,
 )
+from wm_adapter_freq.io.fingerprint import resolve_base_model_identity
 from wm_adapter_freq.training.adapter_trainer import (
     AdapterTrainer,
     AdapterTrainingConfig,
 )
-
-
-def _model_reference(value: str) -> str:
-    path = Path(value).expanduser()
-    return str(path) if path.exists() or value.startswith(("~", ".")) else value
 
 
 def _adapter_config(cfg: DictConfig) -> dict[str, object]:
@@ -47,11 +43,35 @@ def main(cfg: DictConfig) -> None:
 
     torch.manual_seed(int(cfg.seed))
     device = torch.device(str(cfg.device))
-    base_model = load_pretrained(_model_reference(str(cfg.base_model_ref)))
+    dataset = PairedFeatureDataset(
+        Path(str(cfg.cache_path)).expanduser(),
+        identity_probability=float(cfg.identity_probability),
+    )
+    identity = resolve_base_model_identity(str(cfg.base_model_ref))
+    if (
+        str(dataset.metadata["base_model_fingerprint"])
+        != identity.combined_fingerprint
+    ):
+        raise RuntimeError(
+            "Feature cache was built from a different base checkpoint."
+        )
+    if dataset.backend != str(cfg.backend):
+        raise RuntimeError(
+            "Feature cache backend does not match training backend."
+        )
+
+    base_model = load_pretrained(identity.resolved_weights_path)
     base_model.eval()
     base_model.requires_grad_(False)
     backend = build_backend(str(cfg.backend), base_model)
     backend.move_training_modules(device)
+    if (
+        int(dataset.metadata["token_dim"]) != backend.token_dim
+        or int(dataset.metadata["latent_dim"]) != backend.latent_dim
+    ):
+        raise RuntimeError(
+            "Feature cache dimensions do not match the base checkpoint."
+        )
 
     adapter = SequenceStableAdaptiveDCTAdapter(
         **_adapter_config(cfg)
@@ -63,12 +83,6 @@ def main(cfg: DictConfig) -> None:
         dynamics_weight=float(cfg.dynamics_weight),
     )
 
-    dataset = PairedFeatureDataset(
-        Path(str(cfg.cache_path)).expanduser(),
-        identity_probability=float(cfg.identity_probability),
-    )
-    if dataset.backend != str(cfg.backend):
-        raise ValueError("Feature cache backend does not match training backend.")
     data_loader = DataLoader(
         dataset,
         batch_size=int(cfg.batch_size),
@@ -97,11 +111,14 @@ def main(cfg: DictConfig) -> None:
         {
             "backend": str(cfg.backend),
             "base_model_ref": str(cfg.base_model_ref),
+            "base_model_identity": identity,
             "history_size": 3,
             "image_size": 224,
             "patch_size": 14,
             "token_dim": backend.token_dim,
             "latent_dim": backend.latent_dim,
+            "dataset_name": str(dataset.metadata["dataset_name"]),
+            "normalization": dataset.normalization,
         },
     )
 

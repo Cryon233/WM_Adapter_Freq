@@ -10,15 +10,37 @@ from torch import nn
 from wm_adapter_freq.backends.base import build_backend
 from wm_adapter_freq.data.paired_windows import build_image_preprocessor
 from wm_adapter_freq.io.adapter_checkpoint import load_adapter_checkpoint
+from wm_adapter_freq.io.fingerprint import resolve_base_model_identity
 
 
-def _model_reference(value: str) -> str:
-    expanded = Path(value).expanduser()
-    return (
-        str(expanded)
-        if expanded.exists() or value.startswith(("~", "."))
-        else value
-    )
+def _normalizers_from_checkpoint(
+    normalization: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    from stable_worldmodel.data.normalization import ZScoreScaler
+
+    scalers: dict[str, Any] = {}
+    for key in ("action", "proprio"):
+        stats = normalization[key]
+        if str(stats["method"]) != "zscore":
+            raise RuntimeError(
+                f"Unsupported checkpoint normalization for {key}."
+            )
+        feature_dim = int(stats["feature_dim"])
+        mean = np.asarray(stats["mean"], dtype=np.float32).reshape(
+            1,
+            feature_dim,
+        )
+        std = np.asarray(stats["std"], dtype=np.float32).reshape(
+            1,
+            feature_dim,
+        )
+        scalers[key] = ZScoreScaler(
+            mean=mean,
+            std=std,
+            eps=float(stats["eps"]),
+        )
+    scalers["goal_proprio"] = scalers["proprio"]
+    return scalers
 
 
 def build_adapted_model(
@@ -27,63 +49,65 @@ def build_adapted_model(
     adapter_checkpoint: str | Path,
     device: torch.device | str,
 ) -> nn.Module:
-    """Load a base checkpoint and attach the matching adapter for inference."""
+    """Attach a fingerprint-matched adapter to its frozen base model."""
     from stable_worldmodel.wm.utils import load_pretrained
 
-    device = torch.device(device)
-    base_model = load_pretrained(_model_reference(base_model_ref))
+    target_device = torch.device(device)
+    identity = resolve_base_model_identity(base_model_ref)
     adapter, metadata = load_adapter_checkpoint(
-        Path(adapter_checkpoint).expanduser(), device="cpu"
+        Path(adapter_checkpoint).expanduser(),
+        device="cpu",
     )
-    if metadata["backend"] != backend:
-        raise ValueError("Adapter checkpoint backend does not match the requested model.")
+    checkpoint_identity = metadata["base_model_identity"]
+    if (
+        str(checkpoint_identity["combined_fingerprint"])
+        != identity.combined_fingerprint
+    ):
+        raise RuntimeError(
+            "Adapter checkpoint was trained for a different base checkpoint."
+        )
+    if str(metadata["backend"]) != backend:
+        raise RuntimeError(
+            "Adapter checkpoint backend does not match the requested model."
+        )
+
+    base_model = load_pretrained(identity.resolved_weights_path)
+    base_model.eval()
+    base_model.requires_grad_(False)
     model_backend = build_backend(backend, base_model)
     if (
-        metadata["token_dim"] != model_backend.token_dim
-        or metadata["latent_dim"] != model_backend.latent_dim
+        int(metadata["token_dim"]) != model_backend.token_dim
+        or int(metadata["latent_dim"]) != model_backend.latent_dim
     ):
-        raise ValueError("Adapter checkpoint dimensions do not match the base model.")
+        raise RuntimeError(
+            "Adapter checkpoint dimensions do not match the base model."
+        )
+
     model = model_backend.build_online_model(adapter)
-    model.to(device)
+    model.to(target_device)
     model.eval()
+    setattr(model, "base_model_fingerprint", identity.combined_fingerprint)
+    setattr(model, "adapter_checkpoint_metadata", metadata)
     return model
-
-
-def _fit_normalizers(dataset: Any) -> dict[str, Any]:
-    from stable_worldmodel.data.normalization import get_scaler
-
-    process: dict[str, Any] = {}
-    for key in ("action", "proprio"):
-        if key not in dataset.column_names:
-            continue
-        values = np.asarray(dataset.get_col_data(key))
-        values = values.reshape(-1, values.shape[-1])
-        values = values[~np.isnan(values).any(axis=1)]
-        scaler = get_scaler("zscore")
-        scaler.fit(values)
-        process[key] = scaler
-        if key != "action":
-            process[f"goal_{key}"] = scaler
-    return process
 
 
 def build_tworoom_mpc_policy(
     backend: str,
     base_model_ref: str,
     adapter_checkpoint: str | Path,
-    dataset: Any,
     device: torch.device | str,
     horizon: int = 5,
-    receding_horizon: int = 5,
+    receding_horizon: int = 1,
     history_len: int = 3,
     action_block: int = 5,
+    warm_start: bool = True,
     num_samples: int = 300,
-    cem_steps: int = 30,
+    cem_steps: int = 10,
     topk: int = 30,
-    batch_size: int = 1,
+    batch_size: int = 4,
     seed: int = 42,
 ) -> Any:
-    """Build the upstream CEM/WorldModelPolicy stack for TwoRoom."""
+    """Build the upstream CEM and WorldModelPolicy stack for TwoRoom."""
     from stable_worldmodel.planning import (
         CEMSolver,
         GoalMSE,
@@ -97,9 +121,9 @@ def build_tworoom_mpc_policy(
         adapter_checkpoint,
         device,
     )
-    cost: Any
+    checkpoint_metadata = getattr(model, "adapter_checkpoint_metadata")
     if backend == "prejepa":
-        cost = model
+        cost: Any = model
         history_keys = ("pixels", "proprio")
     else:
         cost = ShootingCostEvaluator(model, GoalMSE())
@@ -119,13 +143,15 @@ def build_tworoom_mpc_policy(
         receding_horizon=receding_horizon,
         history_len=history_len,
         action_block=action_block,
-        warm_start=True,
+        warm_start=warm_start,
     )
     image_preprocessor = build_image_preprocessor(224)
-    return WorldModelPolicy(
+    policy = WorldModelPolicy(
         solver=solver,
         config=plan_config,
-        process=_fit_normalizers(dataset),
+        process=_normalizers_from_checkpoint(
+            checkpoint_metadata["normalization"]
+        ),
         transform={
             "pixels": image_preprocessor,
             "goal": image_preprocessor,
@@ -133,3 +159,9 @@ def build_tworoom_mpc_policy(
         history_keys=history_keys,
         seed=seed,
     )
+    setattr(
+        policy,
+        "base_model_fingerprint",
+        getattr(model, "base_model_fingerprint"),
+    )
+    return policy

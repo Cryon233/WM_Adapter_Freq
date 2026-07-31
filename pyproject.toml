@@ -14,11 +14,7 @@ dependencies = [
     "hydra-core>=1.3",
     "numpy>=1.26",
     "omegaconf>=2.3",
-    "stable-pretraining==0.1.8",
-    "torch>=2.13",
-    "torchvision>=0.28",
     "tqdm>=4.66",
-    "transformers==5.14.1",
 ]
 
 [tool.setuptools]

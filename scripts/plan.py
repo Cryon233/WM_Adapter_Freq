@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import json
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,9 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 
+from wm_adapter_freq.envs.appearance_render_wrapper import (
+    TwoRoomAppearanceRenderWrapper,
+)
 from wm_adapter_freq.planning.policy_builder import build_tworoom_mpc_policy
 
 
@@ -44,12 +48,12 @@ def main(cfg: DictConfig) -> None:
         backend=str(cfg.backend),
         base_model_ref=str(cfg.base_model_ref),
         adapter_checkpoint=Path(str(cfg.adapter_checkpoint)).expanduser(),
-        dataset=dataset,
         device=str(cfg.device),
         horizon=int(cfg.plan.horizon),
         receding_horizon=int(cfg.plan.receding_horizon),
         history_len=int(cfg.plan.history_len),
         action_block=int(cfg.plan.action_block),
+        warm_start=bool(cfg.plan.warm_start),
         num_samples=int(cfg.cem.num_samples),
         cem_steps=int(cfg.cem.n_steps),
         topk=int(cfg.cem.topk),
@@ -90,6 +94,15 @@ def main(cfg: DictConfig) -> None:
         num_envs=int(cfg.eval.num_eval),
         max_episode_steps=2 * int(cfg.eval.eval_budget),
         image_shape=(224, 224),
+        pre_wrappers=[
+            functools.partial(
+                TwoRoomAppearanceRenderWrapper,
+                enabled=bool(cfg.appearance.enabled),
+                shift_type=str(cfg.appearance.shift_type),
+                severity=float(cfg.appearance.severity),
+                base_seed=int(cfg.appearance.seed),
+            )
+        ],
     )
     world.set_policy(policy)
     video_path = (
@@ -110,12 +123,27 @@ def main(cfg: DictConfig) -> None:
 
     result_path = Path(str(cfg.output.result_path)).expanduser()
     result_path.parent.mkdir(parents=True, exist_ok=True)
+    result = {
+        **{
+            key: _json_value(value)
+            for key, value in metrics.items()
+        },
+        "backend": str(cfg.backend),
+        "base_model_fingerprint": str(
+            getattr(policy, "base_model_fingerprint")
+        ),
+        "adapter_checkpoint": str(
+            Path(str(cfg.adapter_checkpoint)).expanduser()
+        ),
+        "appearance": OmegaConf.to_container(
+            cfg.appearance,
+            resolve=True,
+        ),
+        "planning": OmegaConf.to_container(cfg.plan, resolve=True),
+        "cem": OmegaConf.to_container(cfg.cem, resolve=True),
+    }
     with result_path.open("w") as handle:
-        json.dump(
-            {key: _json_value(value) for key, value in metrics.items()},
-            handle,
-            indent=2,
-        )
+        json.dump(result, handle, indent=2)
     print(metrics)
 
 
