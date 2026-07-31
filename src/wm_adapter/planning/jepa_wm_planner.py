@@ -22,7 +22,8 @@ from wm_adapter.data.robocasa_windows import build_robocasa_dataset, split_episo
 from wm_adapter.utils.reproducibility import resolve_path, seed_everything
 
 
-EVALUATION_PROTOCOL_VERSION = "1.0"
+EVALUATION_PROTOCOL_VERSION = "2.0"
+EVALUATION_PROTOCOL_DIRECTORY = "protocol_v2"
 
 
 @dataclass(frozen=True)

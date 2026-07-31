@@ -8,6 +8,7 @@ from wm_adapter.adapters.factory import build_method
 from wm_adapter.appearance.composed_photometric import ComposedPhotometricShift
 from wm_adapter.backends.jepa_wm_droid import JEPAWMDroidBackend
 from wm_adapter.planning.jepa_wm_planner import (
+    EVALUATION_PROTOCOL_DIRECTORY,
     EVALUATION_PROTOCOL_VERSION,
     run_robocasa_planning,
     save_planning_results,
@@ -74,7 +75,7 @@ def main() -> None:
         resolve_path(cfg.output.root_dir)
         / "jepa_wm_droid"
         / "robocasa"
-        / "protocol_v1"
+        / EVALUATION_PROTOCOL_DIRECTORY
         / task
         / f"seed_{seed}"
         / method_name

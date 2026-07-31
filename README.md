@@ -167,6 +167,8 @@ checkpoints/jepa_wm_droid/robocasa/
 
 第一阶段固定采用官方 RoboCasa planning 配置中首个 JEPA-WM 任务：`robocasa-PnPCounterTop` 的 `place` subtask。默认 50 episodes，evaluation seed 42。环境、观测、动作、predictor rollout、L2 goal cost、CEM、success 判定和 episode termination 均走官方实现。
 
+Protocol 2.0 中，current observation 使用三帧左填充 history：第一步为 `[x0,x0,x0]`，第二步为 `[x0,x0,x1]`，随后始终使用 `[x_{t-2},x_{t-1},x_t]`。goal 使用单张 clean image 独立编码，不进入 current history；Base、Token MLP、LoRA 和 DCT Adapter 共享完全相同的 history。
+
 官方 CEM 预算保持 `horizon=3`、`num_samples=300`、`iterations=15`、`top-k/num_elites=10`。16 GB 显存下 `planning.candidate_chunk_size=16` 只分块计算 candidate rollout cost，汇总全部 300 个 cost 后仍由官方 CEM 做全局 top-k；不会减少候选数、horizon 或 iterations。四种方法使用完全相同的 chunk size 和随机种子。
 
 八组运行命令：
@@ -200,7 +202,7 @@ python scripts/plan.py --config configs/experiment/robocasa_pilot.yaml method=dc
 结果隔离为：
 
 ```text
-outputs/jepa_wm_droid/robocasa/protocol_v1/place/seed_42/<method>/<clean_or_ood>/results.json
+outputs/jepa_wm_droid/robocasa/protocol_v2/place/seed_42/<method>/<clean_or_ood>/results.json
 ```
 
 `results.json` 记录 success count、episode 总数、success rate、逐 episode success、environment/CEM seed、appearance spec、耗时、peak CUDA memory、方法参数量、完整配置以及基础/PEFT/cache fingerprint。是否成功只能由实际完成的 RoboCasa 运行结果确定。
