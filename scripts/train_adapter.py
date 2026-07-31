@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import hydra
@@ -119,6 +120,17 @@ def main(cfg: DictConfig) -> None:
             "latent_dim": backend.latent_dim,
             "dataset_name": str(dataset.metadata["dataset_name"]),
             "normalization": dataset.normalization,
+            "appearance_training": {
+                "severity": float(
+                    dataset.metadata["appearance_severity"]
+                ),
+                "shift_names": json.loads(
+                    str(dataset.metadata["appearance_shift_names"])
+                ),
+                "pipeline_version": str(
+                    dataset.metadata["appearance_pipeline_version"]
+                ),
+            },
         },
     )
 

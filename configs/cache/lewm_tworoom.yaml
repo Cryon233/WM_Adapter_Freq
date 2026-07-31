@@ -5,11 +5,14 @@ dataset_cache_dir: null
 output_path: data/features/lewm_tworoom.h5
 max_windows: 5000
 encoder_batch_size: 32
-writer_chunk_size: 16
+writer_chunk_size: 64
 num_workers: 4
 seed: 42
 device: cuda
 image_size: 224
+
+appearance:
+  severity: 1.0
 
 hydra:
   job:

@@ -62,6 +62,22 @@ class FeatureCacheWriter:
             return array.astype(np.float32, copy=False)
         return array
 
+    def _dataset_chunks(
+        self,
+        key: str,
+        array: np.ndarray,
+    ) -> tuple[int, ...]:
+        if key in {"clean_prefix_tokens", "clean_targets"}:
+            return (1, *array.shape[1:])
+        if key == "shifted_prefix_tokens":
+            return (1, 1, *array.shape[2:])
+        if key in {"action", "proprio", "shift_type", "shift_seed"}:
+            return (
+                min(self.chunk_size, 64),
+                *array.shape[1:],
+            )
+        raise ValueError(f"Unsupported feature cache key: {key}")
+
     def append(
         self,
         batch: Mapping[str, Tensor | np.ndarray],
@@ -77,16 +93,12 @@ class FeatureCacheWriter:
         batch_size = len(next(iter(arrays.values())))
         if len(self.file.keys()) == 0:
             for key, array in arrays.items():
-                chunks = (
-                    min(self.chunk_size, batch_size),
-                    *array.shape[1:],
-                )
                 self.file.create_dataset(
                     key,
                     shape=(0, *array.shape[1:]),
                     maxshape=(None, *array.shape[1:]),
                     dtype=array.dtype,
-                    chunks=chunks,
+                    chunks=self._dataset_chunks(key, array),
                     compression="lzf",
                 )
 

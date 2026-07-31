@@ -7,6 +7,7 @@ import torch
 from torch import Tensor
 
 
+SHIFT_PIPELINE_VERSION = "1.0"
 SHIFT_NAMES = (
     "photometric",
     "background_texture",

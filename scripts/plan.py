@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import functools
 import json
+import math
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +32,27 @@ def _json_value(value: Any) -> Any:
     return value
 
 
+def _format_severity(value: float) -> str:
+    if not math.isfinite(value):
+        raise ValueError("appearance severity must be finite")
+    decimal_value = format(Decimal(str(value)), "f")
+    if "." not in decimal_value:
+        decimal_value += ".0"
+    whole, fraction = decimal_value.split(".", maxsplit=1)
+    fraction = fraction.rstrip("0") or "0"
+    return f"{whole}p{fraction}"
+
+
+def _planning_run_name(cfg: DictConfig) -> str:
+    if not bool(cfg.appearance.enabled):
+        return "clean"
+    severity = _format_severity(float(cfg.appearance.severity))
+    return (
+        f"{cfg.appearance.shift_type}_severity{severity}"
+        f"_seed{int(cfg.appearance.seed)}"
+    )
+
+
 @hydra.main(
     version_base=None,
     config_path="../configs/plan",
@@ -37,6 +60,9 @@ def _json_value(value: Any) -> Any:
 )
 def main(cfg: DictConfig) -> None:
     import stable_worldmodel as swm
+
+    if str(cfg.appearance.protocol) != "fixed":
+        raise ValueError("appearance.protocol must be 'fixed'")
 
     torch.manual_seed(int(cfg.seed))
     dataset = swm.data.load_dataset(
@@ -89,6 +115,12 @@ def main(cfg: DictConfig) -> None:
     eval_episodes = episode_ids[selected_rows].astype(np.int64)
     eval_steps = step_ids[selected_rows].astype(np.int64)
 
+    output_root = Path(str(cfg.output.root_dir)).expanduser()
+    run_name = _planning_run_name(cfg)
+    run_dir = output_root / run_name
+    result_path = run_dir / "results.json"
+    video_path = run_dir / "videos" if bool(cfg.output.video) else None
+
     world = swm.World(
         str(cfg.world.env_name),
         num_envs=int(cfg.eval.num_eval),
@@ -105,11 +137,6 @@ def main(cfg: DictConfig) -> None:
         ],
     )
     world.set_policy(policy)
-    video_path = (
-        Path(str(cfg.output.video_dir)).expanduser()
-        if cfg.output.video
-        else None
-    )
     metrics = world.evaluate(
         dataset=dataset,
         episodes_idx=eval_episodes.tolist(),
@@ -121,8 +148,11 @@ def main(cfg: DictConfig) -> None:
     )
     world.close()
 
-    result_path = Path(str(cfg.output.result_path)).expanduser()
-    result_path.parent.mkdir(parents=True, exist_ok=True)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_metadata = getattr(
+        policy,
+        "adapter_checkpoint_metadata",
+    )
     result = {
         **{
             key: _json_value(value)
@@ -135,7 +165,12 @@ def main(cfg: DictConfig) -> None:
         "adapter_checkpoint": str(
             Path(str(cfg.adapter_checkpoint)).expanduser()
         ),
-        "appearance": OmegaConf.to_container(
+        "run_name": run_name,
+        "output_directory": str(run_dir),
+        "training_appearance": checkpoint_metadata[
+            "appearance_training"
+        ],
+        "evaluation_appearance": OmegaConf.to_container(
             cfg.appearance,
             resolve=True,
         ),

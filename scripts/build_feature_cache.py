@@ -13,6 +13,10 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from wm_adapter_freq.backends.base import BaseWorldModelBackend, build_backend
+from wm_adapter_freq.data.appearance_shift import (
+    SHIFT_NAMES,
+    SHIFT_PIPELINE_VERSION,
+)
 from wm_adapter_freq.data.feature_cache import FeatureCacheWriter
 from wm_adapter_freq.data.paired_windows import (
     build_image_preprocessor,
@@ -102,6 +106,7 @@ def main(cfg: DictConfig) -> None:
         str(cfg.dataset_name),
         cache_dir=cfg.get("dataset_cache_dir"),
         seed=int(cfg.seed),
+        severity=float(cfg.appearance.severity),
     )
     max_windows = min(int(cfg.max_windows), len(paired_dataset))
     windows = Subset(paired_dataset, range(max_windows))
@@ -135,7 +140,13 @@ def main(cfg: DictConfig) -> None:
         "history_size": 3,
         "num_preds": 1,
         "frameskip": 5,
-        "variants_per_window": 4,
+        "variants_per_window": len(SHIFT_NAMES),
+        "appearance_severity": float(cfg.appearance.severity),
+        "appearance_shift_names": json.dumps(
+            list(SHIFT_NAMES),
+            separators=(",", ":"),
+        ),
+        "appearance_pipeline_version": SHIFT_PIPELINE_VERSION,
         "normalization_method": "zscore",
         "action_normalization": json.dumps(
             action_normalization,

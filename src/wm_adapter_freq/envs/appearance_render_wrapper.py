@@ -13,7 +13,7 @@ from wm_adapter_freq.data.appearance_shift import (
 
 
 class TwoRoomAppearanceRenderWrapper(gym.Wrapper):
-    """Apply one deterministic raw-render appearance shift per episode."""
+    """Apply one fixed raw-render appearance domain for the full run."""
 
     def __init__(
         self,
@@ -29,7 +29,15 @@ class TwoRoomAppearanceRenderWrapper(gym.Wrapper):
         self.base_seed = int(base_seed)
         self.enabled = bool(enabled)
         self.appearance_shift = TwoRoomAppearanceShift()
-        self._spec: AppearanceShiftSpec | None = None
+        self._spec: AppearanceShiftSpec | None = (
+            self.appearance_shift.sample_spec(
+                shift_type=self.shift_type,
+                seed=self.base_seed,
+                severity=self.severity,
+            )
+            if self.enabled
+            else None
+        )
 
     def reset(
         self,
@@ -37,20 +45,7 @@ class TwoRoomAppearanceRenderWrapper(gym.Wrapper):
         seed: int | None = None,
         options: dict[str, Any] | None = None,
     ) -> tuple[Any, dict[str, Any]]:
-        observation, info = self.env.reset(seed=seed, options=options)
-        if self.enabled:
-            reset_seed = 0 if seed is None else int(seed)
-            spec_seed = (
-                self.base_seed * 1_000_003 + reset_seed * 97_409
-            ) % (2**63 - 1)
-            self._spec = self.appearance_shift.sample_spec(
-                shift_type=self.shift_type,
-                seed=spec_seed,
-                severity=self.severity,
-            )
-        else:
-            self._spec = None
-        return observation, info
+        return self.env.reset(seed=seed, options=options)
 
     def render(self) -> np.ndarray:
         image = np.asarray(self.env.render())

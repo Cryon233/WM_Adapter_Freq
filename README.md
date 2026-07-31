@@ -85,16 +85,16 @@ python scripts/build_feature_cache.py \
 - `data/features/prejepa_tworoom.h5`
 - `data/features/lewm_tworoom.h5`
 
-每个 clean 四帧物理窗口只读取一次，并从同一轨迹生成 photometric、background texture、palette shift 和 composed 四个序列级外观视图。cache 使用 float16 token/latent、chunked HDF5 和 LZF 压缩。
+每个 clean 四帧物理窗口只读取一次，并从同一轨迹生成 photometric、background texture、palette shift 和 composed 四个序列级外观视图。cache 使用 float16 token/latent、chunked HDF5 和 LZF 压缩。分块方式与训练访问一致：clean feature 和 clean target 按单个 window 分块，shifted feature 按单个 window、单个 view 分块；action、proprio、shift type 和 shift seed 使用最多 64 个 window 的 chunk。
 
 默认规模及未压缩 feature 体积估算：
 
 | 后端 | 窗口数 | encoder batch | writer chunk | feature 原始体积 |
 |---|---:|---:|---:|---:|
-| PreJEPA | 2,000 | 8 | 8 | 约 8.8 GiB |
-| LeWM | 5,000 | 32 | 16 | 约 9.2 GiB |
+| PreJEPA | 2,000 | 8 | 64 | 约 8.8 GiB |
+| LeWM | 5,000 | 32 | 64 | 约 9.2 GiB |
 
-实际文件大小取决于 LZF 压缩率，并另有少量 action、proprio 和 HDF5 元数据开销。
+`writer_chunk_size` 只控制这些小字段；大 feature tensor 始终使用上述访问对齐布局。实际文件大小取决于 LZF 压缩率，并另有少量 action、proprio 和 HDF5 元数据开销。cache 根元数据会记录 appearance severity、shift names 和 shift pipeline version。
 
 ## 训练 Adapter
 
@@ -111,7 +111,7 @@ python scripts/train_adapter.py \
 - `checkpoints/adapters/prejepa_tworoom.pt`
 - `checkpoints/adapters/lewm_tworoom.pt`
 
-基础模型保持冻结，loss 只包含 clean canonical latent 对齐和原 dynamics predictor 对齐。cache 使用的 action/proprio z-score 统计随 Adapter checkpoint 保存，规划阶段直接恢复同一份统计，不从评估数据重新拟合。
+基础模型保持冻结，loss 只包含 clean canonical latent 对齐和原 dynamics predictor 对齐。cache 使用的 action/proprio z-score 统计随 Adapter checkpoint 保存，规划阶段直接恢复同一份统计，不从评估数据重新拟合。Adapter checkpoint 同时记录训练 cache 的 appearance severity、shift names 和 shift pipeline version。
 
 16GB 显卡默认配置：
 
@@ -143,20 +143,26 @@ python scripts/plan.py \
     --config-name prejepa_tworoom \
     appearance.enabled=true \
     appearance.shift_type=composed \
-    appearance.severity=1.0
+    appearance.severity=1.0 \
+    appearance.seed=42
 
 python scripts/plan.py \
     --config-name lewm_tworoom \
     appearance.enabled=true \
     appearance.shift_type=composed \
-    appearance.severity=1.0
+    appearance.severity=1.0 \
+    appearance.seed=42
 ```
 
-OOD 评估采用 clean-goal 协议：在线 current observation 在 TwoRoom 原始 HWC `uint8` render 阶段施加一个整回合固定的 appearance shift，之后才进入上游 resize 和 ImageNet normalization；dataset 提供的 goal image 保持 clean。shifted current 与 clean goal 都通过同一个训练后 Adapter，映射到 clean canonical latent 空间。wrapper 不改变 state、proprio、goal state、action、reward、碰撞或终止条件。
+最终 OOD 协议为 fixed appearance domain。`appearance.seed` 唯一确定整个评估运行的视觉域；所有并行环境、所有 episode、所有 history 帧和所有 current observation 使用同一个 `AppearanceShiftSpec`，因此不同模型和 Adapter 面对完全相同的 OOD 域。
 
-默认规划结果和视频位于：
+该协议继续采用 clean-goal 设定：在线 current observation 在 TwoRoom 原始 HWC `uint8` render 阶段施加固定 shift，之后才进入上游 resize 和 ImageNet normalization；dataset 提供的 goal image 保持 clean。shifted current 与 clean goal 都通过同一个训练后 Adapter。wrapper 不改变 state、proprio、goal state、action、reward、碰撞或终止条件。
 
-- `outputs/plan/prejepa_tworoom/`
-- `outputs/plan/lewm_tworoom/`
+clean 与不同 OOD 域的输出会自动隔离，同一配置重复运行则覆盖同一实验目录：
 
-结果 JSON 同时记录基础模型 fingerprint、Adapter checkpoint、appearance 配置、planning 配置和 CEM 配置。数据、feature cache、基础权重、Adapter checkpoint、规划输出及视频均由 `.gitignore` 排除。
+- `outputs/plan/prejepa_tworoom/clean/results.json`
+- `outputs/plan/prejepa_tworoom/composed_severity1p0_seed42/results.json`
+- `outputs/plan/lewm_tworoom/clean/results.json`
+- `outputs/plan/lewm_tworoom/composed_severity1p0_seed42/results.json`
+
+各目录下的视频保存到 `videos/`。结果 JSON 同时记录基础模型 fingerprint、Adapter checkpoint、run name、输出目录、训练 appearance 域、评估 appearance 域、planning 配置和 CEM 配置。数据、feature cache、基础权重、Adapter checkpoint、规划输出及视频均由 `.gitignore` 排除。

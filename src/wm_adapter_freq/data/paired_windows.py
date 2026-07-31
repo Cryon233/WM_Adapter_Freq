@@ -60,7 +60,10 @@ class PairedAppearanceWindowDataset(Dataset[dict[str, Tensor]]):
             "shifted_pixels": torch.stack(shifted_windows),
             "action": torch.as_tensor(sample["action"]).float(),
             "proprio": torch.as_tensor(sample["proprio"]).float(),
-            "shift_type": torch.arange(4, dtype=torch.int64),
+            "shift_type": torch.arange(
+                len(SHIFT_NAMES),
+                dtype=torch.int64,
+            ),
             "shift_seed": torch.tensor(shift_seeds, dtype=torch.int64),
         }
 
@@ -69,6 +72,7 @@ def load_paired_two_room_windows(
     dataset_name: str,
     cache_dir: str | Path | None = None,
     seed: int = 0,
+    severity: float = 1.0,
 ) -> tuple[PairedAppearanceWindowDataset, Any]:
     """Load stable-worldmodel TwoRoom clips with the final four-step contract."""
     import stable_worldmodel as swm
@@ -82,7 +86,14 @@ def load_paired_two_room_windows(
         keys_to_load=["pixels", "action", "proprio"],
         keys_to_cache=["action", "proprio"],
     )
-    return PairedAppearanceWindowDataset(dataset, seed=seed), dataset
+    return (
+        PairedAppearanceWindowDataset(
+            dataset,
+            seed=seed,
+            severity=severity,
+        ),
+        dataset,
+    )
 
 
 def build_image_preprocessor(

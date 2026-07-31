@@ -164,4 +164,9 @@ def build_tworoom_mpc_policy(
         "base_model_fingerprint",
         getattr(model, "base_model_fingerprint"),
     )
+    setattr(
+        policy,
+        "adapter_checkpoint_metadata",
+        checkpoint_metadata,
+    )
     return policy

@@ -8,6 +8,7 @@ seed: 42
 
 appearance:
   enabled: true
+  protocol: fixed
   shift_type: composed
   severity: 1.0
   seed: 42
@@ -44,8 +45,7 @@ eval:
 
 output:
   video: true
-  video_dir: outputs/plan/prejepa_tworoom/videos
-  result_path: outputs/plan/prejepa_tworoom/results.json
+  root_dir: outputs/plan/prejepa_tworoom
 
 hydra:
   job:
