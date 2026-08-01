@@ -312,19 +312,74 @@ class EncPredWM(nn.Module):
             prop_feats_prefix = None
         vid_feats = vid_feats_prefix
         prop_feats = prop_feats_prefix
-        # CAUSE OF THE BUG: act_suffix = rearrange(act_suffix, "t b (act_suffix tube) -> b (t tube) act_suffix", tube=self.tubelet_size_enc)
         act_suffix = rearrange(act_suffix, "t b ... -> b t ...")
         act_feats_suffix = self.model.encode_act(act_suffix)  # (b t a) or (b t 1 d) if action_encoder_inpred=False
+
+        if self.ctxt_window <= 0:
+            raise ValueError(
+                f"ctxt_window must be positive, received {self.ctxt_window}"
+            )
+
+        initial_visual_steps = int(vid_feats_prefix.shape[1])
+        initial_window_steps = min(self.ctxt_window, initial_visual_steps)
+        history_action_steps = max(initial_window_steps - 1, 0)
+
+        if history_action_steps > 0:
+            zero_raw_action = torch.zeros_like(act_suffix[:, :1])
+            zero_action_feature = self.model.encode_act(zero_raw_action)
+            if zero_action_feature.shape[1] != 1:
+                raise RuntimeError(
+                    "Encoding one zero action must produce one action timestep, "
+                    f"received shape={tuple(zero_action_feature.shape)}"
+                )
+            repeat_factors = [1] * zero_action_feature.ndim
+            repeat_factors[1] = history_action_steps
+            historical_action_features = zero_action_feature.repeat(*repeat_factors)
+            action_features = torch.cat(
+                [historical_action_features, act_feats_suffix],
+                dim=1,
+            )
+        else:
+            action_features = act_feats_suffix
+
         for h in range(T):
-            new_act_feats = act_feats_suffix[:, h : h + 1]
-            if h == 0:
-                act_feats = new_act_feats
-            else:
-                act_feats = torch.cat([act_feats, new_act_feats], dim=1)
+            action_end = history_action_steps + h + 1
+            visual_window = vid_feats[:, -self.ctxt_window :]
+            action_window = action_features[
+                :,
+                max(0, action_end - self.ctxt_window) : action_end,
+            ]
+            proprio_window = (
+                prop_feats[:, -self.ctxt_window :]
+                if prop_feats is not None
+                else None
+            )
+
+            if visual_window.shape[1] != action_window.shape[1]:
+                raise RuntimeError(
+                    "JEPA-WM rollout context mismatch: "
+                    f"step={h}, visual_window={tuple(visual_window.shape)}, "
+                    f"action_window={tuple(action_window.shape)}, "
+                    f"ctxt_window={self.ctxt_window}, "
+                    f"initial_visual_steps={initial_visual_steps}, "
+                    f"history_action_steps={history_action_steps}"
+                )
+            if (
+                proprio_window is not None
+                and proprio_window.shape[1] != visual_window.shape[1]
+            ):
+                raise RuntimeError(
+                    "JEPA-WM rollout proprio context mismatch: "
+                    f"step={h}, proprio_window={tuple(proprio_window.shape)}, "
+                    f"visual_window={tuple(visual_window.shape)}, "
+                    f"ctxt_window={self.ctxt_window}, "
+                    f"initial_visual_steps={initial_visual_steps}"
+                )
+
             pred_video_features, _, pred_proprio_features = self.model.forward_pred(
-                vid_feats[:, -self.ctxt_window :],
-                act_feats[:, -self.ctxt_window :],
-                prop_feats[:, -self.ctxt_window :] if prop_feats is not None else None,
+                visual_window,
+                action_window,
+                proprio_window,
                 debug=debug,
             )
             next_vid_feat = pred_video_features[:, -1:]
