@@ -292,30 +292,32 @@ def run_robocasa_planning(
         domain_name,
         total_episodes,
     )
-    environment_started = time.perf_counter()
-    LOGGER.info(
-        "PLANNING_PROGRESS "
-        "phase=environment status=started "
-        "method=%s domain=%s",
-        method_name,
-        domain_name,
-    )
-    environment = make_env(official_cfg)
-    LOGGER.info(
-        "PLANNING_PROGRESS "
-        "phase=environment status=completed "
-        "method=%s domain=%s elapsed_seconds=%.3f",
-        method_name,
-        domain_name,
-        time.perf_counter() - environment_started,
-    )
-    evaluator = PlanEvaluator(official_cfg, agent)
+    environment: Any | None = None
     successes: list[bool] = []
     environment_seeds: list[int] = []
-    if backend.device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(backend.device)
-    started = time.perf_counter()
+    job_error: Exception | None = None
     try:
+        environment_started = time.perf_counter()
+        LOGGER.info(
+            "PLANNING_PROGRESS "
+            "phase=environment status=started "
+            "method=%s domain=%s",
+            method_name,
+            domain_name,
+        )
+        environment = make_env(official_cfg)
+        LOGGER.info(
+            "PLANNING_PROGRESS "
+            "phase=environment status=completed "
+            "method=%s domain=%s elapsed_seconds=%.3f",
+            method_name,
+            domain_name,
+            time.perf_counter() - environment_started,
+        )
+        evaluator = PlanEvaluator(official_cfg, agent)
+        if backend.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(backend.device)
+        started = time.perf_counter()
         for episode in range(total_episodes):
             episode_seed = (evaluation_seed * evaluation_seed + episode * evaluation_seed) % (2**32 - 2)
             episode_number = episode + 1
@@ -353,9 +355,48 @@ def run_robocasa_planning(
                 sum(successes),
                 time.perf_counter() - episode_started,
             )
+        elapsed = time.perf_counter() - started
+    except Exception as error:
+        job_error = error
+        LOGGER.exception(
+            "PLANNING_PROGRESS "
+            "phase=job status=failed "
+            "method=%s domain=%s "
+            "completed=%d total=%d error_type=%s",
+            method_name,
+            domain_name,
+            len(successes),
+            total_episodes,
+            type(error).__name__,
+        )
+        raise
     finally:
-        environment.close()
-    elapsed = time.perf_counter() - started
+        if environment is not None:
+            try:
+                environment.close()
+            except Exception as close_error:
+                if job_error is None:
+                    LOGGER.exception(
+                        "PLANNING_PROGRESS "
+                        "phase=job status=failed "
+                        "method=%s domain=%s "
+                        "completed=%d total=%d error_type=%s",
+                        method_name,
+                        domain_name,
+                        len(successes),
+                        total_episodes,
+                        type(close_error).__name__,
+                    )
+                    raise
+                LOGGER.exception(
+                    "PLANNING_PROGRESS "
+                    "phase=environment status=close_failed "
+                    "method=%s domain=%s original_error_type=%s close_error_type=%s",
+                    method_name,
+                    domain_name,
+                    type(job_error).__name__,
+                    type(close_error).__name__,
+                )
     LOGGER.info(
         "PLANNING_PROGRESS "
         "phase=job status=completed "
