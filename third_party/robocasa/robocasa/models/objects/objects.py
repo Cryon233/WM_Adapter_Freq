@@ -23,9 +23,9 @@ def _ensure_dummy_placement_sites(root, mjcf_path):
         )
 
     placement_sites = {
-        "bottom_site": "0 0 -0.05",
-        "top_site": "0 0 0.05",
-        "horizontal_radius_site": "0.05 0.05 0",
+        "bottom_site": "0 0 -0.001",
+        "top_site": "0 0 0.001",
+        "horizontal_radius_site": "0.001 0.001 0",
     }
     for name, position in placement_sites.items():
         if container.find(f"./site[@name='{name}']") is not None:
@@ -36,7 +36,7 @@ def _ensure_dummy_placement_sites(root, mjcf_path):
             attrib={
                 "name": name,
                 "pos": position,
-                "size": "0.005",
+                "size": "0.0001",
                 "rgba": "0 0 0 0",
             },
         )

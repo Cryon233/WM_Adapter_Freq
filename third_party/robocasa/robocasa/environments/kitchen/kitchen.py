@@ -426,19 +426,24 @@ class Kitchen(ManipulationEnv, metaclass=KitchenEnvMeta):
             self.fixture_cfgs, z_offset=0.0
         )
         fxtr_placements = None
-        for i in range(10):
+        fixture_placement_attempts = 100
+        for attempt in range(1, fixture_placement_attempts + 1):
             try:
                 fxtr_placements = fxtr_placement_initializer.sample()
-            except RandomizationError as e:
+            except RandomizationError:
                 if macros.VERBOSE:
-                    print("Ranomization error in initial placement. Try #{}".format(i))
+                    print(
+                        "Randomization error in initial fixture placement. "
+                        f"Try #{attempt}/{fixture_placement_attempts}"
+                    )
                 continue
             break
         if fxtr_placements is None:
-            if macros.VERBOSE:
-                print("Could not place fixtures. Trying again with self._load_model()")
-            self._load_model()
-            return
+            raise RuntimeError(
+                "Could not place RoboCasa fixtures after "
+                f"{fixture_placement_attempts} attempts: "
+                f"layout_id={self.layout_id}, style_id={self.style_id}"
+            )
         self.fxtr_placements = fxtr_placements
         # Loop through all objects and reset their positions
         for obj_pos, obj_quat, obj in fxtr_placements.values():
@@ -491,21 +496,27 @@ class Kitchen(ManipulationEnv, metaclass=KitchenEnvMeta):
         # setup object locations
         self.placement_initializer = self._get_placement_initializer(self.object_cfgs)
         object_placements = None
-        for i in range(1):
+        object_placement_attempts = 100
+        for attempt in range(1, object_placement_attempts + 1):
             try:
                 object_placements = self.placement_initializer.sample(
                     placed_objects=self.fxtr_placements
                 )
-            except RandomizationError as e:
+            except RandomizationError:
                 if macros.VERBOSE:
-                    print("Randomization error in initial placement. Try #{}".format(i))
+                    print(
+                        "Randomization error in initial object placement. "
+                        f"Try #{attempt}/{object_placement_attempts}"
+                    )
                 continue
             break
         if object_placements is None:
-            if macros.VERBOSE:
-                print("Could not place objects. Trying again with self._load_model()")
-            self._load_model()
-            return
+            raise RuntimeError(
+                "Could not place dummy RoboCasa objects after "
+                f"{object_placement_attempts} attempts: "
+                f"layout_id={self.layout_id}, style_id={self.style_id}, "
+                f"object_cfgs={self.object_cfgs!r}"
+            )
         self.object_placements = object_placements
         delta_list = [-0.1, 0.1, 0.2, -0.2, -0.3, 0.3, -0.4, 0.4]
         existing = self._ep_meta.get("delta_num", [])
