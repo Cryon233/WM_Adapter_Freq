@@ -69,6 +69,11 @@ def main() -> None:
             )
         checkpoint_fingerprint = sha256_file(checkpoint_path)
         cache_fingerprint = str(checkpoint["cache_fingerprint"])
+    backend.configure_planning_inference(
+        inference_precision=str(cfg.planning.inference_precision),
+        allow_tf32=bool(cfg.planning.allow_tf32),
+        compile_predictor=bool(cfg.planning.compile_predictor),
+    )
     task = str(cfg.planning.task_slug)
     seed = int(cfg.evaluation.eval_seed)
     output_directory = (
@@ -101,6 +106,12 @@ def main() -> None:
         "upstream_commits": backend.upstream_commits,
         "training_appearance": training_appearance,
         "planning_history_len": int(cfg.planning.history_len),
+        "planning_inference": {
+            "precision": str(cfg.planning.inference_precision),
+            "allow_tf32": bool(cfg.planning.allow_tf32),
+            "compile_predictor": bool(cfg.planning.compile_predictor),
+            "candidate_chunk_size": int(cfg.planning.candidate_chunk_size),
+        },
         "cem": {
             **OmegaConf.to_container(
                 backend.official_planning_template.planner,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from dataclasses import dataclass
@@ -13,6 +14,9 @@ from torch import Tensor, nn
 from wm_adapter.adapters.base import PEFTMethod
 from wm_adapter.utils.checkpoints import sha256_file, verify_upstream_commits
 from wm_adapter.utils.reproducibility import resolve_path
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -156,6 +160,7 @@ class JEPAWMDroidBackend(nn.Module):
         self._validate_checkpoint_parameters()
         self.requires_grad_(False)
         self.eval()
+        self._predictor_compiled = False
 
     @property
     def token_layout(self) -> TokenLayout:
@@ -167,6 +172,49 @@ class JEPAWMDroidBackend(nn.Module):
         del mode
         super().train(False)
         return self
+
+    def configure_planning_inference(
+        self,
+        *,
+        inference_precision: str,
+        allow_tf32: bool,
+        compile_predictor: bool,
+    ) -> None:
+        if self.device.type == "cuda" and allow_tf32:
+            torch.set_float32_matmul_precision("high")
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
+        LOGGER.info(
+            "Planning CUDA settings: inference_precision=%s, allow_tf32=%s",
+            inference_precision,
+            str(allow_tf32).lower(),
+        )
+
+        if compile_predictor and not self._predictor_compiled:
+            LOGGER.info(
+                "Compiling JEPA-WM predictor with "
+                "torch.compile(mode=reduce-overhead)"
+            )
+            try:
+                compiled_predictor = torch.compile(
+                    self.video_model.predictor,
+                    mode="reduce-overhead",
+                    fullgraph=False,
+                    dynamic=False,
+                )
+            except Exception as error:
+                raise RuntimeError(
+                    "Failed to compile the JEPA-WM predictor with "
+                    "torch.compile(mode=reduce-overhead)"
+                ) from error
+            self.video_model.predictor = compiled_predictor
+            if self.official_model.model.predictor is not compiled_predictor:
+                raise RuntimeError(
+                    "Compiled predictor is not shared by backend.video_model and "
+                    "backend.official_model.model"
+                )
+            self._predictor_compiled = True
 
     def _validate_checkpoint_parameters(self) -> None:
         checkpoint = torch.load(self.jepa_checkpoint, map_location="cpu", weights_only=False)

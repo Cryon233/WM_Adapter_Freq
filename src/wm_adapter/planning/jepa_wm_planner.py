@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -49,6 +49,7 @@ class JEPAWMPlanningModel(nn.Module):
         *,
         domain: str,
         appearance_spec: AppearanceShiftSpec,
+        inference_precision: str,
     ) -> None:
         super().__init__()
         if domain not in {"clean", "ood"}:
@@ -58,12 +59,18 @@ class JEPAWMPlanningModel(nn.Module):
         self.domain = domain
         self.appearance = ComposedPhotometricShift()
         self.appearance_spec = appearance_spec
+        self.inference_precision = inference_precision
         self._encoding_goal = False
         self.action_dim = backend.official_model.action_dim
         self.tubelet_size_enc = backend.official_model.tubelet_size_enc
         self.action_skip = backend.official_model.action_skip
         self.preprocessor = backend.preprocessor
         self.decode_unroll = None
+
+    def _inference_context(self) -> Any:
+        if self.backend.device.type == "cuda" and self.inference_precision == "bf16":
+            return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        return nullcontext()
 
     @contextmanager
     def goal_encoding(self) -> Iterator[None]:
@@ -80,7 +87,7 @@ class JEPAWMPlanningModel(nn.Module):
         shifted = [self.appearance.apply(sequence, self.appearance_spec) for sequence in images]
         return torch.stack(shifted, dim=0)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def encode(self, observations: Tensor, act: bool = True) -> Tensor:
         del act
         if observations.ndim != 5:
@@ -89,14 +96,20 @@ class JEPAWMPlanningModel(nn.Module):
             )
         images = self._current_only_shift(observations)
         batch, time_steps = images.shape[:2]
-        latents = self.backend.encode_images(images, self.method, batch, time_steps)
-        return self.backend.planning_latents(latents)
+        with self._inference_context():
+            latents = self.backend.encode_images(images, self.method, batch, time_steps)
+            return self.backend.planning_latents(latents)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def unroll(self, z_ctxt: Tensor, act_suffix: Tensor | None = None, debug: bool = False) -> Tensor:
         if act_suffix is None:
             raise ValueError("JEPA-WM planning unroll requires action candidates")
-        return self.backend.official_model.unroll(z_ctxt, act_suffix=act_suffix, debug=debug)
+        with self._inference_context():
+            return self.backend.official_model.unroll(
+                z_ctxt,
+                act_suffix=act_suffix,
+                debug=debug,
+            )
 
 
 def _build_official_agent(
@@ -276,7 +289,23 @@ def run_robocasa_planning(
         method,
         domain=str(experiment_config.domain),
         appearance_spec=appearance_spec,
+        inference_precision=str(experiment_config.planning.inference_precision),
     ).eval()
+    predictor_parameter = next(backend.video_model.predictor.parameters(), None)
+    predictor_parameter_dtype = (
+        str(predictor_parameter.dtype)
+        if predictor_parameter is not None
+        else "none"
+    )
+    LOGGER.info(
+        "PLANNING_INFERENCE precision=%s allow_tf32=%s compile_predictor=%s "
+        "candidate_chunk_size=%d predictor_parameter_dtype=%s",
+        str(experiment_config.planning.inference_precision),
+        str(bool(experiment_config.planning.allow_tf32)).lower(),
+        str(bool(experiment_config.planning.compile_predictor)).lower(),
+        int(experiment_config.planning.candidate_chunk_size),
+        predictor_parameter_dtype,
+    )
     agent = _build_official_agent(
         official_cfg,
         planning_model,

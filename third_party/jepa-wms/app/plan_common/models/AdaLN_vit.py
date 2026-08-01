@@ -255,7 +255,11 @@ class VisionTransformerAdaLN(nn.Module):
                 grid_width,
                 add_tokens=self.cond_tokens,
             )
-        self.attn_mask = attn_mask
+        self.register_buffer(
+            "attn_mask",
+            attn_mask,
+            persistent=False,
+        )
 
         # ------ initialize weights
         self.init_std = init_std
@@ -340,7 +344,7 @@ class VisionTransformerAdaLN(nn.Module):
         else:
             x = x.flatten(1, 2)  # [B, T*(H*W), D]
         attn_mask = (
-            self.attn_mask[: x.size(1), : x.size(1)].to(x.device, non_blocking=True)
+            self.attn_mask[: x.size(1), : x.size(1)]
             if self.attn_mask is not None
             else None
         )

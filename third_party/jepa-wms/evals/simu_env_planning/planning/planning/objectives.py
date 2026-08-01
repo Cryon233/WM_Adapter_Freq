@@ -126,6 +126,40 @@ class ReprTargetDistMPCObjective(BaseMPCObjective):
         Returns:
             loss: tensor, (T x B) or (B) if not keepdims
         """
+        if not keepdims and not self.sum_all_diffs:
+            if isinstance(encodings, TensorDict) and isinstance(self.target_enc, TensorDict):
+                predicted_visual = encodings["visual"][-1]
+                target_visual = self.target_enc["visual"]
+                if target_visual.ndim == predicted_visual.ndim + 1:
+                    target_visual = target_visual[-1]
+                diff_visual = (
+                    (target_visual.float() - predicted_visual.float())
+                    .square()
+                    .mean(dim=tuple(range(1, predicted_visual.ndim)))
+                )
+
+                predicted_proprio = encodings["proprio"][-1]
+                target_proprio = self.target_enc["proprio"]
+                if target_proprio.ndim == predicted_proprio.ndim + 1:
+                    target_proprio = target_proprio[-1]
+                diff_proprio = (
+                    (target_proprio.float() - predicted_proprio.float())
+                    .square()
+                    .mean(dim=tuple(range(1, predicted_proprio.ndim)))
+                )
+                return diff_visual + self.alpha * diff_proprio
+            if isinstance(encodings, torch.Tensor) and isinstance(self.target_enc, torch.Tensor):
+                predicted = encodings[-1]
+                target = self.target_enc
+                if target.ndim == predicted.ndim + 1:
+                    target = target[-1]
+                return (
+                    (target.float() - predicted.float())
+                    .square()
+                    .mean(dim=tuple(range(1, predicted.ndim)))
+                )
+            raise ValueError("Input type mismatch")
+
         if isinstance(encodings, TensorDict) and isinstance(self.target_enc, TensorDict):
             diff_visual = (
                 (self.target_enc["visual"] - encodings["visual"])
