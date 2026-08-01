@@ -322,7 +322,15 @@ class RoboCasaWrapper(gym.Wrapper):
             logger.info("Resetting from provided model XML")
             xml = _prepare_xml(self.env, model_xml)
             xml = path_change(xml)
-            self.env.reset_from_xml_string(xml)
+            logger.info(
+                "Loading external RoboCasa model XML with stale dummy task-model "
+                "ID mappings disabled"
+            )
+            self.env._skip_model_id_mappings_on_external_xml_reset = True
+            try:
+                self.env.reset_from_xml_string(xml)
+            finally:
+                self.env._skip_model_id_mappings_on_external_xml_reset = False
             self.env.sim.reset()
             logger.info("Finished resetting from provided model XML")
         else:
