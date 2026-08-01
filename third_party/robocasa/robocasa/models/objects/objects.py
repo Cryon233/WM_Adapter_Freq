@@ -9,6 +9,39 @@ from robosuite.models.objects import MujocoXMLObject
 from robosuite.utils.mjcf_utils import array_to_string, string_to_array
 
 
+def _ensure_dummy_placement_sites(root, mjcf_path):
+    worldbody = root.find("worldbody")
+    if worldbody is None:
+        raise RuntimeError(
+            f"RoboCasa object MJCF has no worldbody: {mjcf_path}"
+        )
+
+    container = worldbody.find("body")
+    if container is None:
+        raise RuntimeError(
+            f"RoboCasa object MJCF worldbody has no container body: {mjcf_path}"
+        )
+
+    placement_sites = {
+        "bottom_site": "0 0 -0.05",
+        "top_site": "0 0 0.05",
+        "horizontal_radius_site": "0.05 0.05 0",
+    }
+    for name, position in placement_sites.items():
+        if container.find(f"./site[@name='{name}']") is not None:
+            continue
+        ET.SubElement(
+            container,
+            "site",
+            attrib={
+                "name": name,
+                "pos": position,
+                "size": "0.005",
+                "rgba": "0 0 0 0",
+            },
+        )
+
+
 class MJCFObject(MujocoXMLObject):
     """
     Blender object with support for changing the scaling
@@ -52,6 +85,7 @@ class MJCFObject(MujocoXMLObject):
         folder = os.path.dirname(xml_path)
         tree = ET.parse(xml_path)
         root = tree.getroot()
+        _ensure_dummy_placement_sites(root, mjcf_path)
 
         # write modified xml (and make sure to postprocess any paths just in case)
         xml_str = ET.tostring(root, encoding="utf8").decode("utf8")

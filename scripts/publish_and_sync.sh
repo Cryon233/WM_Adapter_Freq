@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-
 set -Eeuo pipefail
 
 if [[ $# -lt 1 || -z "${1//[[:space:]]/}" ]]; then
-    echo "Usage: bash scripts/publish_and_sync.sh \"commit message\"" >&2
+    echo 'Usage: bash scripts/publish_and_sync.sh "commit message"' >&2
     exit 2
 fi
 
@@ -11,7 +10,14 @@ message="$1"
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
-bash "$ROOT/scripts/export_third_party_patches.sh"
+# Direct-vendor mode requires third_party directories to be ordinary directories.
+nested_git="$(find third_party -mindepth 2 -maxdepth 2 -name .git -print -quit 2>/dev/null || true)"
+if [[ -n "$nested_git" ]]; then
+    echo "Nested Git metadata still exists: $nested_git" >&2
+    echo "Move all third_party/*/.git entries outside the main repository first." >&2
+    exit 1
+fi
+
 git add -A
 
 if git diff --cached --quiet; then
@@ -39,6 +45,6 @@ deploy_root="$2"
 cd "$deploy_root"
 git fetch origin "$branch"
 git reset --hard "origin/$branch"
-bash scripts/apply_third_party_patches.sh
 REMOTE
 
+echo "Published branch $branch and synchronized $deploy_host:$deploy_root"

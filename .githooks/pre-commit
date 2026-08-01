@@ -1,7 +1,0 @@
-#!/usr/bin/env bash
-
-set -Eeuo pipefail
-
-ROOT="$(git rev-parse --show-toplevel)"
-bash "$ROOT/scripts/export_third_party_patches.sh"
-

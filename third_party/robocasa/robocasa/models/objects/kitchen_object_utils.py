@@ -1,9 +1,7 @@
 import math
 import os
-import warnings
 import xml.etree.ElementTree as ET
 from copy import deepcopy
-from functools import lru_cache
 
 import numpy as np
 from robosuite.utils.mjcf_utils import find_elements, string_to_array
@@ -12,94 +10,6 @@ import robocasa
 from robocasa.models.objects.kitch_min_obj import OBJ_CATEGORIES, OBJ_GROUPS
 
 BASE_ASSET_ZOO_PATH = os.path.join(robocasa.models.assets_root, "objects")
-_REQUIRED_GEOMETRY_SITES = (
-    "bottom_site",
-    "top_site",
-    "horizontal_radius_site",
-)
-_MAX_OBJECT_SAMPLE_ATTEMPTS = 4096
-_MJCF_GEOMETRY_FAILURES = {}
-
-
-def _load_mjcf_geometry(
-    mjcf_path: str,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
-    normalized_path = os.path.realpath(os.path.abspath(mjcf_path))
-    return _load_mjcf_geometry_cached(normalized_path)
-
-
-@lru_cache(maxsize=None)
-def _load_mjcf_geometry_cached(
-    mjcf_path: str,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
-    try:
-        tree = ET.parse(mjcf_path)
-    except (ET.ParseError, OSError) as exc:
-        _MJCF_GEOMETRY_FAILURES[mjcf_path] = "parse_error"
-        warnings.warn(
-            f"Skipping incompatible RoboCasa object {mjcf_path}: "
-            f"failed to parse MJCF ({exc})",
-            RuntimeWarning,
-        )
-        return None
-
-    root = tree.getroot()
-    site_elements = {
-        name: find_elements(
-            root=root,
-            tags="site",
-            attribs={"name": name},
-        )
-        for name in _REQUIRED_GEOMETRY_SITES
-    }
-    missing_sites = [
-        name
-        for name, element in site_elements.items()
-        if element is None or element.get("pos") is None
-    ]
-    if missing_sites:
-        _MJCF_GEOMETRY_FAILURES[mjcf_path] = "missing_geometry"
-        warnings.warn(
-            f"Skipping incompatible RoboCasa object {mjcf_path}: "
-            f"missing required MJCF sites {missing_sites}",
-            RuntimeWarning,
-        )
-        return None
-
-    try:
-        geometry = (
-            string_to_array(site_elements["bottom_site"].get("pos")),
-            string_to_array(site_elements["top_site"].get("pos")),
-            string_to_array(site_elements["horizontal_radius_site"].get("pos")),
-        )
-    except (TypeError, ValueError) as exc:
-        _MJCF_GEOMETRY_FAILURES[mjcf_path] = "missing_geometry"
-        warnings.warn(
-            f"Skipping incompatible RoboCasa object {mjcf_path}: "
-            f"invalid required MJCF site positions ({exc})",
-            RuntimeWarning,
-        )
-        return None
-
-    invalid_sites = [
-        name
-        for name, position in zip(_REQUIRED_GEOMETRY_SITES, geometry)
-        if position.size < 3 or not np.isfinite(position).all()
-    ]
-    if invalid_sites:
-        _MJCF_GEOMETRY_FAILURES[mjcf_path] = "missing_geometry"
-        warnings.warn(
-            f"Skipping incompatible RoboCasa object {mjcf_path}: "
-            f"invalid required MJCF site positions {invalid_sites}",
-            RuntimeWarning,
-        )
-        return None
-    return geometry
-
-
-def _mjcf_geometry_failure(mjcf_path: str) -> str | None:
-    normalized_path = os.path.realpath(os.path.abspath(mjcf_path))
-    return _MJCF_GEOMETRY_FAILURES.get(normalized_path)
 
 
 class ObjCat:
@@ -319,10 +229,8 @@ def sample_kitchen_object(
     """
     if sampled_objects is None:
         sampled_objects = set()
-    rejected_missing_geometry = 0
-    rejected_size = 0
-    rejected_parse_error = 0
-    for attempt in range(1, _MAX_OBJECT_SAMPLE_ATTEMPTS + 1):
+    valid_object_sampled = False
+    while valid_object_sampled is False:
         mjcf_kwargs, info = sample_kitchen_object_helper(
             groups=groups,
             exclude_groups=exclude_groups,
@@ -345,20 +253,26 @@ def sample_kitchen_object(
         # Add the object to the set of sampled objects
         sampled_objects.add(mjcf_path)
 
-        geometry = _load_mjcf_geometry(str(mjcf_path))
-        if geometry is None:
-            failure = _mjcf_geometry_failure(str(mjcf_path))
-            if failure == "parse_error":
-                rejected_parse_error += 1
-            else:
-                rejected_missing_geometry += 1
-            if isinstance(groups, str) and groups.endswith(".xml"):
-                raise RuntimeError(
-                    "Explicit RoboCasa object has incompatible MJCF geometry: "
-                    f"{mjcf_path}"
-                )
-            continue
-        bottom, top, horizontal_radius = geometry
+        if max_size is None or all(limit is None for limit in max_size):
+            return mjcf_kwargs, info
+
+        tree = ET.parse(mjcf_path)
+        root = tree.getroot()
+        bottom = string_to_array(
+            find_elements(root=root, tags="site", attribs={"name": "bottom_site"}).get(
+                "pos"
+            )
+        )
+        top = string_to_array(
+            find_elements(root=root, tags="site", attribs={"name": "top_site"}).get(
+                "pos"
+            )
+        )
+        horizontal_radius = string_to_array(
+            find_elements(
+                root=root, tags="site", attribs={"name": "horizontal_radius_site"}
+            ).get("pos")
+        )
         scale = mjcf_kwargs["scale"]
         obj_size = (
             np.array(
@@ -366,19 +280,12 @@ def sample_kitchen_object(
             )
             * scale
         )
-        if all(max_size[i] is None or obj_size[i] <= max_size[i] for i in range(3)):
-            return mjcf_kwargs, info
-        rejected_size += 1
+        valid_object_sampled = True
+        for i in range(3):
+            if max_size[i] is not None and obj_size[i] > max_size[i]:
+                valid_object_sampled = False
 
-    raise RuntimeError(
-        "Unable to sample a size-compatible RoboCasa object after bounded attempts: "
-        f"obj_groups={groups!r}, exclude_obj_groups={exclude_groups!r}, "
-        f"registries={obj_registries!r}, split={split!r}, max_size={max_size!r}, "
-        f"attempts={_MAX_OBJECT_SAMPLE_ATTEMPTS}, "
-        f"rejected_missing_geometry={rejected_missing_geometry}, "
-        f"rejected_size={rejected_size}, rejected_parse_error={rejected_parse_error}, "
-        f"unique_sampled_paths={len(sampled_objects)}"
-    )
+    return mjcf_kwargs, info
 
 
 def sample_kitchen_object_helper(
@@ -434,10 +341,6 @@ def sample_kitchen_object_helper(
     # option to spawn specific object instead of sampling from a group
     if isinstance(groups, str) and groups.endswith(".xml"):
         mjcf_path = groups
-        if _load_mjcf_geometry(str(mjcf_path)) is None:
-            raise RuntimeError(
-                f"Explicit RoboCasa object has incompatible MJCF geometry: {mjcf_path}"
-            )
         # reverse look up mjcf_path to category
         mjcf_kwargs = dict()
         cat = None
@@ -508,6 +411,7 @@ def sample_kitchen_object_helper(
                 valid_categories.append(cat)
 
         cat = rng.choice(valid_categories)
+
         choices = {reg: [] for reg in obj_registries}
 
         for reg in obj_registries:
