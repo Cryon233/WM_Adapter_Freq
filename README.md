@@ -206,3 +206,53 @@ outputs/jepa_wm_droid/robocasa/protocol_v2/place/seed_42/<method>/<clean_or_ood>
 ```
 
 `results.json` 记录 success count、episode 总数、success rate、逐 episode success、environment/CEM seed、appearance spec、耗时、peak CUDA memory、方法参数量、完整配置以及基础/PEFT/cache fingerprint。是否成功只能由实际完成的 RoboCasa 运行结果确定。
+
+## 本地开发与服务器部署
+
+主仓库和 GitHub 是项目代码的唯一 source of truth。`/third_party/` 继续由 `.gitignore` 排除，四个上游仓库保持在“固定 upstream commit + 主仓库内 patch”的状态；不会把嵌套仓库、RoboCasa assets 或本地模型文件直接加入主仓库。
+
+| 嵌套仓库 | 固定 base commit | 主仓库中的 patch |
+| --- | --- | --- |
+| `third_party/jepa-wms` | `13cf1d9c7e476f53c17714d2e0f1dc239a883ce0` | `patches/third_party/jepa-wms.patch` |
+| `third_party/dinov3` | `6876159a11b4df116f30f667f8c9888617df0751` | `patches/third_party/dinov3.patch` |
+| `third_party/robosuite` | `9548a5a35bde8eabf47f760802045cca447e9c0c` | `patches/third_party/robosuite.patch` |
+| `third_party/robocasa` | `2544dc2e38bb44f5ced80fbc91114a2f7934016a` | `patches/third_party/robocasa.patch` |
+
+`scripts/export_third_party_patches.sh` 始终相对于表中的固定 commit 导出 binary-safe diff，因此能够同时包含嵌套仓库中已经 commit 的本地变化、staged 修改和 unstaged tracked-file 修改。导出前会拒绝任何非 ignored 的 untracked 文件，避免源码被静默遗漏；ignored assets 不会被扫描、复制或提交。空 diff 不保留空 patch，`patches/third_party/MANIFEST.txt` 记录 base commit、当前 HEAD、patch SHA256 和生成时间。
+
+首次克隆后启用仓库自带的 pre-commit hook：
+
+```bash
+git config core.hooksPath .githooks
+```
+
+之后正常在本地修改主仓库或嵌套仓库源码。每次 commit 前，hook 会自动运行导出脚本并把最新 patch 与 manifest 加入该次 commit；它不运行测试、训练或 planning。也可以随时手动刷新并检查 patch：
+
+```bash
+bash scripts/export_third_party_patches.sh
+git diff --cached -- patches/third_party
+```
+
+新机器或服务器先把四个嵌套仓库准备到上表所列对象可用的状态，再执行：
+
+```bash
+bash scripts/apply_third_party_patches.sh
+```
+
+应用脚本会依次把每个嵌套仓库的 tracked 文件 `reset --hard` 到固定 base commit，然后执行 `git apply --check` 和 `git apply`。它绝不执行 `git clean`，因此不会删除 ignored 的 RoboCasa assets、本地模型或其他未跟踪数据；重复执行会先恢复固定 commit 再应用同一 patch，结果幂等。运行前应先导出需要保留的嵌套仓库 tracked 修改。
+
+完成本地修改后，可以一次性 commit、push 并同步服务器：
+
+```bash
+bash scripts/publish_and_sync.sh "描述本次修改的 commit message"
+```
+
+默认部署目标为 `zhaoyanghe@172.28.11.129:/data/users/zhaoyanghe/control-frequency-wm`，可在单次命令中覆盖：
+
+```bash
+DEPLOY_HOST="user@server" \
+DEPLOY_ROOT="/absolute/server/path/control-frequency-wm" \
+bash scripts/publish_and_sync.sh "描述本次修改的 commit message"
+```
+
+部署端只执行当前 branch 的 `git fetch`、`git reset --hard origin/<branch>` 和第三方 patch 应用，不会重建 feature cache、重新训练或启动 planning。`storage/`、RoboCasa assets、`outputs/`、`checkpoints/`、feature cache 与训练 checkpoint 均不上传 GitHub，也不会被部署流程清理。当前依赖使用 editable install，纯 Python 源码更新后无需重新执行 `pip install`。

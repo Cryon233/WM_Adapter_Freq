@@ -1,0 +1,31 @@
+Third-party patch manifest
+Generated at (UTC): 2026-08-01T11:22:28Z
+
+Repository: jepa-wms
+Base commit: 13cf1d9c7e476f53c17714d2e0f1dc239a883ce0
+Current HEAD: 13cf1d9c7e476f53c17714d2e0f1dc239a883ce0
+Patch file: jepa-wms.patch
+Patch SHA256: ce9491a65daa6270e24f0b330038fd535f4b76ec16c9dc0b4e4630e525e9ada9
+Patch status: present
+
+Repository: dinov3
+Base commit: 6876159a11b4df116f30f667f8c9888617df0751
+Current HEAD: 6876159a11b4df116f30f667f8c9888617df0751
+Patch file: dinov3.patch
+Patch SHA256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+Patch status: empty (patch file omitted)
+
+Repository: robosuite
+Base commit: 9548a5a35bde8eabf47f760802045cca447e9c0c
+Current HEAD: 9548a5a35bde8eabf47f760802045cca447e9c0c
+Patch file: robosuite.patch
+Patch SHA256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+Patch status: empty (patch file omitted)
+
+Repository: robocasa
+Base commit: 2544dc2e38bb44f5ced80fbc91114a2f7934016a
+Current HEAD: 2544dc2e38bb44f5ced80fbc91114a2f7934016a
+Patch file: robocasa.patch
+Patch SHA256: b708f36da8e39e2ab9bcdcab6632f57588254097b775d3f1ad2c932c94a6e9fd
+Patch status: present
+
