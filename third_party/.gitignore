@@ -1,0 +1,45 @@
+# Python/runtime caches
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.cache/
+**/.ipynb_checkpoints/
+**/.venv/
+**/venv/
+# Experiment outputs
+**/wandb/
+**/.wandb/
+**/outputs/
+**/logs/
+**/runs/
+**/lightning_logs/
+# Downloaded archives and model/data files
+**/*.zip
+**/*.7z
+**/*.tar
+**/*.tar.gz
+**/*.tgz
+**/*.pth
+**/*.pth.tar
+**/*.pt
+**/*.ckpt
+**/*.safetensors
+**/*.onnx
+**/*.h5
+**/*.hdf5
+**/*.npz
+**/*.pkl
+**/*.pickle
+# Project-specific downloaded content
+/robocasa/robocasa/models/assets/
+/robocasa/datasets/
+/robocasa/checkpoints/
+/jepa-wms/checkpoints/
+/jepa-wms/datasets/
+/dinov3/checkpoints/
+/dinov3/weights/
+/stable-worldmodel/checkpoints/
+/stable-worldmodel/datasets/
+/stable-worldmodel/outputs/
