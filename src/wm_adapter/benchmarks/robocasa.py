@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -582,9 +583,17 @@ class RoboCasaBenchmark(BenchmarkAdapter):
                 np.asarray(states[0]),
                 env_info=environment_info,
             )
-            visual = restored_observation.get("pixels")
-            if visual is None:
-                visual = restored_observation.get("visual")
+            if isinstance(restored_observation, (torch.Tensor, np.ndarray)):
+                visual = restored_observation
+            elif isinstance(restored_observation, Mapping):
+                visual = restored_observation.get("pixels")
+                if visual is None:
+                    visual = restored_observation.get("visual")
+            else:
+                raise RuntimeError(
+                    "RoboCasa restored observation has an unsupported type: "
+                    f"type={type(restored_observation).__name__}"
+                )
             if visual is None:
                 raise RuntimeError(
                     f"RoboCasa restored observation has no RGB value: keys={sorted(restored_observation)}"
