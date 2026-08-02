@@ -20,7 +20,7 @@ from wm_adapter.appearance.composed_photometric import (
 )
 from wm_adapter.backends.jepa_wm_droid import JEPAWMDroidBackend
 from wm_adapter.benchmarks.base import array_sha256
-from wm_adapter.data.robocasa_windows import build_robocasa_dataset, split_episode_indices
+from wm_adapter.benchmarks.factory import build_benchmark
 from wm_adapter.utils.reproducibility import resolve_path, seed_everything
 
 
@@ -317,6 +317,9 @@ def run_robocasa_planning(
             official_cfg.task_specification.env.subtask = None
             official_cfg.task_specification.env.sample_subtask_slice = False
             official_cfg.model_kwargs.data.custom.filter_tasks = [resolved_task_name]
+    configured_gripper = experiment_config.benchmark.get("gripper_types")
+    if configured_gripper is not None:
+        official_cfg.task_specification.env.gripper_types = str(configured_gripper)
     suite_mode = str(experiment_config.get("suite_mode", "formal"))
     if suite_mode == "self_test":
         self_test = experiment_config.planning.self_test
@@ -362,20 +365,9 @@ def run_robocasa_planning(
     official_cfg.frameskip = int(official_cfg.model_kwargs.data.custom.frameskip)
     official_cfg.action_ratio = 1 if official_cfg.planner.repeat_actskip else official_cfg.frameskip // backend.official_model.action_skip
 
-    source_dataset = build_robocasa_dataset(
-        jepa_wms_root=backend.jepa_repo,
-        dataset_root=experiment_config.paths.dataset_root,
-        hdf5_path=experiment_config.paths.robocasa_hdf5,
-        task_name=str(experiment_config.data.task_name),
-        camera_view=str(experiment_config.data.camera_view),
-        output_environment_info=True,
-        transform=None,
-    )
-    _, evaluation_episodes = split_episode_indices(
-        len(source_dataset),
-        float(experiment_config.data.train_fraction),
-        int(experiment_config.data.split_seed),
-    )
+    benchmark = build_benchmark(experiment_config)
+    source_dataset = benchmark.build_source_dataset(output_environment_info=True)
+    _, evaluation_episodes = benchmark.split_trajectory_ids(source_dataset)
     dataset = TrajSubset(source_dataset, evaluation_episodes.tolist())
     manifest_path = resolve_path(str(experiment_config.paths.get("evaluation_manifest", "")))
     manifest_instances: list[dict[str, Any]] = []

@@ -23,6 +23,7 @@ from wm_adapter.data.robocasa_windows import (
     build_robocasa_dataset,
 )
 from wm_adapter.data.robocasa_lerobot import (
+    LEROBOT_DATASET_FORMAT,
     RoboCasaLeRobotDataset,
     inspect_robocasa_lerobot,
 )
@@ -114,7 +115,7 @@ class RoboCasaBenchmark(BenchmarkAdapter):
         sources: list[tuple[str, Path]] = []
         lerobot = self._candidate_lerobot_dataset(candidate)
         if lerobot is not None:
-            sources.append(("lerobot_v3", lerobot))
+            sources.append((LEROBOT_DATASET_FORMAT, lerobot))
         hdf5 = self._candidate_dataset(candidate)
         if hdf5 is not None:
             sources.append(("hdf5", hdf5))
@@ -268,7 +269,7 @@ class RoboCasaBenchmark(BenchmarkAdapter):
                 continue
             source_failures: list[str] = []
             for dataset_format, path in sources:
-                if dataset_format == "lerobot_v3":
+                if dataset_format == LEROBOT_DATASET_FORMAT:
                     reasons, candidate_details = inspect_robocasa_lerobot(
                         path,
                         task_name=candidate,
@@ -349,7 +350,14 @@ class RoboCasaBenchmark(BenchmarkAdapter):
             status = "candidate_requires_deep_preflight"
         available = int(details.get("available_demonstrations", 0))
         if available >= 2:
-            train, evaluation = self.split_trajectory_ids(range(available))
+            if str(details.get("dataset_format")) == LEROBOT_DATASET_FORMAT:
+                train_count = int(
+                    np.floor(available * float(self.cfg.data.train_fraction))
+                )
+                train = np.arange(train_count, dtype=np.int64)
+                evaluation = np.arange(train_count, available, dtype=np.int64)
+            else:
+                train, evaluation = self.split_trajectory_ids(range(available))
             demonstration_ids = list(details.get("demonstration_ids", []))
             train_ids = tuple(
                 str(demonstration_ids[int(index)]) for index in train.tolist()
@@ -387,7 +395,26 @@ class RoboCasaBenchmark(BenchmarkAdapter):
             selected_train_demonstrations=train_ids,
             selected_test_demonstrations=evaluation_ids,
             camera_key=camera_key,
-            action_convention=self.action_convention().as_dict(),
+            action_convention=(
+                json.loads(
+                    json.dumps(
+                        {
+                            **self.action_convention().as_dict(),
+                            "dataset_raw_action": details.get(
+                                "canonical_action_mapping"
+                            ),
+                            "dataset_raw_action_segments": details.get(
+                                "raw_action_segments"
+                            ),
+                            "dataset_raw_action_indices": details.get(
+                                "raw_action_indices"
+                            ),
+                        }
+                    )
+                )
+                if str(details.get("dataset_format")) == LEROBOT_DATASET_FORMAT
+                else self.action_convention().as_dict()
+            ),
             environment_implementation="robocasa.utils.env_utils.create_env via JEPA-WM RoboCasaWrapper",
             upstream_commits=dict(UPSTREAM_COMMITS),
             frameskip=int(self.cfg.data.frameskip),
@@ -504,6 +531,9 @@ class RoboCasaBenchmark(BenchmarkAdapter):
         subtask = self.cfg.planning.get("subtask")
         official.task_specification.env.subtask = subtask
         official.task_specification.env.sample_subtask_slice = bool(subtask)
+        configured_gripper = self.cfg.benchmark.get("gripper_types")
+        if configured_gripper is not None:
+            official.task_specification.env.gripper_types = str(configured_gripper)
         official.model_kwargs.data.custom.filter_tasks = [task_name]
         official = parse_cfg(official)
         official.rank = 0
@@ -581,7 +611,7 @@ class RoboCasaBenchmark(BenchmarkAdapter):
     def build_source_dataset(self, *, output_environment_info: bool) -> Any:
         task = self.resolve_task(strict=True)
         dataset_path = resolve_path(task.dataset_path)
-        dataset_format = "lerobot_v3" if dataset_path.is_dir() else "hdf5"
+        dataset_format = LEROBOT_DATASET_FORMAT if dataset_path.is_dir() else "hdf5"
         return self._build_source(
             path=dataset_path,
             task_name=task.task_name,
@@ -597,7 +627,7 @@ class RoboCasaBenchmark(BenchmarkAdapter):
         dataset_format: str,
         output_environment_info: bool,
     ) -> Any:
-        if dataset_format == "lerobot_v3":
+        if dataset_format == LEROBOT_DATASET_FORMAT:
             return RoboCasaLeRobotDataset(
                 path,
                 task_name=task_name,
@@ -618,6 +648,27 @@ class RoboCasaBenchmark(BenchmarkAdapter):
             output_environment_info=output_environment_info,
             transform=None,
         )
+
+    def split_trajectory_ids(
+        self,
+        source_dataset: Any,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if isinstance(source_dataset, RoboCasaLeRobotDataset):
+            episode_count = len(source_dataset)
+            train_count = int(
+                np.floor(episode_count * float(self.cfg.data.train_fraction))
+            )
+            if train_count <= 0 or train_count >= episode_count:
+                raise ValueError(
+                    "RoboCasa365 ordered split must leave non-empty partitions: "
+                    f"episodes={episode_count}, "
+                    f"train_fraction={self.cfg.data.train_fraction}"
+                )
+            return (
+                np.arange(train_count, dtype=np.int64),
+                np.arange(train_count, episode_count, dtype=np.int64),
+            )
+        return super().split_trajectory_ids(source_dataset)
 
     def enumerate_window_candidates(
         self,

@@ -6,9 +6,9 @@ export LIBERO_SPATIAL_DATA_ROOT="/absolute/path/to/libero_spatial"
 export LIBERO_GOAL_DATA_ROOT="/absolute/path/to/libero_goal"
 
 export ROBOCASA_PLACE_HDF5="/absolute/path/to/jepa_wm_datasets/robocasa/combine_all_im256.hdf5"
-# Preferred articulated source. It must include task Parquet/video metadata and
-# full simulator reconstruction metadata; policy-only LeRobot exports fail strict preflight.
-export ROBOCASA_OPEN_DRAWER_LEROBOT="/absolute/path/to/robocasa365/OpenDrawer"
+# Preferred articulated source: complete task-level RoboCasa365 LeRobot v2.1
+# data, including per-episode Parquet, videos, model.xml.gz, and states.npz.
+export ROBOCASA_OPEN_DRAWER_LEROBOT="/absolute/path/to/robocasa365/v1.0/pretrain/atomic/OpenDrawer/20250819/lerobot"
 # Optional official task-level HDF5 fallback:
 export ROBOCASA_OPEN_DRAWER_HDF5=""
 

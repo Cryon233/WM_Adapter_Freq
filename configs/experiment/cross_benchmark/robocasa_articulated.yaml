@@ -16,6 +16,7 @@ benchmark:
   task_id: auto_articulated
   task_name: auto_articulated
   control_frequency_hz: 20.0
+  gripper_types: default
 paths:
   dataset_root: ${oc.env:JEPAWM_DSET,''}
   robocasa_hdf5: ${oc.env:ROBOCASA_ARTICULATED_HDF5,''}
