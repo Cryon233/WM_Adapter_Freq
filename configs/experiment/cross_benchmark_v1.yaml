@@ -1,0 +1,71 @@
+suite_name: cross_benchmark_v1
+protocol: cross_benchmark_v1
+state_path: logs/cross_benchmark_v1/state.json
+pid_path: logs/cross_benchmark_v1/runner.pid
+runner_log: logs/cross_benchmark_v1/runner.log
+log_root: logs/cross_benchmark_v1/jobs
+output_root: outputs/cross_benchmark_v1
+analysis_root: outputs/cross_benchmark_v1/analysis
+manifest_root: outputs/cross_benchmark_v1/manifests
+storage_root: storage/feature_cache/cross_benchmark_v1
+checkpoint_root: checkpoints/cross_benchmark_v1
+tasks:
+  robocasa_place: configs/experiment/cross_benchmark/robocasa_place.yaml
+  robocasa_articulated: configs/experiment/cross_benchmark/robocasa_articulated.yaml
+  libero_spatial_0: configs/experiment/cross_benchmark/libero_spatial_0.yaml
+  libero_goal_0: configs/experiment/cross_benchmark/libero_goal_0.yaml
+methods: [base, dct_adapter, token_mlp, lora]
+domains: [clean, ood]
+main: {episodes: 20, eval_seed: 42}
+data: {num_train_windows: 2000, split_seed: 42, window_seed: 42, train_fraction: 0.8}
+training: {seeds: [42], epochs: 20}
+stability:
+  tasks: [robocasa_place, libero_goal_0]
+  methods: [dct_adapter, lora]
+  seeds: [42, 7, 2026]
+  episodes: 10
+  domain: ood
+  severity: 1.0
+severity:
+  tasks: [robocasa_place, libero_goal_0]
+  methods: [base, dct_adapter]
+  values: [0.5, 1.0, 1.5]
+  episodes: 10
+  seed: 42
+ablations:
+  tasks: [robocasa_place, libero_goal_0]
+  variants:
+    full: {method_config: configs/method/dct_adapter.yaml, canonical_weight: 1.0, dynamics_weight: 1.0}
+    framewise_mask: {method_config: configs/method/dct_framewise_mask.yaml, canonical_weight: 1.0, dynamics_weight: 1.0}
+    static_low_rank_mask: {method_config: configs/method/dct_static_low_rank_mask.yaml, canonical_weight: 1.0, dynamics_weight: 1.0}
+    canonical_only: {method_config: configs/method/dct_adapter.yaml, canonical_weight: 1.0, dynamics_weight: 0.0}
+  episodes: 10
+  seed: 42
+  domain: ood
+offline: {windows: 200, seed: 42, shuffle_seed: 100045, bootstrap_samples: 10000}
+appearance: {pipeline_version: composed_photometric_v1, training_severity: 1.0, main_severity: 1.0, seed: 2026}
+gpu: {default_ids: [0, 1, 2, 3], one_heavy_job_per_gpu: true}
+reuse_sources:
+  robocasa_place:
+    cache: storage/feature_cache/jepa_wm_droid_robocasa_pilot.h5
+    checkpoints:
+      dct_adapter: checkpoints/jepa_wm_droid/robocasa/dct_adapter_final.pt
+      token_mlp: checkpoints/jepa_wm_droid/robocasa/token_mlp_final.pt
+      lora: checkpoints/jepa_wm_droid/robocasa/lora_final.pt
+    planning_root: outputs/jepa_wm_droid/robocasa/protocol_v2/place/seed_42
+self_test:
+  task_keys: [robocasa_place, libero_goal_0]
+  methods: [dct_adapter]
+  domains: [ood]
+  windows: 4
+  offline_windows: 1
+  epochs: 1
+  episodes: 1
+  roots:
+    state_path: logs/cross_benchmark_v1_self_test/state.json
+    pid_path: logs/cross_benchmark_v1_self_test/runner.pid
+    log_root: logs/cross_benchmark_v1_self_test/jobs
+    storage_root: storage/cross_benchmark_v1_self_test
+    checkpoint_root: checkpoints/cross_benchmark_v1_self_test
+    output_root: outputs/cross_benchmark_v1_self_test
+    analysis_root: outputs/cross_benchmark_v1_self_test/analysis

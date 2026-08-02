@@ -99,15 +99,15 @@ def build_robocasa_dataset(
             f"Official custom RoboCasa data must be inside {expected_parent}; received {hdf5}"
         )
     matching = sorted(path.resolve() for path in expected_parent.rglob("*im256.hdf5") if path.is_file())
-    if matching != [hdf5]:
+    if hdf5 not in matching:
         raise RuntimeError(
-            f"JEPA-WM custom RoboCasa loader must resolve exactly the configured HDF5 {hdf5}; "
+            f"JEPA-WM custom RoboCasa loader cannot see the configured HDF5 {hdf5}; "
             f"found {[str(path) for path in matching]}"
         )
     os.environ["JEPAWM_DSET"] = str(root)
     from app.plan_common.datasets.robocasa_dset import RoboCasaDataset
 
-    return RoboCasaDataset(
+    dataset = RoboCasaDataset(
         transform=transform,
         filter_tasks=[task_name],
         filter_first_episodes=None,
@@ -122,6 +122,16 @@ def build_robocasa_dataset(
         rcasa_to_droid_action_format=False,
         custom_teleop_dset=True,
     )
+    source_files = {
+        resolve_path(str(trajectory["file_path"]))
+        for trajectory in dataset.trajectories
+    }
+    if source_files != {hdf5}:
+        raise RuntimeError(
+            "The filtered RoboCasa task did not resolve exclusively to its configured "
+            f"HDF5: expected={hdf5}, actual={sorted(str(path) for path in source_files)}"
+        )
+    return dataset
 
 
 @dataclass(frozen=True)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import json
 from pathlib import Path
 from typing import Any
 
@@ -208,6 +209,38 @@ class AdapterTrainer:
             "upstream_commits": self.backend.upstream_commits,
             "cache_fingerprint": str(cache_metadata["cache_fingerprint"]),
             "appearance_metadata": cache_metadata["appearance_metadata"],
+            "data_metadata": {
+                key: (
+                    json.loads(str(cache_metadata[key]))
+                    if key in {
+                        "action_convention",
+                        "source_trajectory_ids",
+                        "train_test_split",
+                        "window_identity",
+                        "task_upstream_commits",
+                    }
+                    else cache_metadata[key].item()
+                    if hasattr(cache_metadata[key], "item")
+                    else cache_metadata[key]
+                )
+                for key in (
+                    "benchmark",
+                    "benchmark_suite",
+                    "task_id",
+                    "task_name",
+                    "task_key",
+                    "task_manifest_sha256",
+                    "dataset_sha256",
+                    "camera_key",
+                    "action_convention",
+                    "source_trajectory_ids",
+                    "train_test_split",
+                    "window_identity",
+                    "source_trajectory_identity",
+                    "task_upstream_commits",
+                )
+                if key in cache_metadata
+            },
             "training_config": asdict(self.config),
         }
         atomic_torch_save(payload, checkpoint_path)

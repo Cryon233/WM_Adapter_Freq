@@ -1,0 +1,663 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+import h5py
+import numpy as np
+import torch
+from omegaconf import OmegaConf
+
+from wm_adapter.benchmarks.base import (
+    ActionConvention,
+    BenchmarkAdapter,
+    EvaluationInstance,
+    ResolvedTask,
+    array_sha256,
+    canonical_sha256,
+)
+from wm_adapter.data.robocasa_windows import (
+    RoboCasaWindowDataset,
+    build_robocasa_dataset,
+)
+from wm_adapter.utils.checkpoints import UPSTREAM_COMMITS, sha256_file
+from wm_adapter.utils.reproducibility import resolve_path
+
+
+ARTICULATED_TASK_PRIORITY = (
+    "OpenDrawer",
+    "CloseDrawer",
+    "OpenCabinet",
+    "CloseCabinet",
+)
+
+
+class RoboCasaBenchmark(BenchmarkAdapter):
+    def __init__(self, cfg: Any) -> None:
+        super().__init__(cfg)
+        self._strict_resolution: ResolvedTask | None = None
+
+    @property
+    def name(self) -> str:
+        return "robocasa"
+
+    def action_convention(self) -> ActionConvention:
+        return ActionConvention(
+            dimension=7,
+            translation="normalized delta Cartesian position in the robot base frame",
+            rotation="normalized delta axis-angle rotation",
+            gripper="scalar command; -1=open and +1=close",
+            source_range=(-1.0, 1.0),
+            target_range=(-1.0, 1.0),
+            controller_type="DROID canonical action -> RoboCasa OSC_POSE",
+            control_frequency_hz=float(self.cfg.benchmark.get("control_frequency_hz", 20.0)),
+            action_repeat=int(self.cfg.data.frameskip),
+            transform=(
+                "RoboCasaWrapper scales canonical dimensions by the pinned controller "
+                "output limits [0.05,0.05,0.05,0.5,0.5,0.5,1.0]"
+            ),
+        )
+
+    def _candidate_dataset(self, candidate: str) -> Path | None:
+        mappings = self.cfg.paths.get("candidate_datasets", {})
+        value = mappings.get(candidate) if mappings else None
+        if value is None or not str(value).strip():
+            value = self.cfg.paths.get("robocasa_hdf5", "")
+        if not str(value).strip():
+            return None
+        return resolve_path(str(value))
+
+    @staticmethod
+    def _inspect_dataset(path: Path, expected_task: str) -> tuple[list[str], dict[str, Any]]:
+        errors: list[str] = []
+        details: dict[str, Any] = {"dataset_path": str(path)}
+        if not path.is_file():
+            return [f"demonstration HDF5 does not exist: {path}"], details
+        try:
+            with h5py.File(path, "r") as handle:
+                if "data" not in handle:
+                    return ["HDF5 lacks root group 'data'"], details
+                data = handle["data"]
+                try:
+                    env_args = json.loads(str(data.attrs.get("env_args", "{}")))
+                except json.JSONDecodeError as error:
+                    return [f"data.env_args is invalid JSON: {error}"], details
+                actual_task = str(env_args.get("env_name", ""))
+                details["source_task"] = actual_task
+                if actual_task != expected_task:
+                    errors.append(
+                        f"dataset env_name is {actual_task!r}, expected {expected_task!r}"
+                    )
+                demos = sorted(
+                    (key for key in data if key.startswith("demo_")),
+                    key=lambda value: int(value.rsplit("_", 1)[-1]),
+                )
+                details["demonstration_ids"] = demos
+                details["available_demonstrations"] = len(demos)
+                if len(demos) < 2:
+                    errors.append(
+                        f"dataset needs at least two trajectories, found {len(demos)}"
+                    )
+                window_candidates = 0
+                lengths: list[int] = []
+                for demo in demos:
+                    group = data[demo]
+                    if "actions" not in group or "states" not in group:
+                        errors.append(f"{demo} lacks actions or states")
+                        continue
+                    if "rewards" not in group:
+                        errors.append(
+                            f"{demo} lacks the official task success/reward signal"
+                        )
+                    actions = group["actions"]
+                    lengths.append(int(actions.shape[0]))
+                    if actions.ndim != 2 or actions.shape[1] < 7:
+                        errors.append(
+                            f"{demo} action shape is {actions.shape}, expected [T,>=7]"
+                        )
+                        continue
+                    if "obs" not in group:
+                        errors.append(f"{demo} lacks obs group")
+                        continue
+                    image_keys = sorted(
+                        key for key in group["obs"] if key.endswith("_image")
+                    )
+                    if not image_keys:
+                        errors.append(f"{demo} has no camera image dataset")
+                        continue
+                    window_candidates += max(0, int(actions.shape[0]) - 16)
+                details["window_candidates_lower_bound"] = window_candidates
+                details["demonstration_lengths"] = lengths
+                if window_candidates < 2000:
+                    errors.append(
+                        "dataset cannot provide 2000 four-frame training windows: "
+                        f"lower_bound={window_candidates}"
+                    )
+        except OSError as error:
+            errors.append(f"cannot open HDF5: {error}")
+        return errors, details
+
+    def resolve_task(self, *, strict: bool) -> ResolvedTask:
+        if strict and self._strict_resolution is not None:
+            return self._strict_resolution
+        if strict:
+            existing = self.existing_task_manifest()
+            if existing is not None:
+                self._strict_resolution = existing
+                return existing
+        task_key = str(self.cfg.benchmark.task_key)
+        requested = str(self.cfg.benchmark.get("task_name", self.cfg.data.task_name))
+        failures: dict[str, list[str]] = {}
+        selected: str | None = None
+        selected_path: Path | None = None
+        details: dict[str, Any] = {}
+        candidates = (
+            ARTICULATED_TASK_PRIORITY
+            if requested in {"auto_articulated", "articulated"}
+            else (requested,)
+        )
+        for candidate in candidates:
+            path = self._candidate_dataset(candidate)
+            if path is None:
+                failures[candidate] = ["no dataset path is configured"]
+                continue
+            reasons, candidate_details = self._inspect_dataset(path, candidate)
+            if reasons:
+                failures[candidate] = reasons
+                continue
+            if strict and requested in {"auto_articulated", "articulated"}:
+                try:
+                    source = build_robocasa_dataset(
+                        jepa_wms_root=(
+                            resolve_path(self.cfg.model.third_party_root) / "jepa-wms"
+                        ),
+                        dataset_root=self.cfg.paths.dataset_root,
+                        hdf5_path=path,
+                        task_name=candidate,
+                        camera_view=str(self.cfg.data.camera_view),
+                        output_environment_info=True,
+                        transform=None,
+                    )
+                    _, heldout = self.split_trajectory_ids(source)
+                    candidate_details["resolver_environment_check"] = (
+                        self._deep_environment_preflight(candidate, source, heldout)
+                    )
+                except Exception as error:
+                    failures[candidate] = [
+                        "environment/state/action/success preflight failed: "
+                        f"{type(error).__name__}: {error}"
+                    ]
+                    continue
+            selected = candidate
+            selected_path = path
+            details = candidate_details
+            break
+        if selected is None or selected_path is None:
+            message = (
+                "No RoboCasa task candidate satisfies the fixed resolver priority: "
+                + json.dumps(failures, sort_keys=True)
+            )
+            if strict:
+                raise RuntimeError(message)
+            selected = requested if requested not in {"auto_articulated", "articulated"} else ARTICULATED_TASK_PRIORITY[0]
+            selected_path = self._candidate_dataset(selected) or resolve_path("missing-robocasa-dataset.hdf5")
+            details = {"available_demonstrations": 0}
+        camera_key = str(self.cfg.data.camera_view)
+        status = "resolved" if not failures or selected not in failures else "unresolved"
+        if not strict and requested in {"auto_articulated", "articulated"} and status == "resolved":
+            status = "candidate_requires_deep_preflight"
+        available = int(details.get("available_demonstrations", 0))
+        if available >= 2:
+            train, evaluation = self.split_trajectory_ids(range(available))
+            demonstration_ids = list(details.get("demonstration_ids", []))
+            train_ids = tuple(
+                str(demonstration_ids[int(index)]) for index in train.tolist()
+            )
+            evaluation_ids = tuple(
+                str(demonstration_ids[int(index)]) for index in evaluation.tolist()
+            )
+        else:
+            train_ids = ()
+            evaluation_ids = ()
+        lengths = np.asarray(details.get("demonstration_lengths", []), dtype=np.int64)
+        length_summary = (
+            f"demonstration lengths min/median/max="
+            f"{int(lengths.min())}/{float(np.median(lengths)):.1f}/{int(lengths.max())}"
+            if lengths.size
+            else "demonstration lengths unavailable"
+        )
+        result = ResolvedTask(
+            task_key=task_key,
+            benchmark="robocasa",
+            suite=str(self.cfg.benchmark.get("suite", "single_stage")),
+            task_id=str(selected),
+            task_name=str(selected),
+            language_instruction=None,
+            bddl_path=None,
+            bddl_sha256=None,
+            problem_folder=None,
+            initial_states_sha256=None,
+            initial_states_count=0,
+            dataset_path=str(selected_path),
+            dataset_sha256=sha256_file(selected_path) if strict else None,
+            available_demonstrations=available,
+            selected_train_demonstrations=train_ids,
+            selected_test_demonstrations=evaluation_ids,
+            camera_key=camera_key,
+            action_convention=self.action_convention().as_dict(),
+            environment_implementation="robocasa.utils.env_utils.create_env via JEPA-WM RoboCasaWrapper",
+            upstream_commits=dict(UPSTREAM_COMMITS),
+            frameskip=int(self.cfg.data.frameskip),
+            max_episode_steps=int(self.cfg.evaluation.max_episode_steps),
+            episode_cap_basis=(
+                f"{self.cfg.evaluation.episode_cap_basis}; {length_summary}; "
+                f"control_frequency_hz={self.action_convention().control_frequency_hz}"
+            ),
+            status=status,
+            candidate_failures=failures or None,
+        )
+        if strict:
+            self._strict_resolution = result
+        return result
+
+    def preflight(self, *, deep: bool) -> dict[str, Any]:
+        task = self.resolve_task(strict=True)
+        source = self.build_source_dataset(output_environment_info=deep)
+        train, evaluation = self.split_trajectory_ids(source)
+        train_ids = tuple(
+            str(source.trajectories[int(index)].get("demo_key", index))
+            for index in train.tolist()
+        )
+        evaluation_ids = tuple(
+            str(source.trajectories[int(index)].get("demo_key", index))
+            for index in evaluation.tolist()
+        )
+        if train_ids != tuple(task.selected_train_demonstrations) or evaluation_ids != tuple(task.selected_test_demonstrations):
+            raise RuntimeError(
+                "RoboCasa deterministic split no longer matches the immutable task manifest"
+            )
+        candidates = self.enumerate_window_candidates(
+            source,
+            int(self.cfg.data.num_frames),
+            int(self.cfg.data.frameskip),
+        )
+        selected = self.select_windows(
+            candidates,
+            train,
+            int(self.cfg.data.num_train_windows),
+            int(self.cfg.data.window_seed),
+        )
+        errors: list[str] = []
+        if len(selected) != int(self.cfg.data.num_train_windows):
+            errors.append(
+                f"selected {len(selected)} training windows, expected {self.cfg.data.num_train_windows}"
+            )
+        if len(evaluation) == 0:
+            errors.append("held-out trajectory partition is empty")
+        if errors:
+            raise RuntimeError("RoboCasa preflight failed:\n- " + "\n- ".join(errors))
+        report = {
+            "benchmark": self.name,
+            "task": task.as_dict(),
+            "train_trajectories": train.tolist(),
+            "evaluation_trajectories": evaluation.tolist(),
+            "selected_train_windows": len(selected),
+            "deep_environment_check": deep,
+        }
+        if deep:
+            report["environment_restore"] = self._deep_environment_preflight(
+                task.task_name, source, evaluation
+            )
+        return report
+
+    def _deep_environment_preflight(
+        self,
+        task_name: str,
+        source: Any,
+        evaluation: np.ndarray,
+    ) -> dict[str, Any]:
+        from evals.simu_env_planning.envs.init import make_env
+        from evals.simu_env_planning.planning.common.parser import parse_cfg
+
+        official = OmegaConf.load(resolve_path(str(self.cfg.model.official_planning_config)))
+        official = OmegaConf.create(
+            OmegaConf.to_container(official, resolve=False)
+        )
+        official.folder = str(resolve_path("logs/cross_benchmark_v1/preflight"))
+        OmegaConf.resolve(official)
+        official.work_dir = resolve_path("logs/cross_benchmark_v1/preflight")
+        official.task_specification.task = f"robocasa-{task_name}"
+        subtask = self.cfg.planning.get("subtask")
+        official.task_specification.env.subtask = subtask
+        official.task_specification.env.sample_subtask_slice = bool(subtask)
+        official.model_kwargs.data.custom.filter_tasks = [task_name]
+        official = parse_cfg(official)
+        official.rank = 0
+        official.world_size = 1
+        official.device = "cpu"
+        official.num_active_gpus = 1
+        official.active_ranks = [0]
+        official.local_seed = int(self.cfg.evaluation.eval_seed)
+        official.frameskip = int(self.cfg.data.frameskip)
+        generator = torch.Generator(device="cpu").manual_seed(
+            int(self.cfg.evaluation.eval_seed)
+        )
+        sample: Any | None = None
+        trajectory = -1
+        for _ in range(100):
+            trajectory = int(
+                evaluation[
+                    int(
+                        torch.randint(
+                            0, len(evaluation), (1,), generator=generator
+                        ).item()
+                    )
+                ]
+            )
+            try:
+                sample = source.__getitem__(
+                    trajectory, subtask=str(subtask) if subtask else None
+                )
+            except ValueError:
+                continue
+            break
+        if sample is None:
+            raise RuntimeError(
+                f"RoboCasa {task_name} has no usable held-out trajectory after 100 attempts"
+            )
+        observation, actions, states, rewards, environment_info = sample
+        if states is None or environment_info is None:
+            raise RuntimeError(
+                f"RoboCasa {task_name} cannot restore simulator state/environment XML"
+            )
+        environment = make_env(official)
+        try:
+            environment.update_env(environment_info)
+            restored_observation, info = environment.prepare(
+                int(self.cfg.evaluation.eval_seed),
+                np.asarray(states[0]),
+                env_info=environment_info,
+            )
+            visual = restored_observation.get("pixels")
+            if visual is None:
+                visual = restored_observation.get("visual")
+            if visual is None:
+                raise RuntimeError(
+                    f"RoboCasa restored observation has no RGB value: keys={sorted(restored_observation)}"
+                )
+            if int(environment.action_dim) != 7 or int(actions.shape[-1]) != 7:
+                raise RuntimeError(
+                    f"RoboCasa action dimension mismatch: env={environment.action_dim}, dataset={actions.shape}"
+                )
+            if "success" not in info:
+                raise RuntimeError(
+                    f"RoboCasa official success signal is absent: keys={sorted(info)}"
+                )
+            return {
+                "trajectory_index": trajectory,
+                "dataset_visual_shape": list(observation["visual"].shape),
+                "restored_visual_shape": list(np.asarray(visual).shape),
+                "action_dim": int(environment.action_dim),
+                "success_signal": "info.success",
+                "reward_shape": None if rewards is None else list(rewards.shape),
+            }
+        finally:
+            environment.close()
+
+    def build_source_dataset(self, *, output_environment_info: bool) -> Any:
+        task = self.resolve_task(strict=True)
+        return build_robocasa_dataset(
+            jepa_wms_root=resolve_path(self.cfg.model.third_party_root) / "jepa-wms",
+            dataset_root=self.cfg.paths.dataset_root,
+            hdf5_path=task.dataset_path,
+            task_name=task.task_name,
+            camera_view=str(self.cfg.data.camera_view),
+            output_environment_info=output_environment_info,
+            transform=None,
+        )
+
+    def enumerate_window_candidates(
+        self,
+        source_dataset: Any,
+        num_frames: int,
+        frameskip: int,
+    ) -> list[tuple[int, int]]:
+        return RoboCasaWindowDataset.all_candidates(
+            source_dataset, num_frames, frameskip
+        )
+
+    def make_window_dataset(
+        self,
+        source_dataset: Any,
+        selections: list[tuple[int, int]],
+        *,
+        num_frames: int,
+        frameskip: int,
+        appearance_seed: int,
+        appearance_severity: float,
+    ) -> RoboCasaWindowDataset:
+        return RoboCasaWindowDataset(
+            source_dataset,
+            selections,
+            num_frames=num_frames,
+            frameskip=frameskip,
+            appearance_seed=appearance_seed,
+            appearance_severity=appearance_severity,
+        )
+
+    def build_evaluation_manifest(
+        self,
+        task: ResolvedTask,
+        *,
+        count: int,
+        seed: int,
+        appearance_seed: int,
+    ) -> dict[str, Any]:
+        source = self.build_source_dataset(output_environment_info=True)
+        _, evaluation = self.split_trajectory_ids(source)
+        goal_span = int(self.cfg.evaluation.goal_span_steps)
+        subtask = self.cfg.planning.get("subtask")
+        if task.task_key == "robocasa_place" and str(subtask) == "place":
+            generator = torch.Generator(device="cpu").manual_seed(seed)
+            instances: list[EvaluationInstance] = []
+            for position in range(count):
+                selected: tuple[int, Any] | None = None
+                errors: list[str] = []
+                for _ in range(100):
+                    subset_index = int(
+                        torch.randint(
+                            0, len(evaluation), (1,), generator=generator
+                        ).item()
+                    )
+                    trajectory = int(evaluation[subset_index])
+                    try:
+                        result = source.__getitem__(trajectory, subtask="place")
+                    except ValueError as error:
+                        errors.append(str(error))
+                        continue
+                    selected = (trajectory, result)
+                    break
+                if selected is None:
+                    raise RuntimeError(
+                        "RoboCasa Place compatibility manifest could not reproduce "
+                        f"the pinned evaluator sampling after 100 attempts: {errors[-3:]}"
+                    )
+                trajectory, result = selected
+                observation, _, states, _, trajectory_info = result
+                if states is None:
+                    raise RuntimeError(
+                        f"RoboCasa Place trajectory {trajectory} returned no simulator state"
+                    )
+                trajectory_path = Path(str(trajectory_info["file_path"]))
+                with h5py.File(trajectory_path, "r") as handle:
+                    group = handle["data"][str(trajectory_info["demo_key"])]
+                    segments = np.asarray(
+                        group["meta_data_info/current_task_segment"]
+                    )
+                frame_indices = np.flatnonzero(segments == 2)
+                if frame_indices.size == 0 or not np.array_equal(
+                    frame_indices,
+                    np.arange(frame_indices[0], frame_indices[-1] + 1),
+                ):
+                    raise RuntimeError(
+                        "RoboCasa Place compatibility requires one contiguous place "
+                        f"segment: trajectory={trajectory}, indices={frame_indices.tolist()}"
+                    )
+                if int(observation["visual"].shape[0]) != int(frame_indices.size):
+                    raise RuntimeError(
+                        f"RoboCasa Place filtered length mismatch for trajectory {trajectory}"
+                    )
+                source_id = str(trajectory_info.get("demo_key", trajectory))
+                identity = {
+                    "task": task.task_key,
+                    "source": source_id,
+                    "start": int(frame_indices[0]),
+                    "end": int(frame_indices[-1]),
+                    "evaluation_position": position,
+                }
+                instances.append(
+                    EvaluationInstance(
+                        instance_id=canonical_sha256(identity)[:24],
+                        source_trajectory_id=source_id,
+                        source_trajectory_index=trajectory,
+                        segment_start=int(frame_indices[0]),
+                        segment_end=int(frame_indices[-1]),
+                        initialization_fingerprint=array_sha256(states[0].numpy()),
+                        goal_fingerprint=array_sha256(
+                            observation["visual"][-1].numpy()
+                        ),
+                        environment_seed=int(
+                            (seed * seed + position * seed) % (2**32 - 2)
+                        ),
+                        cem_seed=seed,
+                        appearance_seed=appearance_seed,
+                    )
+                )
+            payload = self.finalize_evaluation_manifest(task, instances)
+            payload.update(
+                source_trajectory_count=len(
+                    {value.source_trajectory_id for value in instances}
+                ),
+                segment_identity_note=(
+                    "Sampling reproduces the pinned evaluator's seeded held-out "
+                    "trajectory stream; repeated trajectories are clustered."
+                ),
+                cem_seed_mode="continuous_generator_stream",
+                legacy_place_reuse_compatible=True,
+            )
+            payload["evaluation_manifest_sha256"] = canonical_sha256(
+                {
+                    key: value
+                    for key, value in payload.items()
+                    if key != "evaluation_manifest_sha256"
+                }
+            )
+            return payload
+        primary_candidates: list[tuple[int, int, int]] = []
+        for trajectory in evaluation.tolist():
+            length = int(source.get_seq_length(int(trajectory)))
+            end = length - 1
+            start = max(0, end - goal_span)
+            try:
+                observation, _, _, _, _ = source.get_frames(
+                    int(trajectory),
+                    range(start, end + 1),
+                    subtask=str(subtask) if subtask else None,
+                )
+            except ValueError:
+                continue
+            if int(observation["visual"].shape[0]) == end - start + 1:
+                primary_candidates.append((int(trajectory), start, end))
+        candidates = primary_candidates
+        uses_distinct_source_trajectories = len(primary_candidates) >= count
+        if not uses_distinct_source_trajectories:
+            candidates = []
+            # A small held-out partition may contribute distinct fixed-span
+            # segments. Their shared source IDs remain explicit for clustering.
+            for trajectory in evaluation.tolist():
+                length = int(source.get_seq_length(int(trajectory)))
+                for start in range(max(0, length - goal_span)):
+                    end = start + goal_span
+                    try:
+                        observation, _, _, _, _ = source.get_frames(
+                            int(trajectory),
+                            range(start, end + 1),
+                            subtask=str(subtask) if subtask else None,
+                        )
+                    except ValueError:
+                        continue
+                    if int(observation["visual"].shape[0]) != goal_span + 1:
+                        continue
+                    candidates.append((int(trajectory), start, end))
+        generator = np.random.default_rng(seed)
+        if len(candidates) < count:
+            raise RuntimeError(
+                f"RoboCasa held-out partition provides {len(candidates)} segments, expected {count}"
+            )
+        order = generator.permutation(len(candidates))[:count]
+        instances: list[EvaluationInstance] = []
+        for position, candidate_index in enumerate(order.tolist()):
+            trajectory, start, end = candidates[int(candidate_index)]
+            observation, _, states, _, trajectory_info = source.get_frames(
+                trajectory,
+                range(start, end + 1),
+                subtask=str(subtask) if subtask else None,
+            )
+            if states is None:
+                raise RuntimeError(
+                    f"RoboCasa evaluation trajectory {trajectory} returned no simulator state"
+                )
+            visual = observation["visual"]
+            source_id = str(trajectory_info.get("demo_key", trajectory))
+            identity_payload = {
+                "task": task.task_key,
+                "source": source_id,
+                "start": start,
+                "end": end,
+            }
+            instances.append(
+                EvaluationInstance(
+                    instance_id=canonical_sha256(identity_payload)[:24],
+                    source_trajectory_id=source_id,
+                    source_trajectory_index=trajectory,
+                    segment_start=start,
+                    segment_end=end,
+                    initialization_fingerprint=array_sha256(states[0].numpy()),
+                    goal_fingerprint=array_sha256(visual[-1].numpy()),
+                    environment_seed=int(
+                        (seed * seed + position * seed) % (2**32 - 2)
+                    ),
+                    cem_seed=int(seed + position),
+                    appearance_seed=int(appearance_seed + position),
+                )
+            )
+        payload = self.finalize_evaluation_manifest(task, instances)
+        payload["source_trajectory_count"] = len(set(x.source_trajectory_id for x in instances))
+        payload["distinct_source_trajectories"] = uses_distinct_source_trajectories
+        payload["segment_identity_note"] = (
+            "One final-goal segment per held-out trajectory is preferred; when fewer "
+            "than the requested count exist, segments sharing source_trajectory_id "
+            "are retained explicitly and clustered for trajectory bootstrap"
+        )
+        payload["cem_seed_mode"] = "per_instance"
+        payload["evaluation_manifest_sha256"] = canonical_sha256(
+            {key: value for key, value in payload.items() if key != "evaluation_manifest_sha256"}
+        )
+        return payload
+
+    def run_planning(
+        self,
+        *,
+        backend: Any,
+        method: Any,
+        output_directory: str | Path,
+    ) -> Any:
+        from wm_adapter.planning.jepa_wm_planner import run_robocasa_planning
+
+        return run_robocasa_planning(
+            experiment_config=self.cfg,
+            backend=backend,
+            method=method,
+            output_directory=output_directory,
+        )

@@ -19,6 +19,7 @@ dist/
 /multirun/
 
 .env
+/env_libero.sh
 *.log
 .DS_Store
 

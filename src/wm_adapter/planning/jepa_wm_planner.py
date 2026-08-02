@@ -4,7 +4,7 @@ import json
 import logging
 import time
 from contextlib import contextmanager, nullcontext
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -19,6 +19,7 @@ from wm_adapter.appearance.composed_photometric import (
     ComposedPhotometricShift,
 )
 from wm_adapter.backends.jepa_wm_droid import JEPAWMDroidBackend
+from wm_adapter.benchmarks.base import array_sha256
 from wm_adapter.data.robocasa_windows import build_robocasa_dataset, split_episode_indices
 from wm_adapter.utils.reproducibility import resolve_path, seed_everything
 
@@ -39,6 +40,59 @@ class PlanningResult:
     appearance_spec: dict[str, Any] | None
     elapsed_seconds: float
     peak_cuda_memory_bytes: int
+    evaluation_instance_ids: list[str] = field(default_factory=list)
+    source_trajectory_ids: list[str] = field(default_factory=list)
+    initialization_fingerprints: list[str] = field(default_factory=list)
+    goal_fingerprints: list[str] = field(default_factory=list)
+    appearance_specs: list[dict[str, Any] | None] = field(default_factory=list)
+    cem_seeds: list[int] = field(default_factory=list)
+
+
+class _FixedRoboCasaSegment:
+    """One manifest-selected trajectory segment for the official evaluator."""
+
+    def __init__(
+        self,
+        source: Any,
+        trajectory_index: int,
+        start: int,
+        end: int,
+    ) -> None:
+        if end < start:
+            raise ValueError(f"Invalid RoboCasa segment [{start}, {end}]")
+        self.source = source
+        self.trajectory_index = trajectory_index
+        self.start = start
+        self.end = end
+        self.frames_per_clip = end - start + 1
+
+    def __len__(self) -> int:
+        return 1
+
+    def get_seq_length(self, index: int) -> int:
+        if index != 0:
+            raise IndexError(index)
+        return self.frames_per_clip
+
+    def __getitem__(self, index: int, subtask: str | None = None) -> Any:
+        if index != 0:
+            raise IndexError(index)
+        result = self.source.get_frames(
+            self.trajectory_index,
+            range(self.start, self.end + 1),
+            subtask=subtask,
+        )
+        visual = result[0]["visual"]
+        if int(visual.shape[0]) != self.frames_per_clip:
+            raise RuntimeError(
+                "Manifest-selected RoboCasa segment changed length after subtask "
+                f"filtering: expected={self.frames_per_clip}, actual={visual.shape[0]}, "
+                f"trajectory={self.trajectory_index}, range=[{self.start},{self.end}]"
+            )
+        return result
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.source, name)
 
 
 class JEPAWMPlanningModel(nn.Module):
@@ -256,6 +310,13 @@ def run_robocasa_planning(
     official_cfg.logging.tqdm_silent = bool(experiment_config.evaluation.tqdm_silent)
     official_cfg.planner.decode_each_iteration = False
     official_cfg.planner.candidate_chunk_size = int(experiment_config.planning.candidate_chunk_size)
+    resolved_task_name = str(experiment_config.benchmark.get("task_name", ""))
+    if resolved_task_name and resolved_task_name not in {"articulated", "auto_articulated"}:
+        official_cfg.task_specification.task = f"robocasa-{resolved_task_name}"
+        if resolved_task_name != "PnPCounterTop":
+            official_cfg.task_specification.env.subtask = None
+            official_cfg.task_specification.env.sample_subtask_slice = False
+            official_cfg.model_kwargs.data.custom.filter_tasks = [resolved_task_name]
     suite_mode = str(experiment_config.get("suite_mode", "formal"))
     if suite_mode == "self_test":
         self_test = experiment_config.planning.self_test
@@ -316,6 +377,28 @@ def run_robocasa_planning(
         int(experiment_config.data.split_seed),
     )
     dataset = TrajSubset(source_dataset, evaluation_episodes.tolist())
+    manifest_path = resolve_path(str(experiment_config.paths.get("evaluation_manifest", "")))
+    manifest_instances: list[dict[str, Any]] = []
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if str(manifest.get("task_key")) != str(experiment_config.benchmark.task_key):
+            raise RuntimeError(
+                f"RoboCasa evaluation manifest task mismatch at {manifest_path}: "
+                f"expected={experiment_config.benchmark.task_key}, actual={manifest.get('task_key')}"
+            )
+        manifest_instances = list(manifest.get("instances", []))[:total_episodes]
+        if len(manifest_instances) != total_episodes:
+            raise RuntimeError(
+                f"RoboCasa evaluation manifest has {len(manifest_instances)} instances; "
+                f"{total_episodes} are required: {manifest_path}"
+            )
+        cem_seed_mode = str(manifest.get("cem_seed_mode", "per_instance"))
+        if cem_seed_mode not in {"per_instance", "continuous_generator_stream"}:
+            raise RuntimeError(
+                f"Unsupported RoboCasa manifest CEM seed mode: {cem_seed_mode}"
+            )
+    else:
+        cem_seed_mode = "per_instance"
     appearance_spec = ComposedPhotometricShift().sample_spec(
         int(experiment_config.appearance.seed), float(experiment_config.appearance.severity)
     )
@@ -359,6 +442,12 @@ def run_robocasa_planning(
     environment: Any | None = None
     successes: list[bool] = []
     environment_seeds: list[int] = []
+    evaluation_instance_ids: list[str] = []
+    source_trajectory_ids: list[str] = []
+    initialization_fingerprints: list[str] = []
+    goal_fingerprints: list[str] = []
+    appearance_specs: list[dict[str, Any] | None] = []
+    cem_seeds: list[int] = []
     job_error: Exception | None = None
     try:
         environment_started = time.perf_counter()
@@ -384,6 +473,45 @@ def run_robocasa_planning(
         started = time.perf_counter()
         for episode in range(total_episodes):
             episode_seed = (evaluation_seed * evaluation_seed + episode * evaluation_seed) % (2**32 - 2)
+            if manifest_instances:
+                instance = manifest_instances[episode]
+                episode_seed = int(instance["environment_seed"])
+                expected_seed = (
+                    evaluation_seed * evaluation_seed + episode * evaluation_seed
+                ) % (2**32 - 2)
+                if episode_seed != expected_seed:
+                    raise RuntimeError(
+                        "RoboCasa manifest environment seed is incompatible with the "
+                        f"official evaluator: episode={episode}, manifest={episode_seed}, "
+                        f"expected={expected_seed}"
+                    )
+                agent.dset = _FixedRoboCasaSegment(
+                    source_dataset,
+                    int(instance["source_trajectory_index"]),
+                    int(instance["segment_start"]),
+                    int(instance["segment_end"]),
+                )
+                selected_observation, _, selected_states, _, _ = agent.dset[0]
+                if selected_states is None:
+                    raise RuntimeError("Manifest-selected RoboCasa segment has no simulator state")
+                actual_initialization = array_sha256(selected_states[0].numpy())
+                actual_goal = array_sha256(
+                    selected_observation["visual"][-1].numpy()
+                )
+                if actual_initialization != str(instance["initialization_fingerprint"]) or actual_goal != str(instance["goal_fingerprint"]):
+                    raise RuntimeError(
+                        "RoboCasa evaluation instance fingerprint changed: "
+                        f"instance={instance['instance_id']}, "
+                        f"initialization={actual_initialization}, goal={actual_goal}"
+                    )
+                cem_seed = int(instance["cem_seed"])
+                if cem_seed_mode == "per_instance":
+                    agent.local_generator.manual_seed(cem_seed)
+                    agent.local_gpu_generator.manual_seed(cem_seed)
+                planning_model.appearance_spec = ComposedPhotometricShift().sample_spec(
+                    int(instance["appearance_seed"]),
+                    float(experiment_config.appearance.severity),
+                )
             episode_number = episode + 1
             episode_started = time.perf_counter()
             LOGGER.info(
@@ -403,6 +531,19 @@ def run_robocasa_planning(
             episode_success = bool(result[1])
             successes.append(episode_success)
             environment_seeds.append(int(episode_seed))
+            if manifest_instances:
+                evaluation_instance_ids.append(str(instance["instance_id"]))
+                source_trajectory_ids.append(str(instance["source_trajectory_id"]))
+                initialization_fingerprints.append(
+                    str(instance["initialization_fingerprint"])
+                )
+                goal_fingerprints.append(str(instance["goal_fingerprint"]))
+                appearance_specs.append(
+                    planning_model.appearance_spec.as_dict()
+                    if domain_name == "ood"
+                    else None
+                )
+                cem_seeds.append(int(instance["cem_seed"]))
             LOGGER.info(
                 "PLANNING_PROGRESS "
                 "phase=episode status=completed "
@@ -488,6 +629,12 @@ def run_robocasa_planning(
         appearance_spec=appearance_spec.as_dict() if experiment_config.domain == "ood" else None,
         elapsed_seconds=elapsed,
         peak_cuda_memory_bytes=peak_memory,
+        evaluation_instance_ids=evaluation_instance_ids,
+        source_trajectory_ids=source_trajectory_ids,
+        initialization_fingerprints=initialization_fingerprints,
+        goal_fingerprints=goal_fingerprints,
+        appearance_specs=appearance_specs,
+        cem_seeds=cem_seeds,
     )
 
 

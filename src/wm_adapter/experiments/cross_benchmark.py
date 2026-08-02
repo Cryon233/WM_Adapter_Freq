@@ -1,0 +1,494 @@
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Iterable, Sequence
+
+import h5py
+from omegaconf import DictConfig, OmegaConf
+
+from wm_adapter.benchmarks.base import atomic_json
+from wm_adapter.data.feature_cache import ARRAY_KEYS, CACHE_SCHEMA_VERSION
+from wm_adapter.utils.checkpoints import load_method_checkpoint, sha256_file
+from wm_adapter.utils.reproducibility import project_root, resolve_path
+
+
+PHASES = (
+    "Task and resource preflight",
+    "Feature caches",
+    "Main adapter training",
+    "Main offline evaluation",
+    "Main closed-loop planning",
+    "Training-seed stability",
+    "OOD severity",
+    "DCT ablations",
+    "Final analysis",
+)
+
+
+@dataclass(frozen=True)
+class JobSpec:
+    job_id: str
+    phase: str
+    benchmark: str
+    task: str
+    command: tuple[str, ...]
+    log_path: str
+    artifact_path: str
+    kind: str
+    method: str | None = None
+    domain: str | None = None
+    seed: int | None = None
+    severity: float | None = None
+    variant: str | None = None
+    required_count: int | None = None
+    reuse_sources: tuple[str, ...] = field(default_factory=tuple)
+
+    def state_fields(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload.pop("reuse_sources")
+        payload["artifact_validation"] = None
+        payload["reuse_source"] = None
+        payload["gpu"] = None
+        payload["pid"] = None
+        payload["start_time"] = None
+        payload["end_time"] = None
+        payload["elapsed_seconds"] = None
+        payload["return_code"] = None
+        payload["error"] = None
+        return payload
+
+
+def load_suite_config(path: str | Path) -> DictConfig:
+    resolved = resolve_path(path)
+    if not resolved.is_file():
+        raise FileNotFoundError(f"Cross-benchmark suite config does not exist: {resolved}")
+    cfg = OmegaConf.load(resolved)
+    OmegaConf.resolve(cfg)
+    return cfg
+
+
+def load_task_config(path: str | Path, overrides: Iterable[str] = ()) -> DictConfig:
+    resolved = resolve_path(path)
+    if not resolved.is_file():
+        raise FileNotFoundError(f"Cross-benchmark task config does not exist: {resolved}")
+    task = OmegaConf.merge(OmegaConf.load(resolved), OmegaConf.from_dotlist(list(overrides)))
+    model_path = resolve_path(str(task.model_config))
+    model = OmegaConf.load(model_path)
+    merged = OmegaConf.merge(task, {"model": model})
+    OmegaConf.resolve(merged)
+    return merged
+
+
+def archive_incomplete(path: str | Path) -> Path:
+    source = resolve_path(path)
+    digest = sha256_file(source)[:12]
+    destination = source.with_name(f"{source.name}.incomplete-{digest}")
+    if destination.exists():
+        raise RuntimeError(f"Incomplete artifact archive already exists: {destination}")
+    source.replace(destination)
+    return destination
+
+
+def validate_task_manifest(path: str | Path, task: str) -> dict[str, Any]:
+    resolved = resolve_path(path)
+    payload = json.loads(resolved.read_text(encoding="utf-8"))
+    if str(payload.get("task_key")) != task:
+        raise RuntimeError(
+            f"Task manifest mismatch: expected={task}, actual={payload.get('task_key')}, path={resolved}"
+        )
+    if str(payload.get("status")) != "resolved":
+        raise RuntimeError(f"Task manifest is unresolved: {resolved}")
+    return {"path": str(resolved), "sha256": sha256_file(resolved)}
+
+
+def validate_cache(
+    path: str | Path,
+    windows: int,
+    *,
+    benchmark: str,
+    task: str,
+    allow_legacy_place: bool = False,
+    expected_task_manifest_sha256: str | None = None,
+) -> dict[str, Any]:
+    resolved = resolve_path(path)
+    with h5py.File(resolved, "r", libver="latest", swmr=True) as handle:
+        if not bool(handle.attrs.get("finalized", False)):
+            raise RuntimeError(f"Feature cache is not finalized: {resolved}")
+        if str(handle.attrs.get("schema_version")) != CACHE_SCHEMA_VERSION:
+            raise RuntimeError(f"Feature cache schema mismatch: {resolved}")
+        missing = sorted(set(ARRAY_KEYS).difference(handle.keys()))
+        if missing:
+            raise RuntimeError(f"Feature cache is missing arrays {missing}: {resolved}")
+        counts = {key: int(handle[key].shape[0]) for key in ARRAY_KEYS}
+        if any(value < windows for value in counts.values()):
+            raise RuntimeError(
+                f"Feature cache has fewer than {windows} windows: {counts}, path={resolved}"
+            )
+        actual_benchmark = str(handle.attrs.get("benchmark", ""))
+        actual_task = str(handle.attrs.get("task_key", ""))
+        if (actual_benchmark, actual_task) != (benchmark, task):
+            legacy_ok = allow_legacy_place and task == "robocasa_place" and not actual_benchmark
+            if not legacy_ok:
+                raise RuntimeError(
+                    "Feature cache benchmark identity mismatch: "
+                    f"expected={(benchmark, task)}, actual={(actual_benchmark, actual_task)}"
+                )
+        actual_manifest = str(handle.attrs.get("task_manifest_sha256", ""))
+        if expected_task_manifest_sha256 is not None and actual_manifest != expected_task_manifest_sha256:
+            legacy_ok = allow_legacy_place and task == "robocasa_place" and not actual_manifest
+            if not legacy_ok:
+                raise RuntimeError(f"Feature cache task-manifest fingerprint mismatch: {resolved}")
+        return {
+            "path": str(resolved),
+            "sha256": sha256_file(resolved),
+            "cache_fingerprint": str(handle.attrs["cache_fingerprint"]),
+            "available_windows": min(counts.values()),
+            "used_windows": windows,
+            "legacy": not bool(actual_benchmark),
+        }
+
+
+def validate_checkpoint(
+    path: str | Path,
+    method: str,
+    cache_fingerprint: str,
+    *,
+    benchmark: str,
+    task: str,
+    allow_legacy_place: bool = False,
+    expected_training_seed: int | None = None,
+    expected_method_config: dict[str, Any] | None = None,
+    expected_loss_weights: tuple[float, float] | None = None,
+) -> dict[str, Any]:
+    resolved = resolve_path(path)
+    payload = load_method_checkpoint(resolved)
+    if str(payload.get("method_name")) != method:
+        raise RuntimeError(f"Checkpoint method mismatch at {resolved}")
+    if str(payload.get("cache_fingerprint")) != cache_fingerprint:
+        raise RuntimeError(f"Checkpoint cache fingerprint mismatch at {resolved}")
+    training = dict(payload.get("training_config", {}))
+    if expected_training_seed is not None and int(training.get("seed", -1)) != expected_training_seed:
+        raise RuntimeError(
+            f"Checkpoint training seed mismatch at {resolved}: "
+            f"expected={expected_training_seed}, actual={training.get('seed')}"
+        )
+    if expected_method_config is not None:
+        actual_options = dict(payload.get("method_config", {}))
+        defaults = {
+            "temporal_pool": "mean",
+            "mask_type": "adaptive",
+            "use_rms_norm": True,
+        }
+        option_mismatch = {
+            key: {
+                "expected": value,
+                "actual": actual_options.get(key, defaults.get(key)),
+            }
+            for key, value in expected_method_config.items()
+            if key != "name"
+            and actual_options.get(key, defaults.get(key)) != value
+        }
+        if option_mismatch:
+            raise RuntimeError(
+                f"Checkpoint method configuration mismatch at {resolved}: "
+                f"{option_mismatch}"
+            )
+    if expected_loss_weights is not None:
+        actual_weights = (
+            float(training.get("canonical_weight", 1.0)),
+            float(training.get("dynamics_weight", 1.0)),
+        )
+        if actual_weights != expected_loss_weights:
+            raise RuntimeError(
+                f"Checkpoint loss weights mismatch at {resolved}: "
+                f"expected={expected_loss_weights}, actual={actual_weights}"
+            )
+    metadata = payload.get("data_metadata", {})
+    actual = (str(metadata.get("benchmark", "")), str(metadata.get("task_key", "")))
+    if actual != (benchmark, task):
+        legacy_ok = allow_legacy_place and task == "robocasa_place" and not actual[0]
+        if not legacy_ok:
+            raise RuntimeError(
+                f"Checkpoint benchmark identity mismatch: expected={(benchmark, task)}, actual={actual}"
+            )
+    return {
+        "path": str(resolved),
+        "sha256": sha256_file(resolved),
+        "parameter_count": int(payload["trainable_parameter_count"]),
+        "cache_fingerprint": str(payload["cache_fingerprint"]),
+        "legacy": not bool(actual[0]),
+    }
+
+
+def validate_offline(
+    path: str | Path,
+    windows: int,
+    *,
+    benchmark: str,
+    task: str,
+    method: str,
+) -> dict[str, Any]:
+    resolved = resolve_path(path)
+    payload = json.loads(resolved.read_text(encoding="utf-8"))
+    expected = {
+        "benchmark": benchmark,
+        "task": task,
+        "method": method,
+        "window_count": windows,
+    }
+    mismatch = {
+        key: {"expected": value, "actual": payload.get(key)}
+        for key, value in expected.items()
+        if payload.get(key) != value
+    }
+    if mismatch:
+        raise RuntimeError(f"Offline artifact mismatch at {resolved}: {mismatch}")
+    if not {"clean", "ood"}.issubset(payload.get("domains", {})):
+        raise RuntimeError(f"Offline artifact lacks clean/OOD metrics: {resolved}")
+    return {"path": str(resolved), "sha256": sha256_file(resolved)}
+
+
+def validate_planning(
+    path: str | Path,
+    episodes: int,
+    *,
+    benchmark: str,
+    task: str,
+    method: str,
+    domain: str,
+    seed: int,
+    severity: float,
+    evaluation_manifest: str | Path,
+    allow_legacy_place: bool = False,
+    expected_task_manifest_sha256: str | None = None,
+    expected_cache_fingerprint: str | None = None,
+    expected_checkpoint_sha256: str | None = None,
+    expected_action_convention: dict[str, Any] | None = None,
+    formal_cem: bool = True,
+    expected_base_checkpoint_sha256: str | None = None,
+    expected_dinov3_checkpoint_sha256: str | None = None,
+    expected_appearance_seed: int = 2026,
+    expected_appearance_pipeline: str = "composed_photometric_v1",
+) -> dict[str, Any]:
+    resolved = resolve_path(path)
+    payload = json.loads(resolved.read_text(encoding="utf-8"))
+    success = payload.get("per_episode_success")
+    if not isinstance(success, list) or len(success) < episodes:
+        raise RuntimeError(f"Planning artifact has fewer than {episodes} episodes: {resolved}")
+    expected = {
+        "method": method,
+        "domain": domain,
+    }
+    mismatch = {
+        key: {"expected": value, "actual": payload.get(key)}
+        for key, value in expected.items()
+        if payload.get(key) != value
+    }
+    actual_task = payload.get("task")
+    legacy_task_ok = allow_legacy_place and task == "robocasa_place" and actual_task == "place"
+    if actual_task != task and not legacy_task_ok:
+        mismatch["task"] = {"expected": task, "actual": actual_task}
+    actual_benchmark = payload.get("benchmark")
+    if actual_benchmark != benchmark and not (
+        allow_legacy_place and task == "robocasa_place" and actual_benchmark in (None, "robocasa")
+    ):
+        mismatch["benchmark"] = {"expected": benchmark, "actual": actual_benchmark}
+    actual_seed = payload.get("cem_seed", payload.get("evaluation_seed"))
+    if int(actual_seed) != seed:
+        mismatch["seed"] = {"expected": seed, "actual": actual_seed}
+    appearance = payload.get("config", {}).get("appearance", payload.get("evaluation_appearance", {}))
+    actual_severity = float(appearance.get("severity", payload.get("severity", 1.0)))
+    if domain == "ood" and actual_severity != severity:
+        mismatch["severity"] = {"expected": severity, "actual": actual_severity}
+    if mismatch:
+        raise RuntimeError(f"Planning artifact mismatch at {resolved}: {mismatch}")
+    if expected_base_checkpoint_sha256 is not None and payload.get("base_checkpoint_sha256") != expected_base_checkpoint_sha256:
+        raise RuntimeError(f"Planning JEPA-WM checkpoint fingerprint mismatch: {resolved}")
+    if expected_dinov3_checkpoint_sha256 is not None and payload.get("dinov3_checkpoint_sha256") != expected_dinov3_checkpoint_sha256:
+        raise RuntimeError(f"Planning DINOv3 checkpoint fingerprint mismatch: {resolved}")
+    if int(appearance.get("seed", expected_appearance_seed)) != expected_appearance_seed:
+        raise RuntimeError(f"Planning appearance seed mismatch: {resolved}")
+    if str(appearance.get("pipeline_version", expected_appearance_pipeline)) != expected_appearance_pipeline:
+        raise RuntimeError(f"Planning appearance pipeline mismatch: {resolved}")
+    manifest = json.loads(resolve_path(evaluation_manifest).read_text(encoding="utf-8"))
+    manifest_hash = str(manifest["task_manifest_sha256"])
+    if expected_task_manifest_sha256 is not None and manifest_hash != expected_task_manifest_sha256:
+        raise RuntimeError(f"Evaluation manifest task fingerprint mismatch: {resolved}")
+    artifact_manifest_hash = payload.get("task_manifest_sha256")
+    if artifact_manifest_hash != manifest_hash and not (
+        allow_legacy_place and task == "robocasa_place" and artifact_manifest_hash is None
+    ):
+        raise RuntimeError(f"Planning task-manifest fingerprint mismatch: {resolved}")
+    expected_eval_hash = str(manifest["evaluation_manifest_sha256"])
+    artifact_eval_hash = payload.get("evaluation_manifest_sha256")
+    if artifact_eval_hash != expected_eval_hash and not (
+        allow_legacy_place and task == "robocasa_place" and artifact_eval_hash is None
+    ):
+        raise RuntimeError(f"Planning evaluation-manifest fingerprint mismatch: {resolved}")
+    if expected_cache_fingerprint is not None:
+        actual_cache = payload.get("cache_fingerprint")
+        if actual_cache != expected_cache_fingerprint and not (
+            allow_legacy_place and task == "robocasa_place" and actual_cache is None
+        ):
+            raise RuntimeError(f"Planning cache fingerprint mismatch: {resolved}")
+    if expected_checkpoint_sha256 is not None and payload.get("method_checkpoint_sha256") != expected_checkpoint_sha256:
+        raise RuntimeError(f"Planning checkpoint fingerprint mismatch: {resolved}")
+    if expected_action_convention is not None and payload.get("action_convention") != expected_action_convention:
+        if not (allow_legacy_place and task == "robocasa_place" and payload.get("action_convention") is None):
+            raise RuntimeError(f"Planning action convention mismatch: {resolved}")
+    if formal_cem:
+        cem = payload.get("cem", {})
+        expected_cem = {
+            "iterations": 15,
+            "num_samples": 300,
+            "num_elites": 10,
+            "horizon": 3,
+            "num_act_stepped": 1,
+            "candidate_chunk_size": 300,
+        }
+        wrong_cem = {
+            key: {"expected": value, "actual": cem.get(key)}
+            for key, value in expected_cem.items()
+            if int(cem.get(key, -1)) != value
+        }
+        if wrong_cem:
+            raise RuntimeError(f"Planning CEM configuration mismatch at {resolved}: {wrong_cem}")
+    expected_ids = [str(item["instance_id"]) for item in manifest["instances"][:episodes]]
+    expected_source_ids = [
+        str(item["source_trajectory_id"])
+        for item in manifest["instances"][:episodes]
+    ]
+    expected_initialization_fingerprints = [
+        str(item["initialization_fingerprint"])
+        for item in manifest["instances"][:episodes]
+    ]
+    expected_goal_fingerprints = [
+        str(item["goal_fingerprint"])
+        for item in manifest["instances"][:episodes]
+    ]
+    actual_ids = payload.get("evaluation_instance_ids")
+    legacy = actual_ids in (None, []) and allow_legacy_place and task == "robocasa_place"
+    if not legacy and list(actual_ids or [])[:episodes] != expected_ids:
+        raise RuntimeError(f"Planning evaluation-instance IDs mismatch at {resolved}")
+    if not legacy and list(payload.get("initialization_fingerprints", []))[:episodes] != expected_initialization_fingerprints:
+        raise RuntimeError(f"Planning initialization fingerprints mismatch at {resolved}")
+    if not legacy and list(payload.get("goal_fingerprints", []))[:episodes] != expected_goal_fingerprints:
+        raise RuntimeError(f"Planning goal fingerprints mismatch at {resolved}")
+    selected = [bool(value) for value in success[:episodes]]
+    return {
+        "path": str(resolved),
+        "sha256": sha256_file(resolved),
+        "source_available_episodes": len(success),
+        "used_episodes": episodes,
+        "used_episode_indices": list(range(episodes)),
+        "success_count": sum(selected),
+        "success_rate": sum(selected) / episodes,
+        "evaluation_instance_ids": expected_ids,
+        "source_trajectory_ids": expected_source_ids,
+        "legacy": legacy,
+        "source_task": actual_task,
+        "source_seed": int(actual_seed),
+        "source_checkpoint_fingerprint": payload.get("method_checkpoint_sha256"),
+    }
+
+
+def _state_job(job: JobSpec, status: str) -> dict[str, Any]:
+    value = job.state_fields()
+    value["status"] = status
+    return value
+
+
+def _write_state(path: str | Path, state: dict[str, Any]) -> None:
+    state["updated_at_unix"] = time.time()
+    atomic_json(path, state)
+
+
+def run_gpu_phase(
+    jobs: Sequence[JobSpec],
+    gpu_ids: Sequence[int],
+    state_path: str | Path,
+    state: dict[str, Any],
+    validator: Any,
+) -> None:
+    pending = list(jobs)
+    running: dict[int, tuple[JobSpec, subprocess.Popen[str], Any, float]] = {}
+    failure = False
+    while pending or running:
+        if not failure:
+            for gpu in gpu_ids:
+                if gpu in running or not pending:
+                    continue
+                job = pending.pop(0)
+                log_path = resolve_path(job.log_path)
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                log = log_path.open("a", encoding="utf-8")
+                environment = os.environ.copy()
+                environment["CUDA_VISIBLE_DEVICES"] = str(gpu)
+                process = subprocess.Popen(
+                    list(job.command),
+                    cwd=project_root(),
+                    env=environment,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                started = time.time()
+                entry = _state_job(job, "running")
+                entry.update(gpu=gpu, pid=process.pid, start_time=started)
+                state["jobs"][job.job_id] = entry
+                running[gpu] = (job, process, log, started)
+                _write_state(state_path, state)
+        if not running:
+            break
+        time.sleep(1.0)
+        for gpu, (job, process, log, started) in list(running.items()):
+            return_code = process.poll()
+            if return_code is None:
+                continue
+            log.close()
+            entry = state["jobs"][job.job_id]
+            entry["end_time"] = time.time()
+            entry["elapsed_seconds"] = entry["end_time"] - started
+            entry["return_code"] = return_code
+            if return_code == 0:
+                try:
+                    entry["artifact_validation"] = validator(job, job.artifact_path)
+                    entry["status"] = "completed"
+                except Exception as error:
+                    entry["status"] = "failed"
+                    entry["error"] = f"{type(error).__name__}: {error}"
+                    failure = True
+            else:
+                entry["status"] = "failed"
+                entry["error"] = f"process exited with code {return_code}"
+                failure = True
+            del running[gpu]
+            _write_state(state_path, state)
+    if failure:
+        for job in pending:
+            state["jobs"][job.job_id] = _state_job(job, "blocked")
+        _write_state(state_path, state)
+        failed = [key for key, value in state["jobs"].items() if value["status"] == "failed"]
+        raise RuntimeError(f"Cross-benchmark jobs failed: {failed}")
+
+
+def phase_summary(state: dict[str, Any], jobs: Sequence[JobSpec]) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for phase in PHASES:
+        phase_jobs = [job for job in jobs if job.phase == phase]
+        statuses = [state.get("jobs", {}).get(job.job_id, {}).get("status", "pending") for job in phase_jobs]
+        complete = sum(value in {"completed", "reused"} for value in statuses)
+        failed = sum(value == "failed" for value in statuses)
+        running = sum(value == "running" for value in statuses)
+        summary[phase] = {
+            "total": len(phase_jobs),
+            "complete": complete,
+            "failed": failed,
+            "running": running,
+        }
+    return summary

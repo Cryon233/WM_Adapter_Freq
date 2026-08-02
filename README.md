@@ -294,3 +294,37 @@ outputs/paper_suite/analysis/
 统计器生成 Wilson 95% CI、10,000 次 paired bootstrap、exact McNemar、Holm 校正和多 seed mean/std。任何需要配对的记录若 environment/episode identity 不一致会立即拒绝统计。调度状态原子写入 `logs/paper_suite/state.json`；监控器显示 phase、job/GPU/PID、训练 loss、离线窗口进度、planning episode/step/success/CEM 和日志心跳。
 
 本机若没有 `wm-a100`、CUDA、checkpoint、HDF5 或 RoboCasa assets，只应提交代码到服务器，不应运行 `test_full_pipeline.sh`。上传服务器、设置前述四个资源环境变量并应用固定上游 patch 后，先运行真实自检；只有它退出码为 0 后再启动正式 runner。
+# Cross-benchmark ICRA suite (`cross_benchmark_v1`)
+
+The current compact paper protocol evaluates the frozen JEPA-WM/DINOv3 backend on two RoboCasa tasks and two official LIBERO tasks. The main matrix is exactly four tasks × four methods (`base`, `dct_adapter`, `token_mlp`, `lora`) × clean/OOD × 20 paired closed-loop rollouts. Existing `icra2027_suite`, `paper_suite`, and `protocol_v2` artifacts remain supported and are never rewritten by this suite.
+
+The task set is fixed as RoboCasa `PnPCounterTop/place`, the first resource-compatible articulated task in the immutable order `OpenDrawer`, `CloseDrawer`, `OpenCabinet`, `CloseCabinet`, official `libero_spatial` task ID 0, and official `libero_goal` task ID 0. Resolution happens before method evaluation and is saved under `outputs/cross_benchmark_v1/manifests/`. A missing fixed LIBERO task or an articulated candidate pool with no valid task is a preflight error; the runner never substitutes a task based on success rate.
+
+LIBERO is accessed through its official benchmark registry (`get_benchmark_dict`, `get_task`, `get_task_init_states`) and `OffScreenRenderEnv`. The agent-view HDF5 key is resolved from supported agent-view-only keys and recorded in the task manifest. Preflight restores a recorded simulator state, checks RGB orientation/channel parity, executes a recorded action, checks state and gripper response, and confirms the official success interface. Its canonical 7-D action is explicitly recorded as normalized OSC-Pose translation, axis-angle rotation, and the LIBERO `-1=open, +1=close` gripper convention; shape alone is not accepted as evidence of compatibility.
+
+Set the existing JEPA-WM variables in `env_jepa.sh`, then create a private `env_libero.sh` from [env_libero.example.sh](env_libero.example.sh). The suite reads `LIBERO_ROOT`, `LIBERO_DATA_ROOT`, and optional `LIBERO_SPATIAL_DATA_ROOT` / `LIBERO_GOAL_DATA_ROOT`. It never downloads checkpoints, demonstrations, BDDL files, init states, or assets.
+
+The data protocol uses 2,000 physical four-frame windows per task, deterministic episode-balanced selection, trajectory-level 80/20 splitting, and split/window/training seed 42. Every task gets one immutable 20-instance evaluation manifest shared across every method and domain. LIBERO instances use distinct held-out successful demonstrations; RoboCasa segments retain their source trajectory and are analyzed with source-trajectory cluster bootstrap. Current frames use `composed_photometric_v1`, while the goal is always a single clean image.
+
+Artifacts are isolated at:
+
+- caches: `storage/feature_cache/cross_benchmark_v1/<benchmark>/<task>.h5`
+- main checkpoints: `checkpoints/cross_benchmark_v1/<benchmark>/<task>/<method>_final.pt`
+- main planning: `outputs/cross_benchmark_v1/main/<benchmark>/<task>/seed_42/<method>/<clean_or_ood>/results.json`
+- analysis: `outputs/cross_benchmark_v1/analysis/`
+
+The runner dynamically constructs the job graph, atomically updates its state, schedules at most one heavyweight subprocess per GPU, validates artifacts before reuse, and SHA-archives an incomplete planning/offline result before rerunning it. A reused source remains in place and is referenced by path and SHA256. When a reused source has more than 20 episodes, success uses the manifest-aligned first 20 and efficiency is normalized by the source file's full available episode count.
+
+Dry-run (no model load and no formal artifact writes): `python scripts/launch_cross_benchmark_suite.py --dry-run`
+
+Isolated resource-backed self-test: `bash scripts/run_cross_benchmark_suite.sh --self-test`
+
+Formal launch with the single-screen curses Dashboard: `bash scripts/run_cross_benchmark_suite.sh`
+
+Attach without starting another runner: `bash scripts/run_cross_benchmark_suite.sh --attach`
+
+Status snapshot: `bash scripts/run_cross_benchmark_suite.sh --status`
+
+Explicit stop: `bash scripts/run_cross_benchmark_suite.sh --stop`
+
+Leaving the Dashboard with `q` or `Ctrl+C` only detaches it; the runner remains in its independent process group. The formal CEM settings remain 15 iterations, 300 candidates, 10 elites, horizon 3, and one executed action step for every method within a task.

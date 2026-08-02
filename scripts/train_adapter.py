@@ -48,6 +48,21 @@ def main() -> None:
         expected_upstream_commits=backend.upstream_commits,
         expected_appearance_metadata=appearance_metadata,
     )
+    configured_benchmark = str(cfg.get("benchmark", {}).get("name", "robocasa"))
+    configured_task = str(
+        cfg.get("benchmark", {}).get("task_key", cfg.planning.task_slug)
+    )
+    cache_identity = (
+        str(dataset.metadata.get("benchmark", "")),
+        str(dataset.metadata.get("task_key", "")),
+    )
+    expected_identity = (configured_benchmark, configured_task)
+    legacy_place = configured_task in {"place", "robocasa_place"} and cache_identity == ("", "")
+    if cache_identity != expected_identity and not legacy_place:
+        raise RuntimeError(
+            "Feature cache benchmark/task mismatch for training: "
+            f"expected={expected_identity}, actual={cache_identity}, path={dataset.path}"
+        )
     generator = torch.Generator().manual_seed(int(cfg.training.seed))
     loader = DataLoader(
         dataset,
@@ -79,10 +94,15 @@ def main() -> None:
         config=training_config,
         device=cfg.device,
     )
+    checkpoint_path = resolve_path(cfg.paths.method_checkpoint)
+    if checkpoint_path.exists():
+        raise FileExistsError(
+            f"Method checkpoint already exists and will not be overwritten: {checkpoint_path}"
+        )
     print(f"Trainable parameters: method={method.method_name}, count={method.parameter_count()}")
     final_losses = trainer.fit(
         loader,
-        checkpoint_path=resolve_path(cfg.paths.method_checkpoint),
+        checkpoint_path=checkpoint_path,
         cache_metadata=metadata,
     )
     print(f"TRAINING_COMPLETE final_losses={json.dumps(final_losses, sort_keys=True)}")

@@ -12,16 +12,12 @@ from tqdm import tqdm
 from wm_adapter.adapters.base import BaseMethod
 from wm_adapter.appearance.composed_photometric import ComposedPhotometricShift
 from wm_adapter.backends.jepa_wm_droid import JEPAWMDroidBackend
-from wm_adapter.data.feature_cache import FeatureCacheWriter
-from wm_adapter.data.robocasa_windows import (
+from wm_adapter.benchmarks.base import (
     EPISODE_SPLIT_STRATEGY,
     WINDOW_SELECTION_STRATEGY,
-    RoboCasaWindowDataset,
-    build_robocasa_dataset,
-    select_episode_balanced_windows,
-    split_episode_indices,
 )
-from wm_adapter.utils.checkpoints import sha256_file
+from wm_adapter.benchmarks.factory import build_benchmark
+from wm_adapter.data.feature_cache import FeatureCacheWriter
 from wm_adapter.utils.reproducibility import load_experiment_config, resolve_path, seed_everything
 
 
@@ -149,22 +145,17 @@ def main() -> None:
         )
     seed_everything(int(cfg.data.window_seed))
     backend = _backend(cfg)
-    source = build_robocasa_dataset(
-        jepa_wms_root=backend.jepa_repo,
-        dataset_root=cfg.paths.dataset_root,
-        hdf5_path=cfg.paths.robocasa_hdf5,
-        task_name=str(cfg.data.task_name),
-        camera_view=str(cfg.data.camera_view),
-        output_environment_info=False,
-        transform=None,
+    benchmark = build_benchmark(cfg)
+    resolved_task = benchmark.resolve_task(strict=True)
+    task_manifest = benchmark.write_task_manifest(resolved_task)
+    source = benchmark.build_source_dataset(output_environment_info=False)
+    train_episodes, evaluation_episodes = benchmark.split_trajectory_ids(source)
+    candidates = benchmark.enumerate_window_candidates(
+        source,
+        int(cfg.data.num_frames),
+        int(cfg.data.frameskip),
     )
-    train_episodes, evaluation_episodes = split_episode_indices(
-        len(source), float(cfg.data.train_fraction), int(cfg.data.split_seed)
-    )
-    candidates = RoboCasaWindowDataset.all_candidates(
-        source, int(cfg.data.num_frames), int(cfg.data.frameskip)
-    )
-    selected = select_episode_balanced_windows(
+    selected = benchmark.select_windows(
         candidates,
         train_episodes,
         int(cfg.data.num_train_windows),
@@ -173,9 +164,9 @@ def main() -> None:
     if len(selected) != int(cfg.data.num_train_windows):
         raise RuntimeError(
             f"Requested {cfg.data.num_train_windows} train windows, but only {len(selected)} "
-            "eligible episode-disjoint RoboCasa windows are available"
+            f"eligible episode-disjoint {benchmark.name} windows are available"
         )
-    windows = RoboCasaWindowDataset(
+    windows = benchmark.make_window_dataset(
         source,
         selected,
         num_frames=int(cfg.data.num_frames),
@@ -214,14 +205,41 @@ def main() -> None:
         "random_horizontal_flip": False,
         "random_resize_scale": [1.0, 1.0],
         "random_resize_aspect_ratio": [1.0, 1.0],
+        "source_camera_key": resolved_task.camera_key,
+        "source_vertical_flip": bool(cfg.data.get("vertical_flip", False)),
+        "source_channel_order": "RGB",
     }
     metadata = {
         "backend": "jepa_wm_droid",
-        "dataset": str(resolve_path(cfg.paths.robocasa_hdf5)),
-        "dataset_sha256": sha256_file(resolve_path(cfg.paths.robocasa_hdf5)),
+        "benchmark": resolved_task.benchmark,
+        "benchmark_suite": resolved_task.suite,
+        "task_id": resolved_task.task_id,
+        "task_name": resolved_task.task_name,
+        "task_key": resolved_task.task_key,
+        "task_manifest_sha256": task_manifest["task_manifest_sha256"],
+        "task_manifest_path": str(benchmark.task_manifest_path()),
+        "dataset": resolved_task.dataset_path,
+        "dataset_sha256": resolved_task.dataset_sha256,
+        "camera_key": resolved_task.camera_key,
+        "action_convention": resolved_task.action_convention,
+        "source_trajectory_ids": list(
+            resolved_task.selected_train_demonstrations
+        ),
+        "train_test_split": {
+            "strategy": EPISODE_SPLIT_STRATEGY,
+            "seed": int(cfg.data.split_seed),
+            "train_fraction": float(cfg.data.train_fraction),
+            "train_source_trajectory_ids": list(
+                resolved_task.selected_train_demonstrations
+            ),
+            "evaluation_source_trajectory_ids": list(
+                resolved_task.selected_test_demonstrations
+            ),
+        },
         "base_checkpoint_sha256": backend.base_checkpoint_sha256,
         "dinov3_checkpoint_sha256": backend.dinov3_checkpoint_sha256,
         "upstream_commits": backend.upstream_commits,
+        "task_upstream_commits": resolved_task.upstream_commits,
         "appearance_metadata": appearance_metadata,
         "preprocessing_metadata": preprocessing_metadata,
         "token_layout": {
@@ -243,8 +261,16 @@ def main() -> None:
         "window_selection_strategy": WINDOW_SELECTION_STRATEGY,
         "window_selection_seed": int(cfg.data.window_seed),
         "selected_window_pairs_sha256": _sha256_array(np.asarray(selected, dtype=np.int64)),
+        "window_identity": ["source_trajectory_index", "start_step"],
+        "source_trajectory_identity": (
+            "benchmark trajectory index plus immutable source trajectory ID"
+        ),
     }
     output_path = resolve_path(cfg.paths.feature_cache)
+    if output_path.exists():
+        raise FileExistsError(
+            f"Feature cache already exists and will not be overwritten: {output_path}"
+        )
     writer = FeatureCacheWriter(output_path, metadata)
     try:
         writer.append(first_encoded)

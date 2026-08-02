@@ -18,12 +18,7 @@ from wm_adapter.adapters.factory import build_method
 from wm_adapter.adapters.lora import LastBlockAttentionLoRA
 from wm_adapter.appearance.composed_photometric import ComposedPhotometricShift
 from wm_adapter.backends.jepa_wm_droid import JEPAWMDroidBackend
-from wm_adapter.data.robocasa_windows import (
-    RoboCasaWindowDataset,
-    build_robocasa_dataset,
-    select_episode_balanced_windows,
-    split_episode_indices,
-)
+from wm_adapter.benchmarks.factory import build_benchmark
 from wm_adapter.utils.checkpoints import load_method_checkpoint, sha256_file
 from wm_adapter.utils.reproducibility import (
     load_experiment_config,
@@ -51,10 +46,13 @@ def _backend(cfg: Any) -> JEPAWMDroidBackend:
     )
 
 
-def _load_method(cfg: Any, backend: JEPAWMDroidBackend) -> tuple[PEFTMethod, str | None]:
+def _load_method(
+    cfg: Any,
+    backend: JEPAWMDroidBackend,
+) -> tuple[PEFTMethod, str | None, dict[str, Any]]:
     method = build_method(str(cfg.method), backend, cfg.method_config).to(backend.device)
     if method.method_name == "base":
-        return method, None
+        return method, None, {}
     checkpoint_path = resolve_path(cfg.paths.method_checkpoint)
     checkpoint = load_method_checkpoint(checkpoint_path)
     expected_appearance = ComposedPhotometricShift.metadata(
@@ -78,8 +76,25 @@ def _load_method(cfg: Any, backend: JEPAWMDroidBackend) -> tuple[PEFTMethod, str
         raise RuntimeError(
             f"Offline method checkpoint does not match the configured run: {mismatches}"
         )
+    training_config = dict(checkpoint.get("training_config", {}))
+    expected_training = {
+        "seed": int(cfg.training.seed),
+        "canonical_weight": float(cfg.training.get("canonical_weight", 1.0)),
+        "dynamics_weight": float(cfg.training.get("dynamics_weight", 1.0)),
+    }
+    training_mismatch = {
+        key: {"expected": value, "actual": training_config.get(key)}
+        for key, value in expected_training.items()
+        if float(training_config.get(key, -1)) != float(value)
+    }
+    if training_mismatch:
+        raise RuntimeError(
+            f"Offline checkpoint training-contract mismatch: {training_mismatch}"
+        )
     method.load_method_checkpoint(checkpoint["peft_state_dict"])
-    return method.eval(), sha256_file(checkpoint_path)
+    return method.eval(), sha256_file(checkpoint_path), dict(
+        checkpoint.get("data_metadata", {})
+    )
 
 
 def _sample_mse(predicted: Tensor, target: Tensor) -> Tensor:
@@ -152,26 +167,54 @@ def main() -> None:
     shuffle_permutation = _action_shuffle_permutation(shuffle_seed)
     seed_everything(offline_seed)
     backend = _backend(cfg)
-    method, method_checkpoint_sha256 = _load_method(cfg, backend)
-    source = build_robocasa_dataset(
-        jepa_wms_root=backend.jepa_repo,
-        dataset_root=cfg.paths.dataset_root,
-        hdf5_path=cfg.paths.robocasa_hdf5,
-        task_name=str(cfg.data.task_name),
-        camera_view=str(cfg.data.camera_view),
-        output_environment_info=False,
-        transform=None,
+    benchmark = build_benchmark(cfg)
+    resolved_task = benchmark.resolve_task(strict=True)
+    method, method_checkpoint_sha256, checkpoint_data_metadata = _load_method(
+        cfg, backend
     )
-    _, evaluation_episodes = split_episode_indices(
-        len(source), float(cfg.data.train_fraction), int(cfg.data.split_seed)
-    )
+    if method.method_name != "base":
+        actual_identity = (
+            str(checkpoint_data_metadata.get("benchmark", "")),
+            str(checkpoint_data_metadata.get("task_key", "")),
+        )
+        expected_identity = (resolved_task.benchmark, resolved_task.task_key)
+        legacy_place = (
+            resolved_task.task_key == "robocasa_place"
+            or resolved_task.suite == "legacy_single_stage"
+        ) and actual_identity == ("", "")
+        if actual_identity != expected_identity and not legacy_place:
+            raise RuntimeError(
+                "Offline checkpoint benchmark/task mismatch: "
+                f"expected={expected_identity}, actual={actual_identity}"
+            )
+        if not legacy_place:
+            expected_contract = {
+                "task_manifest_sha256": resolved_task.as_dict()[
+                    "task_manifest_sha256"
+                ],
+                "dataset_sha256": resolved_task.dataset_sha256,
+                "camera_key": resolved_task.camera_key,
+                "action_convention": resolved_task.action_convention,
+                "task_upstream_commits": resolved_task.upstream_commits,
+            }
+            mismatch = {
+                key: {"expected": value, "actual": checkpoint_data_metadata.get(key)}
+                for key, value in expected_contract.items()
+                if checkpoint_data_metadata.get(key) != value
+            }
+            if mismatch:
+                raise RuntimeError(
+                    f"Offline checkpoint task/data contract mismatch: {mismatch}"
+                )
+    source = benchmark.build_source_dataset(output_environment_info=False)
+    _, evaluation_episodes = benchmark.split_trajectory_ids(source)
     num_frames = int(cfg.offline.num_frames)
     if num_frames != 6:
         raise ValueError(f"Offline one/two/three-step evaluation requires num_frames=6, found {num_frames}")
-    candidates = RoboCasaWindowDataset.all_candidates(
+    candidates = benchmark.enumerate_window_candidates(
         source, num_frames, int(cfg.data.frameskip)
     )
-    selected = select_episode_balanced_windows(
+    selected = benchmark.select_windows(
         candidates,
         evaluation_episodes,
         int(cfg.offline.num_windows),
@@ -182,7 +225,7 @@ def main() -> None:
             f"Offline evaluation requested {cfg.offline.num_windows} held-out windows, "
             f"but selected {len(selected)}"
         )
-    windows = RoboCasaWindowDataset(
+    windows = benchmark.make_window_dataset(
         source,
         selected,
         num_frames=num_frames,
@@ -253,6 +296,9 @@ def main() -> None:
                     "one_step_mse": one,
                     "two_step_mse": two,
                     "three_step_mse": three,
+                    "h1_dynamics_mse": one,
+                    "h2_dynamics_mse": two,
+                    "h3_dynamics_mse": three,
                     "shuffled_action_mse": shuffled,
                     "zero_action_mse": zero,
                     "action_shuffle_gap": shuffled - three,
@@ -284,8 +330,15 @@ def main() -> None:
         )
     metrics = {
         "schema_version": "jepa_wm_offline_metrics_v1",
+        "benchmark": resolved_task.benchmark,
+        "benchmark_suite": resolved_task.suite,
+        "task_id": resolved_task.task_id,
+        "task_name": resolved_task.task_name,
+        "task_manifest_sha256": resolved_task.as_dict()["task_manifest_sha256"],
+        "camera_key": resolved_task.camera_key,
+        "action_convention": resolved_task.action_convention,
         "method": method.method_name,
-        "task": str(cfg.planning.task_slug),
+        "task": resolved_task.task_key,
         "window_count": len(selected),
         "window_identities": [list(pair) for pair in selected],
         "episode_partition": "eval",

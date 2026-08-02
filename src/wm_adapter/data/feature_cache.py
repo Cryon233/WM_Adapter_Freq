@@ -112,6 +112,22 @@ class FeatureCacheWriter:
             ],
             "preprocessing_metadata": self.file.attrs["preprocessing_metadata"],
         }
+        for key in (
+            "benchmark",
+            "benchmark_suite",
+            "task_id",
+            "task_name",
+            "task_key",
+            "task_manifest_sha256",
+            "camera_key",
+            "action_convention",
+            "source_trajectory_ids",
+            "window_identity",
+            "source_trajectory_identity",
+            "task_upstream_commits",
+        ):
+            if key in self.file.attrs:
+                fingerprint_payload[key] = self.file.attrs[key]
         fingerprint = hashlib.sha256(_json_value(fingerprint_payload).encode("utf-8")).hexdigest()
         self.file.attrs["window_count"] = self.count
         self.file.attrs["tensor_shapes"] = _json_value(shapes)
