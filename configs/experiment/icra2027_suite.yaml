@@ -76,6 +76,7 @@ closed_loop_ablations: [full, framewise_mask, static_low_rank_mask, canonical_on
 ablation_tasks: [place, reach-pick-place]
 ablation_episodes: 20
 offline:
-  windows: 32
+  windows: 200
   seed: 42
+  shuffle_seed: 100045
   bootstrap_samples: 10000

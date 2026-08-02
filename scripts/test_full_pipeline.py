@@ -105,6 +105,31 @@ def _finite_training_losses(log_path: Path) -> dict[str, float]:
     return losses
 
 
+def _validate_action_shuffle_metrics(metrics_path: Path) -> dict[str, Any]:
+    payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+    action_shuffle = payload.get("action_shuffle")
+    if not isinstance(action_shuffle, dict):
+        raise RuntimeError(f"Offline metrics lack action_shuffle metadata: {metrics_path}")
+    permutation = action_shuffle.get("permutation")
+    if (
+        not isinstance(permutation, list)
+        or len(permutation) != 3
+        or sorted(permutation) != [0, 1, 2]
+        or permutation == [0, 1, 2]
+    ):
+        raise RuntimeError(
+            f"Offline action shuffle is not a non-identity permutation: {action_shuffle}"
+        )
+    for domain, metrics in payload.get("domains", {}).items():
+        for key in ("shuffled_action_mse", "action_shuffle_gap"):
+            value = float(metrics.get(key, float("nan")))
+            if not math.isfinite(value):
+                raise RuntimeError(
+                    f"Offline {domain} metric {key} is not finite: {value}"
+                )
+    return action_shuffle
+
+
 def main() -> None:
     _clean_isolated_directories()
     report: dict[str, Any] = {
@@ -185,7 +210,11 @@ def main() -> None:
                 f"offline.output_directory={output}",
             ]
             _run(command, resolve_path(f"logs/self_test/offline_{method}.log"), gpu)
-            offline_artifacts[method] = validate_offline_result(output / "metrics.json", 4)
+            metrics_path = output / "metrics.json"
+            offline_artifacts[method] = validate_offline_result(metrics_path, 4)
+            offline_artifacts[method]["action_shuffle"] = (
+                _validate_action_shuffle_metrics(metrics_path)
+            )
         report["stages"][current_stage] = {
             "status": "PASS",
             "elapsed_seconds": time.time() - stage_started,

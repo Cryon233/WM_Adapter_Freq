@@ -116,10 +116,17 @@ def _rollout_errors(
     backend: JEPAWMDroidBackend,
     context: Tensor,
     target: Tensor,
-    actions: Tensor,
+    action_suffix: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    action_suffix = rearrange(actions[:, 2:5], "b t a -> t b a")
-    predicted = backend.official_model.unroll(context, act_suffix=action_suffix)
+    if action_suffix.ndim != 3 or action_suffix.shape[1] != 3:
+        raise ValueError(
+            "Offline rollout actions must have shape [B,3,A], "
+            f"received {tuple(action_suffix.shape)}"
+        )
+    time_major_actions = rearrange(action_suffix, "b t a -> t b a")
+    predicted = backend.official_model.unroll(
+        context, act_suffix=time_major_actions
+    )
     predicted_future = predicted[-3:]
     target_future = rearrange(target, "b t ... -> t b ...")
     per_step = torch.stack(
@@ -129,9 +136,21 @@ def _rollout_errors(
     return per_step[:, 0], per_step[:, :2].mean(dim=1), per_step.mean(dim=1)
 
 
+def _action_shuffle_permutation(shuffle_seed: int) -> Tensor:
+    generator = torch.Generator(device="cpu").manual_seed(shuffle_seed)
+    permutation = torch.randperm(3, generator=generator, device="cpu")
+    identity = torch.arange(3, dtype=torch.int64)
+    if torch.equal(permutation, identity):
+        permutation = torch.tensor([1, 2, 0], dtype=torch.int64)
+    return permutation
+
+
 def main() -> None:
     cfg = load_experiment_config()
-    seed_everything(int(cfg.offline.get("seed", cfg.evaluation.eval_seed)))
+    offline_seed = int(cfg.offline.get("seed", cfg.evaluation.eval_seed))
+    shuffle_seed = int(cfg.offline.get("shuffle_seed", offline_seed + 100003))
+    shuffle_permutation = _action_shuffle_permutation(shuffle_seed)
+    seed_everything(offline_seed)
     backend = _backend(cfg)
     method, method_checkpoint_sha256 = _load_method(cfg, backend)
     source = build_robocasa_dataset(
@@ -156,7 +175,7 @@ def main() -> None:
         candidates,
         evaluation_episodes,
         int(cfg.offline.num_windows),
-        int(cfg.offline.get("seed", cfg.evaluation.eval_seed)),
+        offline_seed,
     )
     if len(selected) != int(cfg.offline.num_windows):
         raise RuntimeError(
@@ -199,6 +218,11 @@ def main() -> None:
             clean = batch["clean_images"]
             batch_size = clean.shape[0]
             actions = batch["actions"].to(backend.device, non_blocking=True).float()
+            rollout_actions = actions[:, 2:5]
+            shuffled_rollout_actions = rollout_actions.index_select(
+                1, shuffle_permutation.to(device=actions.device)
+            )
+            zero_rollout_actions = torch.zeros_like(rollout_actions)
             with _frozen_base_projection(backend, method), autocast():
                 clean_latent = backend.encode_images(
                     clean, base_method, batch_size, num_frames
@@ -212,13 +236,17 @@ def main() -> None:
                     )
                     canonical = _sample_mse(adapted_context, clean_latent[:, :3])
                     context = backend.planning_latents(adapted_context)
-                    one, two, three = _rollout_errors(backend, context, clean_target, actions)
-                    shuffled_actions = actions.flip(dims=(1,))
+                    one, two, three = _rollout_errors(
+                        backend, context, clean_target, rollout_actions
+                    )
                     _, _, shuffled = _rollout_errors(
-                        backend, context, clean_target, shuffled_actions
+                        backend,
+                        context,
+                        clean_target,
+                        shuffled_rollout_actions,
                     )
                     _, _, zero = _rollout_errors(
-                        backend, context, clean_target, torch.zeros_like(actions)
+                        backend, context, clean_target, zero_rollout_actions
                     )
                 tensors = {
                     "canonical_mse": canonical,
@@ -261,6 +289,11 @@ def main() -> None:
         "window_count": len(selected),
         "window_identities": [list(pair) for pair in selected],
         "episode_partition": "eval",
+        "action_shuffle": {
+            "seed": shuffle_seed,
+            "suffix_source_indices": [2, 3, 4],
+            "permutation": shuffle_permutation.tolist(),
+        },
         "domains": domain_metrics,
         "method_parameter_count": method.parameter_count(),
         "method_checkpoint_sha256": method_checkpoint_sha256,

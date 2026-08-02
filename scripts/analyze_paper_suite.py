@@ -15,6 +15,21 @@ from wm_adapter.utils.checkpoints import sha256_file
 from wm_adapter.utils.reproducibility import resolve_path
 
 
+EFFICIENCY_COLUMNS = [
+    "task",
+    "method",
+    "domain",
+    "source_elapsed_seconds",
+    "source_available_episodes",
+    "used_episodes",
+    "elapsed_seconds_per_episode",
+    "elapsed_seconds",
+    "peak_cuda_memory_bytes",
+    "parameter_count",
+    "source_path",
+]
+
+
 def _wilson(successes: int, total: int) -> tuple[float, float]:
     if total <= 0:
         raise ValueError(f"Wilson interval requires positive sample count, received {total}")
@@ -87,6 +102,13 @@ def _markdown(rows: list[dict[str, Any]], columns: list[str]) -> str:
 def _load_planning(path: Path, episodes: int, metadata: dict[str, Any]) -> dict[str, Any]:
     validation = validate_planning_result(path, episodes)
     payload = json.loads(path.read_text(encoding="utf-8"))
+    source_available_episodes = len(payload["per_episode_success"])
+    if source_available_episodes <= 0:
+        raise RuntimeError(f"Planning result contains no source episodes: {path}")
+    source_elapsed_seconds = float(payload.get("elapsed_seconds", 0.0))
+    elapsed_seconds_per_episode = (
+        source_elapsed_seconds / source_available_episodes
+    )
     outcomes = [bool(value) for value in payload["per_episode_success"][:episodes]]
     identities = payload.get("environment_seeds", [])[:episodes]
     if len(identities) != episodes:
@@ -103,7 +125,11 @@ def _load_planning(path: Path, episodes: int, metadata: dict[str, Any]) -> dict[
         "identities": [int(value) for value in identities],
         "source_path": str(path),
         "source_sha256": validation["sha256"],
-        "elapsed_seconds": float(payload.get("elapsed_seconds", 0.0)),
+        "source_elapsed_seconds": source_elapsed_seconds,
+        "source_available_episodes": source_available_episodes,
+        "used_episodes": episodes,
+        "elapsed_seconds_per_episode": elapsed_seconds_per_episode,
+        "elapsed_seconds": source_elapsed_seconds,
         "peak_cuda_memory_bytes": int(payload.get("peak_cuda_memory_bytes", 0)),
         "parameter_count": int(payload.get("method_parameter_count", 0)),
     }
@@ -329,10 +355,10 @@ def main() -> None:
     offline_columns = sorted({key for row in offline_rows for key in row})
     _write_csv(output / "offline_metrics.csv", offline_rows, offline_columns)
     efficiency_rows = [
-        {key: row[key] for key in ("task", "method", "domain", "elapsed_seconds", "peak_cuda_memory_bytes", "parameter_count", "source_path")}
+        {key: row[key] for key in EFFICIENCY_COLUMNS}
         for row in main_public
     ]
-    _write_csv(output / "efficiency.csv", efficiency_rows, ["task", "method", "domain", "elapsed_seconds", "peak_cuda_memory_bytes", "parameter_count", "source_path"])
+    _write_csv(output / "efficiency.csv", efficiency_rows, EFFICIENCY_COLUMNS)
     paired = _paired_statistics(main_rows + multiseed_rows, bootstrap_samples)
     seed_summary: list[dict[str, Any]] = []
     grouped: dict[tuple[str, str, str], list[float]] = {}
@@ -342,7 +368,17 @@ def main() -> None:
         seed_summary.append({"task": task, "method": method, "domain": domain, "seed_mean": float(np.mean(values)), "seed_std": float(np.std(values, ddof=1)) if len(values) > 1 else 0.0, "seed_count": len(values)})
     statistics = {"bootstrap_samples": bootstrap_samples, "paired_comparisons": paired, "multiseed_summary": seed_summary}
     atomic_write_json(output / "statistics.json", statistics)
-    summary = ["# ICRA 2027 paper suite summary", "", f"Main planning conditions: {len(main_rows)}", f"Offline metric rows: {len(offline_rows)}", f"Paired comparisons: {len(paired)}", "", "All reused records retain source paths and SHA256 fingerprints.", ""]
+    summary = [
+        "# ICRA 2027 paper suite summary",
+        "",
+        f"Main planning conditions: {len(main_rows)}",
+        f"Offline metric rows: {len(offline_rows)}",
+        f"Paired comparisons: {len(paired)}",
+        "",
+        "All reused records retain source paths and SHA256 fingerprints.",
+        "For reused 50-episode place results, the main success table uses the first 32 episodes, while runtime efficiency is normalized per episode using the complete source episode count.",
+        "",
+    ]
     (output / "paper_summary.md").write_text("\n".join(summary), encoding="utf-8")
     print(f"Paper-suite analysis written: {output}")
 

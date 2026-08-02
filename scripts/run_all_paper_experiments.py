@@ -305,6 +305,7 @@ def main() -> None:
             "domain=both",
             f"offline.num_windows={int(suite.offline.windows)}",
             f"offline.seed={int(suite.offline.seed)}",
+            f"offline.shuffle_seed={int(suite.offline.shuffle_seed)}",
             f"offline.output_directory={output}",
         ]
         if checkpoint is not None:
@@ -357,6 +358,7 @@ def main() -> None:
                 f"paths.method_checkpoint={checkpoint}",
                 f"offline.num_windows={int(suite.offline.windows)}",
                 f"offline.seed={int(suite.offline.seed)}",
+                f"offline.shuffle_seed={int(suite.offline.shuffle_seed)}",
                 f"offline.output_directory={output}",
             ],
             log_path=resolve_path(str(suite.log_root)) / f"offline-ablation-{variant}.log",
