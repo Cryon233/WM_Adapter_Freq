@@ -46,6 +46,19 @@ def _job_progress(job_id: str, entry: dict[str, Any]) -> progress_core.Progress:
     return progress_core.job_progress(job_id, _normalized(entry))
 
 
+def _running_job_sort_key(
+    value: tuple[str, dict[str, Any]],
+) -> tuple[int, int, str]:
+    job_id, entry = value
+    gpu = entry.get("gpu")
+    if gpu is None:
+        return (1, 0, job_id)
+    try:
+        return (0, int(gpu), job_id)
+    except (TypeError, ValueError):
+        return (1, 0, job_id)
+
+
 def _phase_progress(
     phase: str, expected: int, jobs: dict[str, dict[str, Any]]
 ) -> progress_core.Progress:
@@ -144,10 +157,12 @@ def dashboard_lines(
     lines.extend(["", "RUNNING JOBS"])
     if not running:
         lines.append("  no active cross-benchmark jobs")
-    for job_id, entry in sorted(running, key=lambda value: int(value[1].get("gpu", 999))):
+    for job_id, entry in sorted(running, key=_running_job_sort_key):
+        gpu_label = entry.get("gpu")
+        gpu_text = "--" if gpu_label is None else str(gpu_label)
         lines.append(
             "  " + _progress_line(
-                f"GPU {entry.get('gpu', '?')} {job_id}", _job_progress(job_id, entry), width - 2
+                f"GPU {gpu_text} {job_id}", _job_progress(job_id, entry), width - 2
             )
         )
     failures = [(key, value) for key, value in jobs.items() if value.get("status") == "failed"]
