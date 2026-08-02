@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
+import shutil
 import subprocess
 import xml.etree.ElementTree as ET
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +45,27 @@ _ACTION_SEGMENTS = {
     "end_effector_rotation": (8, 11),
     "gripper_close": (11, 12),
 }
+
+
+@lru_cache(maxsize=1)
+def _ffmpeg_executable() -> str:
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg is not None:
+        return system_ffmpeg
+    try:
+        import imageio_ffmpeg
+    except ImportError as error:
+        raise RuntimeError(
+            "Decoding RoboCasa365 videos requires either a system ffmpeg "
+            "executable or the imageio-ffmpeg package"
+        ) from error
+    bundled_ffmpeg = Path(imageio_ffmpeg.get_ffmpeg_exe()).resolve()
+    if not bundled_ffmpeg.is_file() or not os.access(bundled_ffmpeg, os.X_OK):
+        raise RuntimeError(
+            "imageio-ffmpeg did not provide an executable ffmpeg binary: "
+            f"resolved_path={bundled_ffmpeg}"
+        )
+    return str(bundled_ffmpeg)
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -555,7 +579,7 @@ class RoboCasaLeRobotDataset:
         fps = float(self.info["fps"])
         output_count = frames[-1] - frames[0] + 1
         command = [
-            "ffmpeg",
+            _ffmpeg_executable(),
             "-v",
             "error",
             "-i",
