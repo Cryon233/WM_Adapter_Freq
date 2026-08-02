@@ -100,10 +100,16 @@ def main() -> None:
             str(data_metadata.get("task_key", "")),
         )
         expected_identity = (resolved_task.benchmark, resolved_task.task_key)
+        standard_checkpoint = resolve_path(
+            "checkpoints/cross_benchmark_v1/"
+            f"{resolved_task.benchmark}/{resolved_task.task_key}/{method_name}_final.pt"
+        )
         legacy_place = (
-            resolved_task.task_key == "robocasa_place"
-            or resolved_task.suite == "legacy_single_stage"
-        ) and actual_identity == ("", "")
+            resolved_task.benchmark == "robocasa"
+            and resolved_task.task_key == "robocasa_place"
+            and checkpoint_path != standard_checkpoint
+            and actual_identity == ("", "")
+        )
         if actual_identity != expected_identity and not legacy_place:
             raise RuntimeError(
                 "Method checkpoint benchmark/task mismatch: "
@@ -114,7 +120,12 @@ def main() -> None:
                 "task_manifest_sha256": task_manifest["task_manifest_sha256"],
                 "dataset_sha256": resolved_task.dataset_sha256,
                 "camera_key": resolved_task.camera_key,
+                "camera_height": resolved_task.camera_height,
+                "camera_width": resolved_task.camera_width,
+                "camera_channel_order": resolved_task.camera_channel_order,
+                "camera_vertical_flip": resolved_task.camera_vertical_flip,
                 "action_convention": resolved_task.action_convention,
+                "action_transform": resolved_task.action_transform,
                 "task_upstream_commits": resolved_task.upstream_commits,
             }
             contract_mismatch = {
@@ -213,7 +224,12 @@ def main() -> None:
         "evaluation_manifest_sha256": evaluation_manifest_sha256,
         "dataset_fingerprint": resolved_task.dataset_sha256,
         "camera_key": resolved_task.camera_key,
+        "camera_height": resolved_task.camera_height,
+        "camera_width": resolved_task.camera_width,
+        "camera_channel_order": resolved_task.camera_channel_order,
+        "camera_vertical_flip": resolved_task.camera_vertical_flip,
         "action_convention": resolved_task.action_convention,
+        "action_transform": resolved_task.action_transform,
         "task": task,
         "domain": domain,
         "number_of_episodes": result.total_episodes,

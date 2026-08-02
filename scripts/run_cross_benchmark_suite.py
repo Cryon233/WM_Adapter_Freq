@@ -290,19 +290,45 @@ def _validate_job(
         and resolve_path(path) != resolve_path(job.artifact_path)
     )
     if job.kind == "task_manifest":
-        return validate_task_manifest(path, job.task)
+        return validate_task_manifest(
+            path,
+            job.task,
+            allow_legacy_place=allow_legacy,
+        )
     if job.kind == "cache":
         task_manifest_path, _ = _manifest_paths(suite, job.task)
         task_manifest = json.loads(task_manifest_path.read_text(encoding="utf-8"))
+        camera_contract = {
+            key: task_manifest.get(key)
+            for key in (
+                "camera_height",
+                "camera_width",
+                "camera_channel_order",
+                "camera_vertical_flip",
+            )
+        }
         return validate_cache(
             path, int(job.required_count or 0), benchmark=job.benchmark,
             task=job.task, allow_legacy_place=allow_legacy,
             expected_task_manifest_sha256=str(
                 task_manifest["task_manifest_sha256"]
             ),
+            expected_action_transform=task_manifest.get("action_transform"),
+            expected_camera_contract=camera_contract,
         )
     if job.kind == "checkpoint":
         cache = _cache_info(state, job.task)
+        task_manifest_path, _ = _manifest_paths(suite, job.task)
+        task_manifest = json.loads(task_manifest_path.read_text(encoding="utf-8"))
+        camera_contract = {
+            key: task_manifest.get(key)
+            for key in (
+                "camera_height",
+                "camera_width",
+                "camera_channel_order",
+                "camera_vertical_flip",
+            )
+        }
         task_config_path = str(suite.tasks[job.task])
         task_config = load_task_config(task_config_path)
         if job.variant is not None:
@@ -326,17 +352,31 @@ def _validate_job(
             expected_training_seed=int(job.seed or 42),
             expected_method_config=method_config,
             expected_loss_weights=loss_weights,
+            expected_action_transform=task_manifest.get("action_transform"),
+            expected_camera_contract=camera_contract,
         )
     if job.kind == "offline":
+        task_manifest_path, _ = _manifest_paths(suite, job.task)
+        task_manifest = json.loads(task_manifest_path.read_text(encoding="utf-8"))
         return validate_offline(
             path, int(job.required_count or 0), benchmark=job.benchmark,
             task=job.task, method=str(job.method),
+            expected_action_transform=task_manifest.get("action_transform"),
         )
     if job.kind == "planning":
         task_manifest_path, evaluation_manifest_path = _manifest_paths(suite, job.task)
         task_manifest = json.loads(task_manifest_path.read_text(encoding="utf-8"))
         preflight = state["jobs"][f"preflight/{job.task}"]["artifact_validation"]["report"]
         resources = dict(preflight["resources"])
+        camera_contract = {
+            key: task_manifest.get(key)
+            for key in (
+                "camera_height",
+                "camera_width",
+                "camera_channel_order",
+                "camera_vertical_flip",
+            )
+        }
         cache = _cache_info(state, job.task)
         dependency = _dependency_job(job)
         checkpoint = (
@@ -356,6 +396,8 @@ def _validate_job(
                 str(checkpoint["sha256"]) if checkpoint is not None else None
             ),
             expected_action_convention=dict(task_manifest["action_convention"]),
+            expected_action_transform=task_manifest.get("action_transform"),
+            expected_camera_contract=camera_contract,
             formal_cem=not self_test,
             expected_base_checkpoint_sha256=resources.get("jepa_checkpoint_sha256"),
             expected_dinov3_checkpoint_sha256=resources.get("dinov3_checkpoint_sha256"),

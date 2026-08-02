@@ -214,6 +214,7 @@ class AdapterTrainer:
                     json.loads(str(cache_metadata[key]))
                     if key in {
                         "action_convention",
+                        "action_transform",
                         "source_trajectory_ids",
                         "train_test_split",
                         "window_identity",
@@ -232,7 +233,12 @@ class AdapterTrainer:
                     "task_manifest_sha256",
                     "dataset_sha256",
                     "camera_key",
+                    "camera_height",
+                    "camera_width",
+                    "camera_channel_order",
+                    "camera_vertical_flip",
                     "action_convention",
+                    "action_transform",
                     "source_trajectory_ids",
                     "train_test_split",
                     "window_identity",

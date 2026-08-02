@@ -11,6 +11,7 @@ from omegaconf import OmegaConf
 
 from wm_adapter.benchmarks.base import (
     ActionConvention,
+    ActionTransform,
     BenchmarkAdapter,
     EvaluationInstance,
     ResolvedTask,
@@ -45,8 +46,8 @@ class RoboCasaBenchmark(BenchmarkAdapter):
     def action_convention(self) -> ActionConvention:
         return ActionConvention(
             dimension=7,
-            translation="normalized delta Cartesian position in the robot base frame",
-            rotation="normalized delta axis-angle rotation",
+            translation="JEPA-WM physical delta Cartesian position in the robot base frame",
+            rotation="JEPA-WM physical delta axis-angle rotation",
             gripper="scalar command; -1=open and +1=close",
             source_range=(-1.0, 1.0),
             target_range=(-1.0, 1.0),
@@ -54,9 +55,36 @@ class RoboCasaBenchmark(BenchmarkAdapter):
             control_frequency_hz=float(self.cfg.benchmark.get("control_frequency_hz", 20.0)),
             action_repeat=int(self.cfg.data.frameskip),
             transform=(
-                "RoboCasaWrapper scales canonical dimensions by the pinned controller "
-                "output limits [0.05,0.05,0.05,0.5,0.5,0.5,1.0]"
+                "JEPA-WM physical deltas are mapped to normalized RoboCasa "
+                "OSC_POSE controller input by the pinned wrapper"
             ),
+        )
+
+    def action_transform(self) -> ActionTransform:
+        output_scale = (0.05, 0.05, 0.05, 0.5, 0.5, 0.5)
+        return ActionTransform(
+            canonical_lower=tuple(-value for value in (*output_scale, 1.0)),
+            canonical_upper=(*output_scale, 1.0),
+            environment_lower=(-1.0,) * 7,
+            environment_upper=(1.0,) * 7,
+            controller_input_lower=(-1.0,) * 6,
+            controller_input_upper=(1.0,) * 6,
+            controller_output_lower=tuple(-value for value in output_scale),
+            controller_output_upper=output_scale,
+            translation_scale=output_scale[:3],
+            rotation_scale=output_scale[3:],
+            gripper_mapping="identity",
+            transform_name="jepa_wm_physical_delta_to_robocasa_osc_pose_v1",
+            verified_identity=False,
+            verification_source=(
+                "pinned JEPA-WM RoboCasaWrapper RCASA_CONTROLLER_OUTPUT_LIMS "
+                "and RoboCasa OSC_POSE action contract"
+            ),
+            controller_type="RoboCasa OSC_POSE via JEPA-WM RoboCasaWrapper",
+            control_frequency_hz=float(
+                self.cfg.benchmark.get("control_frequency_hz", 20.0)
+            ),
+            action_repeat=int(self.cfg.data.frameskip),
         )
 
     def _candidate_dataset(self, candidate: str) -> Path | None:
@@ -69,7 +97,11 @@ class RoboCasaBenchmark(BenchmarkAdapter):
         return resolve_path(str(value))
 
     @staticmethod
-    def _inspect_dataset(path: Path, expected_task: str) -> tuple[list[str], dict[str, Any]]:
+    def _inspect_dataset(
+        path: Path,
+        expected_task: str,
+        camera_view: str,
+    ) -> tuple[list[str], dict[str, Any]]:
         errors: list[str] = []
         details: dict[str, Any] = {"dataset_path": str(path)}
         if not path.is_file():
@@ -101,6 +133,8 @@ class RoboCasaBenchmark(BenchmarkAdapter):
                     )
                 window_candidates = 0
                 lengths: list[int] = []
+                camera_key: str | None = None
+                camera_shape: tuple[int, ...] | None = None
                 for demo in demos:
                     group = data[demo]
                     if "actions" not in group or "states" not in group:
@@ -126,9 +160,38 @@ class RoboCasaBenchmark(BenchmarkAdapter):
                     if not image_keys:
                         errors.append(f"{demo} has no camera image dataset")
                         continue
+                    expected_image_key = (
+                        camera_view
+                        if camera_view.endswith("_image")
+                        else f"{camera_view}_image"
+                    )
+                    if expected_image_key not in group["obs"]:
+                        errors.append(
+                            f"{demo} lacks configured camera {expected_image_key!r}; "
+                            f"available={image_keys}"
+                        )
+                        continue
+                    image = group["obs"][expected_image_key]
+                    if image.ndim != 4 or image.shape[-1] != 3:
+                        errors.append(
+                            f"{demo}/{expected_image_key} must be [T,H,W,3], "
+                            f"received {image.shape}"
+                        )
+                        continue
+                    current_shape = tuple(int(value) for value in image.shape[1:])
+                    if camera_shape is not None and current_shape != camera_shape:
+                        errors.append(
+                            f"{demo}/{expected_image_key} shape {current_shape} differs "
+                            f"from {camera_shape}"
+                        )
+                        continue
+                    camera_key = f"obs/{expected_image_key}"
+                    camera_shape = current_shape
                     window_candidates += max(0, int(actions.shape[0]) - 16)
                 details["window_candidates_lower_bound"] = window_candidates
                 details["demonstration_lengths"] = lengths
+                details["camera_key"] = camera_key
+                details["camera_shape"] = camera_shape
                 if window_candidates < 2000:
                     errors.append(
                         "dataset cannot provide 2000 four-frame training windows: "
@@ -162,7 +225,11 @@ class RoboCasaBenchmark(BenchmarkAdapter):
             if path is None:
                 failures[candidate] = ["no dataset path is configured"]
                 continue
-            reasons, candidate_details = self._inspect_dataset(path, candidate)
+            reasons, candidate_details = self._inspect_dataset(
+                path,
+                candidate,
+                str(self.cfg.data.camera_view),
+            )
             if reasons:
                 failures[candidate] = reasons
                 continue
@@ -203,7 +270,8 @@ class RoboCasaBenchmark(BenchmarkAdapter):
             selected = requested if requested not in {"auto_articulated", "articulated"} else ARTICULATED_TASK_PRIORITY[0]
             selected_path = self._candidate_dataset(selected) or resolve_path("missing-robocasa-dataset.hdf5")
             details = {"available_demonstrations": 0}
-        camera_key = str(self.cfg.data.camera_view)
+        camera_key = str(details.get("camera_key") or self.cfg.data.camera_view)
+        camera_shape = details.get("camera_shape")
         status = "resolved" if not failures or selected not in failures else "unresolved"
         if not strict and requested in {"auto_articulated", "articulated"} and status == "resolved":
             status = "candidate_requires_deep_preflight"
@@ -256,6 +324,11 @@ class RoboCasaBenchmark(BenchmarkAdapter):
             ),
             status=status,
             candidate_failures=failures or None,
+            camera_height=(int(camera_shape[0]) if camera_shape is not None else None),
+            camera_width=(int(camera_shape[1]) if camera_shape is not None else None),
+            camera_channel_order=("RGB" if camera_shape is not None else None),
+            camera_vertical_flip=False if camera_shape is not None else None,
+            action_transform=self.action_transform().as_dict(),
         )
         if strict:
             self._strict_resolution = result
@@ -534,26 +607,21 @@ class RoboCasaBenchmark(BenchmarkAdapter):
                         appearance_seed=appearance_seed,
                     )
                 )
-            payload = self.finalize_evaluation_manifest(task, instances)
-            payload.update(
-                source_trajectory_count=len(
+            return self.finalize_evaluation_manifest(
+                task,
+                instances,
+                {
+                    "source_trajectory_count": len(
                     {value.source_trajectory_id for value in instances}
-                ),
-                segment_identity_note=(
+                    ),
+                    "segment_identity_note": (
                     "Sampling reproduces the pinned evaluator's seeded held-out "
                     "trajectory stream; repeated trajectories are clustered."
-                ),
-                cem_seed_mode="continuous_generator_stream",
-                legacy_place_reuse_compatible=True,
+                    ),
+                    "cem_seed_mode": "continuous_generator_stream",
+                    "legacy_place_reuse_compatible": True,
+                },
             )
-            payload["evaluation_manifest_sha256"] = canonical_sha256(
-                {
-                    key: value
-                    for key, value in payload.items()
-                    if key != "evaluation_manifest_sha256"
-                }
-            )
-            return payload
         primary_candidates: list[tuple[int, int, int]] = []
         for trajectory in evaluation.tolist():
             length = int(source.get_seq_length(int(trajectory)))
@@ -632,19 +700,23 @@ class RoboCasaBenchmark(BenchmarkAdapter):
                     appearance_seed=int(appearance_seed + position),
                 )
             )
-        payload = self.finalize_evaluation_manifest(task, instances)
-        payload["source_trajectory_count"] = len(set(x.source_trajectory_id for x in instances))
-        payload["distinct_source_trajectories"] = uses_distinct_source_trajectories
-        payload["segment_identity_note"] = (
-            "One final-goal segment per held-out trajectory is preferred; when fewer "
-            "than the requested count exist, segments sharing source_trajectory_id "
-            "are retained explicitly and clustered for trajectory bootstrap"
+        return self.finalize_evaluation_manifest(
+            task,
+            instances,
+            {
+                "source_trajectory_count": len(
+                    set(value.source_trajectory_id for value in instances)
+                ),
+                "distinct_source_trajectories": uses_distinct_source_trajectories,
+                "segment_identity_note": (
+                    "One final-goal segment per held-out trajectory is preferred; when "
+                    "fewer than the requested count exist, segments sharing "
+                    "source_trajectory_id are retained explicitly and clustered for "
+                    "trajectory bootstrap"
+                ),
+                "cem_seed_mode": "per_instance",
+            },
         )
-        payload["cem_seed_mode"] = "per_instance"
-        payload["evaluation_manifest_sha256"] = canonical_sha256(
-            {key: value for key, value in payload.items() if key != "evaluation_manifest_sha256"}
-        )
-        return payload
 
     def run_planning(
         self,

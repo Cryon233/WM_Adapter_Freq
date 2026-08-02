@@ -206,8 +206,10 @@ def main() -> None:
         "random_resize_scale": [1.0, 1.0],
         "random_resize_aspect_ratio": [1.0, 1.0],
         "source_camera_key": resolved_task.camera_key,
-        "source_vertical_flip": bool(cfg.data.get("vertical_flip", False)),
-        "source_channel_order": "RGB",
+        "source_camera_height": resolved_task.camera_height,
+        "source_camera_width": resolved_task.camera_width,
+        "source_vertical_flip": resolved_task.camera_vertical_flip,
+        "source_channel_order": resolved_task.camera_channel_order,
     }
     metadata = {
         "backend": "jepa_wm_droid",
@@ -221,7 +223,12 @@ def main() -> None:
         "dataset": resolved_task.dataset_path,
         "dataset_sha256": resolved_task.dataset_sha256,
         "camera_key": resolved_task.camera_key,
+        "camera_height": resolved_task.camera_height,
+        "camera_width": resolved_task.camera_width,
+        "camera_channel_order": resolved_task.camera_channel_order,
+        "camera_vertical_flip": resolved_task.camera_vertical_flip,
         "action_convention": resolved_task.action_convention,
+        "action_transform": resolved_task.action_transform,
         "source_trajectory_ids": list(
             resolved_task.selected_train_demonstrations
         ),
@@ -266,6 +273,15 @@ def main() -> None:
             "benchmark trajectory index plus immutable source trajectory ID"
         ),
     }
+    for optional_contract_key in (
+        "camera_height",
+        "camera_width",
+        "camera_channel_order",
+        "camera_vertical_flip",
+        "action_transform",
+    ):
+        if metadata[optional_contract_key] is None:
+            metadata.pop(optional_contract_key)
     output_path = resolve_path(cfg.paths.feature_cache)
     if output_path.exists():
         raise FileExistsError(

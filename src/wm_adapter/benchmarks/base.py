@@ -5,7 +5,7 @@ import json
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 from torch.utils.data import Dataset
@@ -15,7 +15,7 @@ from wm_adapter.utils.reproducibility import resolve_path
 
 EPISODE_SPLIT_STRATEGY = "deterministic_trajectory_partition_v1"
 WINDOW_SELECTION_STRATEGY = "episode_balanced_round_robin_v1"
-TASK_MANIFEST_SCHEMA = "cross_benchmark_task_manifest_v1"
+TASK_MANIFEST_SCHEMA = "cross_benchmark_task_manifest_v2"
 EVALUATION_MANIFEST_SCHEMA = "cross_benchmark_evaluation_manifest_v1"
 
 
@@ -123,7 +123,168 @@ class ActionConvention:
     transform: str
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return json.loads(json.dumps(asdict(self)))
+
+
+@dataclass(frozen=True)
+class ActionTransform:
+    """Verified mapping between JEPA-WM physical deltas and environment input."""
+
+    canonical_lower: tuple[float, ...]
+    canonical_upper: tuple[float, ...]
+    environment_lower: tuple[float, ...]
+    environment_upper: tuple[float, ...]
+    controller_input_lower: tuple[float, ...]
+    controller_input_upper: tuple[float, ...]
+    controller_output_lower: tuple[float, ...]
+    controller_output_upper: tuple[float, ...]
+    translation_scale: tuple[float, ...]
+    rotation_scale: tuple[float, ...]
+    gripper_mapping: str
+    transform_name: str
+    verified_identity: bool
+    verification_source: str
+    controller_type: str
+    control_frequency_hz: float
+    action_repeat: int
+
+    def __post_init__(self) -> None:
+        seven_fields = (
+            "canonical_lower",
+            "canonical_upper",
+            "environment_lower",
+            "environment_upper",
+        )
+        for field_name in seven_fields:
+            if len(getattr(self, field_name)) != 7:
+                raise ValueError(
+                    f"ActionTransform.{field_name} must contain 7 values, "
+                    f"received {getattr(self, field_name)}"
+                )
+        for field_name in (
+            "controller_input_lower",
+            "controller_input_upper",
+            "controller_output_lower",
+            "controller_output_upper",
+        ):
+            if len(getattr(self, field_name)) != 6:
+                raise ValueError(
+                    f"ActionTransform.{field_name} must contain 6 arm values, "
+                    f"received {getattr(self, field_name)}"
+                )
+        if len(self.translation_scale) != 3 or len(self.rotation_scale) != 3:
+            raise ValueError("ActionTransform translation/rotation scales must be 3-D")
+        if self.gripper_mapping not in {"identity", "inverted"}:
+            raise ValueError(
+                "ActionTransform.gripper_mapping must be 'identity' or 'inverted', "
+                f"received {self.gripper_mapping!r}"
+            )
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> ActionTransform:
+        values = dict(payload)
+        tuple_fields = (
+            "canonical_lower",
+            "canonical_upper",
+            "environment_lower",
+            "environment_upper",
+            "controller_input_lower",
+            "controller_input_upper",
+            "controller_output_lower",
+            "controller_output_upper",
+            "translation_scale",
+            "rotation_scale",
+        )
+        for field_name in tuple_fields:
+            values[field_name] = tuple(float(value) for value in values[field_name])
+        return cls(**values)
+
+    def as_dict(self) -> dict[str, Any]:
+        return json.loads(json.dumps(asdict(self)))
+
+    @staticmethod
+    def _checked(
+        action: np.ndarray,
+        lower: np.ndarray,
+        upper: np.ndarray,
+        label: str,
+    ) -> np.ndarray:
+        values = np.asarray(action, dtype=np.float64)
+        if values.ndim == 0 or values.shape[-1] != 7:
+            raise ValueError(
+                f"{label} action must end in dimension 7, received shape={values.shape}"
+            )
+        if not np.isfinite(values).all():
+            raise ValueError(f"{label} action contains non-finite values")
+        tolerance = 1.0e-6
+        if np.any(values < lower - tolerance) or np.any(values > upper + tolerance):
+            raise ValueError(
+                f"{label} action exceeds its verified bounds: "
+                f"minimum={values.min(axis=tuple(range(values.ndim - 1))).tolist()}, "
+                f"maximum={values.max(axis=tuple(range(values.ndim - 1))).tolist()}, "
+                f"lower={lower.tolist()}, upper={upper.tolist()}"
+            )
+        return np.clip(values, lower, upper)
+
+    def canonical_to_environment_action(self, action: np.ndarray) -> np.ndarray:
+        canonical_lower = np.asarray(self.canonical_lower, dtype=np.float64)
+        canonical_upper = np.asarray(self.canonical_upper, dtype=np.float64)
+        values = self._checked(action, canonical_lower, canonical_upper, "Canonical")
+        input_lower = np.asarray(self.controller_input_lower, dtype=np.float64)
+        input_upper = np.asarray(self.controller_input_upper, dtype=np.float64)
+        output_lower = np.asarray(self.controller_output_lower, dtype=np.float64)
+        output_upper = np.asarray(self.controller_output_upper, dtype=np.float64)
+        output_span = output_upper - output_lower
+        if np.any(output_span <= 0.0):
+            raise ValueError("Controller output bounds must have positive span")
+        converted = np.empty_like(values)
+        converted[..., :6] = input_lower + (
+            (values[..., :6] - output_lower) / output_span
+        ) * (input_upper - input_lower)
+        grip_fraction = (values[..., 6] - canonical_lower[6]) / (
+            canonical_upper[6] - canonical_lower[6]
+        )
+        if self.gripper_mapping == "inverted":
+            grip_fraction = 1.0 - grip_fraction
+        environment_lower = np.asarray(self.environment_lower, dtype=np.float64)
+        environment_upper = np.asarray(self.environment_upper, dtype=np.float64)
+        converted[..., 6] = environment_lower[6] + grip_fraction * (
+            environment_upper[6] - environment_lower[6]
+        )
+        converted = self._checked(
+            converted, environment_lower, environment_upper, "Environment"
+        )
+        return converted.astype(np.float32, copy=False)
+
+    def environment_to_canonical_action(self, action: np.ndarray) -> np.ndarray:
+        environment_lower = np.asarray(self.environment_lower, dtype=np.float64)
+        environment_upper = np.asarray(self.environment_upper, dtype=np.float64)
+        values = self._checked(action, environment_lower, environment_upper, "Environment")
+        input_lower = np.asarray(self.controller_input_lower, dtype=np.float64)
+        input_upper = np.asarray(self.controller_input_upper, dtype=np.float64)
+        input_span = input_upper - input_lower
+        if np.any(input_span <= 0.0):
+            raise ValueError("Controller input bounds must have positive span")
+        output_lower = np.asarray(self.controller_output_lower, dtype=np.float64)
+        output_upper = np.asarray(self.controller_output_upper, dtype=np.float64)
+        converted = np.empty_like(values)
+        converted[..., :6] = output_lower + (
+            (values[..., :6] - input_lower) / input_span
+        ) * (output_upper - output_lower)
+        grip_fraction = (values[..., 6] - environment_lower[6]) / (
+            environment_upper[6] - environment_lower[6]
+        )
+        if self.gripper_mapping == "inverted":
+            grip_fraction = 1.0 - grip_fraction
+        canonical_lower = np.asarray(self.canonical_lower, dtype=np.float64)
+        canonical_upper = np.asarray(self.canonical_upper, dtype=np.float64)
+        converted[..., 6] = canonical_lower[6] + grip_fraction * (
+            canonical_upper[6] - canonical_lower[6]
+        )
+        converted = self._checked(
+            converted, canonical_lower, canonical_upper, "Canonical"
+        )
+        return converted.astype(np.float32, copy=False)
 
 
 @dataclass(frozen=True)
@@ -153,9 +314,14 @@ class ResolvedTask:
     episode_cap_basis: str
     status: str = "resolved"
     candidate_failures: dict[str, list[str]] | None = None
+    camera_height: int | None = None
+    camera_width: int | None = None
+    camera_channel_order: str | None = None
+    camera_vertical_flip: bool | None = None
+    action_transform: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        payload = asdict(self)
+        payload = json.loads(json.dumps(asdict(self)))
         payload["schema_version"] = TASK_MANIFEST_SCHEMA
         payload["task_manifest_sha256"] = canonical_sha256(payload)
         return payload
@@ -175,12 +341,13 @@ class EvaluationInstance:
     appearance_seed: int
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return json.loads(json.dumps(asdict(self)))
 
 
 class BenchmarkAdapter(ABC):
     def __init__(self, cfg: Any) -> None:
         self.cfg = cfg
+        self._task_manifest_hash_override: str | None = None
 
     @property
     @abstractmethod
@@ -280,11 +447,18 @@ class BenchmarkAdapter(ABC):
             return None
         payload = json.loads(path.read_text(encoding="utf-8"))
         supplied_hash = str(payload.pop("task_manifest_sha256", ""))
-        payload.pop("schema_version", None)
-        task = ResolvedTask(**payload)
-        computed_hash = task.as_dict()["task_manifest_sha256"]
+        computed_hash = canonical_sha256(payload)
         if supplied_hash != computed_hash:
             raise RuntimeError(f"Resolved task manifest fingerprint is invalid: {path}")
+        self._task_manifest_hash_override = supplied_hash
+        payload.pop("schema_version", None)
+        payload["selected_train_demonstrations"] = tuple(
+            payload["selected_train_demonstrations"]
+        )
+        payload["selected_test_demonstrations"] = tuple(
+            payload["selected_test_demonstrations"]
+        )
+        task = ResolvedTask(**payload)
         if task.status != "resolved":
             raise RuntimeError(f"Resolved task manifest is not usable: {path}")
         if task.task_key != str(self.cfg.benchmark.task_key) or task.benchmark != self.name:
@@ -308,6 +482,30 @@ class BenchmarkAdapter(ABC):
         if destination.exists():
             existing = json.loads(destination.read_text(encoding="utf-8"))
             if existing != payload:
+                legacy_place = (
+                    task.benchmark == "robocasa"
+                    and task.task_key == "robocasa_place"
+                    and all(
+                        key not in existing
+                        for key in (
+                            "camera_height",
+                            "camera_width",
+                            "camera_channel_order",
+                            "camera_vertical_flip",
+                            "action_transform",
+                        )
+                    )
+                    and existing.get("task_manifest_sha256")
+                    == canonical_sha256(
+                        {
+                            key: value
+                            for key, value in existing.items()
+                            if key != "task_manifest_sha256"
+                        }
+                    )
+                )
+                if legacy_place:
+                    return existing
                 raise RuntimeError(
                     f"Resolved task manifest is immutable and differs from {destination}"
                 )
@@ -327,10 +525,18 @@ class BenchmarkAdapter(ABC):
         atomic_json(destination, payload)
         return payload
 
-    @staticmethod
+    def task_manifest_sha256(self, task: ResolvedTask) -> str:
+        """Return the immutable on-disk identity, including legacy Place manifests."""
+
+        return self._task_manifest_hash_override or str(
+            task.as_dict()["task_manifest_sha256"]
+        )
+
     def finalize_evaluation_manifest(
+        self,
         task: ResolvedTask,
         instances: list[EvaluationInstance],
+        extra: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "schema_version": EVALUATION_MANIFEST_SCHEMA,
@@ -339,8 +545,10 @@ class BenchmarkAdapter(ABC):
             "suite": task.suite,
             "task_id": task.task_id,
             "task_name": task.task_name,
-            "task_manifest_sha256": task.as_dict()["task_manifest_sha256"],
+            "task_manifest_sha256": self.task_manifest_sha256(task),
             "instances": [instance.as_dict() for instance in instances],
         }
+        if extra is not None:
+            payload.update(dict(extra))
         payload["evaluation_manifest_sha256"] = canonical_sha256(payload)
         return payload

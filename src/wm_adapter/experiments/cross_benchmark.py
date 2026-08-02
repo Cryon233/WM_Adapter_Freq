@@ -11,7 +11,12 @@ from typing import Any, Iterable, Sequence
 import h5py
 from omegaconf import DictConfig, OmegaConf
 
-from wm_adapter.benchmarks.base import atomic_json
+from wm_adapter.benchmarks.base import (
+    ActionTransform,
+    TASK_MANIFEST_SCHEMA,
+    atomic_json,
+    canonical_sha256,
+)
 from wm_adapter.data.feature_cache import ARRAY_KEYS, CACHE_SCHEMA_VERSION
 from wm_adapter.utils.checkpoints import load_method_checkpoint, sha256_file
 from wm_adapter.utils.reproducibility import project_root, resolve_path
@@ -94,7 +99,12 @@ def archive_incomplete(path: str | Path) -> Path:
     return destination
 
 
-def validate_task_manifest(path: str | Path, task: str) -> dict[str, Any]:
+def validate_task_manifest(
+    path: str | Path,
+    task: str,
+    *,
+    allow_legacy_place: bool = False,
+) -> dict[str, Any]:
     resolved = resolve_path(path)
     payload = json.loads(resolved.read_text(encoding="utf-8"))
     if str(payload.get("task_key")) != task:
@@ -103,6 +113,40 @@ def validate_task_manifest(path: str | Path, task: str) -> dict[str, Any]:
         )
     if str(payload.get("status")) != "resolved":
         raise RuntimeError(f"Task manifest is unresolved: {resolved}")
+    supplied_hash = str(payload.get("task_manifest_sha256", ""))
+    hash_payload = {
+        key: value for key, value in payload.items() if key != "task_manifest_sha256"
+    }
+    if supplied_hash != canonical_sha256(hash_payload):
+        raise RuntimeError(f"Task manifest fingerprint is invalid: {resolved}")
+    legacy = (
+        allow_legacy_place
+        and payload.get("benchmark") == "robocasa"
+        and task == "robocasa_place"
+    )
+    if not legacy and payload.get("schema_version") != TASK_MANIFEST_SCHEMA:
+        raise RuntimeError(f"Task manifest schema mismatch: {resolved}")
+    camera_fields = (
+        "camera_height",
+        "camera_width",
+        "camera_channel_order",
+        "camera_vertical_flip",
+    )
+    missing_camera = [key for key in camera_fields if payload.get(key) is None]
+    if payload.get("benchmark") == "libero":
+        if missing_camera:
+            raise RuntimeError(
+                f"Strict LIBERO task manifest lacks camera contract {missing_camera}: {resolved}"
+            )
+        transform = payload.get("action_transform")
+        if not isinstance(transform, dict):
+            raise RuntimeError(
+                f"Strict LIBERO task manifest lacks an action transform: {resolved}"
+            )
+        if ActionTransform.from_dict(transform).as_dict() != transform:
+            raise RuntimeError(
+                f"LIBERO task manifest action transform is not canonical: {resolved}"
+            )
     return {"path": str(resolved), "sha256": sha256_file(resolved)}
 
 
@@ -114,6 +158,8 @@ def validate_cache(
     task: str,
     allow_legacy_place: bool = False,
     expected_task_manifest_sha256: str | None = None,
+    expected_action_transform: dict[str, Any] | None = None,
+    expected_camera_contract: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     resolved = resolve_path(path)
     with h5py.File(resolved, "r", libver="latest", swmr=True) as handle:
@@ -143,6 +189,30 @@ def validate_cache(
             legacy_ok = allow_legacy_place and task == "robocasa_place" and not actual_manifest
             if not legacy_ok:
                 raise RuntimeError(f"Feature cache task-manifest fingerprint mismatch: {resolved}")
+        if expected_action_transform is not None:
+            raw_transform = handle.attrs.get("action_transform")
+            actual_transform = (
+                json.loads(str(raw_transform)) if raw_transform is not None else None
+            )
+            if actual_transform != expected_action_transform:
+                if not (allow_legacy_place and task == "robocasa_place" and actual_transform is None):
+                    raise RuntimeError(f"Feature cache action-transform mismatch: {resolved}")
+        if expected_camera_contract is not None:
+            actual_camera = {
+                key: (
+                    handle.attrs[key].item()
+                    if hasattr(handle.attrs.get(key), "item")
+                    else handle.attrs.get(key)
+                )
+                for key in expected_camera_contract
+            }
+            if actual_camera != expected_camera_contract:
+                if not (
+                    allow_legacy_place
+                    and task == "robocasa_place"
+                    and all(value is None for value in actual_camera.values())
+                ):
+                    raise RuntimeError(f"Feature cache camera-contract mismatch: {resolved}")
         return {
             "path": str(resolved),
             "sha256": sha256_file(resolved),
@@ -164,6 +234,8 @@ def validate_checkpoint(
     expected_training_seed: int | None = None,
     expected_method_config: dict[str, Any] | None = None,
     expected_loss_weights: tuple[float, float] | None = None,
+    expected_action_transform: dict[str, Any] | None = None,
+    expected_camera_contract: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     resolved = resolve_path(path)
     payload = load_method_checkpoint(resolved)
@@ -216,6 +288,18 @@ def validate_checkpoint(
             raise RuntimeError(
                 f"Checkpoint benchmark identity mismatch: expected={(benchmark, task)}, actual={actual}"
             )
+    if expected_action_transform is not None and metadata.get("action_transform") != expected_action_transform:
+        if not (allow_legacy_place and task == "robocasa_place" and metadata.get("action_transform") is None):
+            raise RuntimeError(f"Checkpoint action-transform mismatch at {resolved}")
+    if expected_camera_contract is not None:
+        actual_camera = {key: metadata.get(key) for key in expected_camera_contract}
+        if actual_camera != expected_camera_contract:
+            if not (
+                allow_legacy_place
+                and task == "robocasa_place"
+                and all(value is None for value in actual_camera.values())
+            ):
+                raise RuntimeError(f"Checkpoint camera-contract mismatch at {resolved}")
     return {
         "path": str(resolved),
         "sha256": sha256_file(resolved),
@@ -232,6 +316,7 @@ def validate_offline(
     benchmark: str,
     task: str,
     method: str,
+    expected_action_transform: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     resolved = resolve_path(path)
     payload = json.loads(resolved.read_text(encoding="utf-8"))
@@ -250,6 +335,8 @@ def validate_offline(
         raise RuntimeError(f"Offline artifact mismatch at {resolved}: {mismatch}")
     if not {"clean", "ood"}.issubset(payload.get("domains", {})):
         raise RuntimeError(f"Offline artifact lacks clean/OOD metrics: {resolved}")
+    if expected_action_transform is not None and payload.get("action_transform") != expected_action_transform:
+        raise RuntimeError(f"Offline action-transform mismatch: {resolved}")
     return {"path": str(resolved), "sha256": sha256_file(resolved)}
 
 
@@ -269,6 +356,8 @@ def validate_planning(
     expected_cache_fingerprint: str | None = None,
     expected_checkpoint_sha256: str | None = None,
     expected_action_convention: dict[str, Any] | None = None,
+    expected_action_transform: dict[str, Any] | None = None,
+    expected_camera_contract: dict[str, Any] | None = None,
     formal_cem: bool = True,
     expected_base_checkpoint_sha256: str | None = None,
     expected_dinov3_checkpoint_sha256: str | None = None,
@@ -341,6 +430,18 @@ def validate_planning(
     if expected_action_convention is not None and payload.get("action_convention") != expected_action_convention:
         if not (allow_legacy_place and task == "robocasa_place" and payload.get("action_convention") is None):
             raise RuntimeError(f"Planning action convention mismatch: {resolved}")
+    if expected_action_transform is not None and payload.get("action_transform") != expected_action_transform:
+        if not (allow_legacy_place and task == "robocasa_place" and payload.get("action_transform") is None):
+            raise RuntimeError(f"Planning action-transform mismatch: {resolved}")
+    if expected_camera_contract is not None:
+        actual_camera = {key: payload.get(key) for key in expected_camera_contract}
+        if actual_camera != expected_camera_contract:
+            if not (
+                allow_legacy_place
+                and task == "robocasa_place"
+                and all(value is None for value in actual_camera.values())
+            ):
+                raise RuntimeError(f"Planning camera-contract mismatch: {resolved}")
     if formal_cem:
         cem = payload.get("cem", {})
         expected_cem = {

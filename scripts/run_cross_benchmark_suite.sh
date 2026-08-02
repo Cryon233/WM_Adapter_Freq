@@ -4,9 +4,17 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-CONDA_BASE="$(conda info --base)"
-source "$CONDA_BASE/etc/profile.d/conda.sh"
-conda activate wm-a100
+CONDA_SH="${CONDA_SH:-$HOME/anaconda3/etc/profile.d/conda.sh}"
+if [[ ! -f "$CONDA_SH" ]]; then
+    echo "Conda activation script not found: $CONDA_SH" >&2
+    exit 1
+fi
+source "$CONDA_SH"
+conda activate "${CONDA_ENV:-wm-a100}"
+if [[ ! -f ./env_jepa.sh ]]; then
+    echo "Required JEPA-WM environment file not found: $ROOT/env_jepa.sh" >&2
+    exit 1
+fi
 source ./env_jepa.sh
 if [[ -f ./env_libero.sh ]]; then
     source ./env_libero.sh
