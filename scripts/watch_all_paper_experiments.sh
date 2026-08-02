@@ -7,4 +7,4 @@ cd "$PROJECT_ROOT"
 source "$CONDA_SH"
 conda activate "$CONDA_ENV"
 export PYTHONUNBUFFERED=1
-python scripts/monitor_all_paper_experiments.py --state logs/paper_suite/state.json --refresh 2
+python scripts/monitor_all_paper_experiments_live.py --state logs/paper_suite/state.json --refresh "${MONITOR_REFRESH:-2}"
