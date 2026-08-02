@@ -33,6 +33,7 @@
 **/*.pkl
 **/*.pickle
 # Project-specific downloaded content
+/LIBERO/
 /robocasa/robocasa/models/assets/
 /robocasa/datasets/
 /robocasa/checkpoints/

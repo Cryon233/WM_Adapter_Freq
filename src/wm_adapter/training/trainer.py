@@ -244,6 +244,13 @@ class AdapterTrainer:
                     "window_identity",
                     "source_trajectory_identity",
                     "task_upstream_commits",
+                    "dataset_format",
+                    "dataset_source_identifier",
+                    "dataset_revision",
+                    "dataset_file_count",
+                    "robot",
+                    "gripper",
+                    "controller_contract",
                 )
                 if key in cache_metadata
             },

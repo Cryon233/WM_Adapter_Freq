@@ -22,7 +22,14 @@ from wm_adapter.data.robocasa_windows import (
     RoboCasaWindowDataset,
     build_robocasa_dataset,
 )
-from wm_adapter.utils.checkpoints import UPSTREAM_COMMITS, sha256_file
+from wm_adapter.data.robocasa_lerobot import (
+    RoboCasaLeRobotDataset,
+    inspect_robocasa_lerobot,
+)
+from wm_adapter.utils.checkpoints import (
+    UPSTREAM_COMMITS,
+    sha256_dataset_path,
+)
 from wm_adapter.utils.reproducibility import resolve_path
 
 
@@ -96,6 +103,23 @@ class RoboCasaBenchmark(BenchmarkAdapter):
             return None
         return resolve_path(str(value))
 
+    def _candidate_lerobot_dataset(self, candidate: str) -> Path | None:
+        mappings = self.cfg.paths.get("candidate_lerobot_datasets", {})
+        value = mappings.get(candidate) if mappings else None
+        if value is None or not str(value).strip():
+            return None
+        return resolve_path(str(value))
+
+    def _candidate_sources(self, candidate: str) -> list[tuple[str, Path]]:
+        sources: list[tuple[str, Path]] = []
+        lerobot = self._candidate_lerobot_dataset(candidate)
+        if lerobot is not None:
+            sources.append(("lerobot_v3", lerobot))
+        hdf5 = self._candidate_dataset(candidate)
+        if hdf5 is not None:
+            sources.append(("hdf5", hdf5))
+        return sources
+
     @staticmethod
     def _inspect_dataset(
         path: Path,
@@ -117,6 +141,23 @@ class RoboCasaBenchmark(BenchmarkAdapter):
                     return [f"data.env_args is invalid JSON: {error}"], details
                 actual_task = str(env_args.get("env_name", ""))
                 details["source_task"] = actual_task
+                environment_kwargs = env_args.get("env_kwargs", {})
+                details["robot"] = str(
+                    environment_kwargs.get("robots", "unavailable in HDF5 metadata")
+                )
+                details["gripper"] = str(
+                    environment_kwargs.get(
+                        "gripper_types",
+                        "unavailable in HDF5 metadata; strict simulator XML preflight required",
+                    )
+                )
+                details["controller"] = json.dumps(
+                    environment_kwargs.get(
+                        "controller_configs",
+                        "unavailable in HDF5 metadata",
+                    ),
+                    sort_keys=True,
+                )
                 if actual_task != expected_task:
                     errors.append(
                         f"dataset env_name is {actual_task!r}, expected {expected_task!r}"
@@ -221,45 +262,71 @@ class RoboCasaBenchmark(BenchmarkAdapter):
             else (requested,)
         )
         for candidate in candidates:
-            path = self._candidate_dataset(candidate)
-            if path is None:
+            sources = self._candidate_sources(candidate)
+            if not sources:
                 failures[candidate] = ["no dataset path is configured"]
                 continue
-            reasons, candidate_details = self._inspect_dataset(
-                path,
-                candidate,
-                str(self.cfg.data.camera_view),
-            )
-            if reasons:
-                failures[candidate] = reasons
-                continue
-            if strict and requested in {"auto_articulated", "articulated"}:
-                try:
-                    source = build_robocasa_dataset(
-                        jepa_wms_root=(
-                            resolve_path(self.cfg.model.third_party_root) / "jepa-wms"
-                        ),
-                        dataset_root=self.cfg.paths.dataset_root,
-                        hdf5_path=path,
+            source_failures: list[str] = []
+            for dataset_format, path in sources:
+                if dataset_format == "lerobot_v3":
+                    reasons, candidate_details = inspect_robocasa_lerobot(
+                        path,
                         task_name=candidate,
                         camera_view=str(self.cfg.data.camera_view),
-                        output_environment_info=True,
-                        transform=None,
                     )
-                    _, heldout = self.split_trajectory_ids(source)
-                    candidate_details["resolver_environment_check"] = (
-                        self._deep_environment_preflight(candidate, source, heldout)
+                else:
+                    reasons, candidate_details = self._inspect_dataset(
+                        path,
+                        candidate,
+                        str(self.cfg.data.camera_view),
                     )
-                except Exception as error:
-                    failures[candidate] = [
-                        "environment/state/action/success preflight failed: "
-                        f"{type(error).__name__}: {error}"
-                    ]
+                    candidate_details["dataset_format"] = "hdf5"
+                    candidate_details["official_source_identifier"] = (
+                        "facebook/jepa-wms"
+                        if candidate == "PnPCounterTop"
+                        else "robocasa/robocasa official dataset registry"
+                    )
+                if reasons:
+                    source_failures.extend(
+                        f"{dataset_format}:{path}: {reason}" for reason in reasons
+                    )
                     continue
-            selected = candidate
-            selected_path = path
-            details = candidate_details
-            break
+                if strict and requested in {"auto_articulated", "articulated"}:
+                    try:
+                        source = self._build_source(
+                            path=path,
+                            task_name=candidate,
+                            dataset_format=dataset_format,
+                            output_environment_info=True,
+                        )
+                        _, heldout = self.split_trajectory_ids(source)
+                        if len(heldout) < int(self.cfg.evaluation.num_episodes):
+                            raise RuntimeError(
+                                "held-out RoboCasa trajectories are insufficient: "
+                                f"available={len(heldout)}, "
+                                f"required={self.cfg.evaluation.num_episodes}"
+                            )
+                        candidate_details["resolver_environment_check"] = (
+                            self._deep_environment_preflight(
+                                candidate, source, heldout
+                            )
+                        )
+                    except Exception as error:
+                        source_failures.append(
+                            f"{dataset_format}:{path}: environment/state/action/"
+                            "success preflight failed: "
+                            f"{type(error).__name__}: {error}"
+                        )
+                        continue
+                selected = candidate
+                selected_path = path
+                details = candidate_details
+                break
+            if selected is not None:
+                if source_failures:
+                    details["rejected_higher_priority_sources"] = source_failures
+                break
+            failures[candidate] = source_failures
         if selected is None or selected_path is None:
             message = (
                 "No RoboCasa task candidate satisfies the fixed resolver priority: "
@@ -268,7 +335,12 @@ class RoboCasaBenchmark(BenchmarkAdapter):
             if strict:
                 raise RuntimeError(message)
             selected = requested if requested not in {"auto_articulated", "articulated"} else ARTICULATED_TASK_PRIORITY[0]
-            selected_path = self._candidate_dataset(selected) or resolve_path("missing-robocasa-dataset.hdf5")
+            configured_sources = self._candidate_sources(selected)
+            selected_path = (
+                configured_sources[0][1]
+                if configured_sources
+                else resolve_path("missing-robocasa-dataset.hdf5")
+            )
             details = {"available_demonstrations": 0}
         camera_key = str(details.get("camera_key") or self.cfg.data.camera_view)
         camera_shape = details.get("camera_shape")
@@ -308,7 +380,9 @@ class RoboCasaBenchmark(BenchmarkAdapter):
             initial_states_sha256=None,
             initial_states_count=0,
             dataset_path=str(selected_path),
-            dataset_sha256=sha256_file(selected_path) if strict else None,
+            dataset_sha256=(
+                sha256_dataset_path(selected_path) if strict else None
+            ),
             available_demonstrations=available,
             selected_train_demonstrations=train_ids,
             selected_test_demonstrations=evaluation_ids,
@@ -329,6 +403,24 @@ class RoboCasaBenchmark(BenchmarkAdapter):
             camera_channel_order=("RGB" if camera_shape is not None else None),
             camera_vertical_flip=False if camera_shape is not None else None,
             action_transform=self.action_transform().as_dict(),
+            dataset_format=str(details.get("dataset_format", "hdf5")),
+            dataset_source_identifier=details.get(
+                "official_source_identifier"
+            ),
+            dataset_revision=details.get("official_source_revision"),
+            dataset_file_count=(
+                len(details.get("required_relative_files", ()))
+                if details.get("required_relative_files")
+                else 1
+            ),
+            robot=str(details.get("robot", "unavailable")),
+            gripper=str(details.get("gripper", "unavailable")),
+            controller_contract=str(
+                details.get(
+                    "controller",
+                    "RoboCasa OSC_POSE through pinned JEPA-WM action wrapper",
+                )
+            ),
         )
         if strict:
             self._strict_resolution = result
@@ -366,8 +458,16 @@ class RoboCasaBenchmark(BenchmarkAdapter):
             errors.append(
                 f"selected {len(selected)} training windows, expected {self.cfg.data.num_train_windows}"
             )
-        if len(evaluation) == 0:
-            errors.append("held-out trajectory partition is empty")
+        required_evaluation = (
+            int(self.cfg.evaluation.num_episodes)
+            if task.task_key == "robocasa_articulated"
+            else 1
+        )
+        if len(evaluation) < required_evaluation:
+            errors.append(
+                "held-out trajectory partition is too small: "
+                f"available={len(evaluation)}, required={required_evaluation}"
+            )
         if errors:
             raise RuntimeError("RoboCasa preflight failed:\n- " + "\n- ".join(errors))
         report = {
@@ -480,11 +580,40 @@ class RoboCasaBenchmark(BenchmarkAdapter):
 
     def build_source_dataset(self, *, output_environment_info: bool) -> Any:
         task = self.resolve_task(strict=True)
+        dataset_path = resolve_path(task.dataset_path)
+        dataset_format = "lerobot_v3" if dataset_path.is_dir() else "hdf5"
+        return self._build_source(
+            path=dataset_path,
+            task_name=task.task_name,
+            dataset_format=dataset_format,
+            output_environment_info=output_environment_info,
+        )
+
+    def _build_source(
+        self,
+        *,
+        path: Path,
+        task_name: str,
+        dataset_format: str,
+        output_environment_info: bool,
+    ) -> Any:
+        if dataset_format == "lerobot_v3":
+            return RoboCasaLeRobotDataset(
+                path,
+                task_name=task_name,
+                camera_view=str(self.cfg.data.camera_view),
+                action_transform=self.action_transform(),
+                output_environment_info=output_environment_info,
+            )
+        if dataset_format != "hdf5":
+            raise ValueError(
+                f"Unsupported RoboCasa dataset format {dataset_format!r}: {path}"
+            )
         return build_robocasa_dataset(
             jepa_wms_root=resolve_path(self.cfg.model.third_party_root) / "jepa-wms",
-            dataset_root=self.cfg.paths.dataset_root,
-            hdf5_path=task.dataset_path,
-            task_name=task.task_name,
+            dataset_root=path.parent.parent,
+            hdf5_path=path,
+            task_name=task_name,
             camera_view=str(self.cfg.data.camera_view),
             output_environment_info=output_environment_info,
             transform=None,

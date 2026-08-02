@@ -222,6 +222,13 @@ def main() -> None:
         "task_manifest_path": str(benchmark.task_manifest_path()),
         "dataset": resolved_task.dataset_path,
         "dataset_sha256": resolved_task.dataset_sha256,
+        "dataset_format": resolved_task.dataset_format,
+        "dataset_source_identifier": resolved_task.dataset_source_identifier,
+        "dataset_revision": resolved_task.dataset_revision,
+        "dataset_file_count": resolved_task.dataset_file_count,
+        "robot": resolved_task.robot,
+        "gripper": resolved_task.gripper,
+        "controller_contract": resolved_task.controller_contract,
         "camera_key": resolved_task.camera_key,
         "camera_height": resolved_task.camera_height,
         "camera_width": resolved_task.camera_width,
@@ -279,6 +286,13 @@ def main() -> None:
         "camera_channel_order",
         "camera_vertical_flip",
         "action_transform",
+        "dataset_format",
+        "dataset_source_identifier",
+        "dataset_revision",
+        "dataset_file_count",
+        "robot",
+        "gripper",
+        "controller_contract",
     ):
         if metadata[optional_contract_key] is None:
             metadata.pop(optional_contract_key)

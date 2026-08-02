@@ -29,7 +29,12 @@ from wm_adapter.experiments.cross_benchmark import (
     validate_task_manifest,
 )
 from wm_adapter.experiments.cross_jobs import build_job_graph, logical_rollout_counts
-from wm_adapter.utils.checkpoints import UPSTREAM_COMMITS, git_commit, sha256_file
+from wm_adapter.utils.checkpoints import (
+    UPSTREAM_COMMITS,
+    git_commit,
+    sha256_dataset_path,
+    sha256_file,
+)
 from wm_adapter.utils.reproducibility import project_root, resolve_path
 
 
@@ -108,7 +113,7 @@ def _resource_report(task_config: Any, *, strict: bool, deep: bool) -> dict[str,
     task = benchmark.resolve_task(strict=False if not strict else True)
     if strict:
         dataset_path = resolve_path(task.dataset_path)
-        actual_dataset_sha256 = sha256_file(dataset_path)
+        actual_dataset_sha256 = sha256_dataset_path(dataset_path)
         if actual_dataset_sha256 != task.dataset_sha256:
             raise RuntimeError(
                 "Resolved task dataset fingerprint changed: "

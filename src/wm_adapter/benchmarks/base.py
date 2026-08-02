@@ -319,6 +319,13 @@ class ResolvedTask:
     camera_channel_order: str | None = None
     camera_vertical_flip: bool | None = None
     action_transform: dict[str, Any] | None = None
+    dataset_format: str | None = None
+    dataset_source_identifier: str | None = None
+    dataset_revision: str | None = None
+    dataset_file_count: int | None = None
+    robot: str | None = None
+    gripper: str | None = None
+    controller_contract: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         payload = json.loads(json.dumps(asdict(self)))

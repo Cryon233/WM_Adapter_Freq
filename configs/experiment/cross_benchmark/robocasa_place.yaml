@@ -18,7 +18,7 @@ benchmark:
   control_frequency_hz: 20.0
 paths:
   dataset_root: ${oc.env:JEPAWM_DSET,''}
-  robocasa_hdf5: ${oc.env:JEPAWM_ROBOCASA_HDF5,''}
+  robocasa_hdf5: ${oc.env:ROBOCASA_PLACE_HDF5,${oc.env:JEPAWM_ROBOCASA_HDF5,''}}
   feature_cache: storage/feature_cache/cross_benchmark_v1/robocasa/robocasa_place.h5
   method_checkpoint: checkpoints/cross_benchmark_v1/robocasa/robocasa_place/${method}_final.pt
   task_manifest: outputs/cross_benchmark_v1/manifests/tasks/robocasa_place.json

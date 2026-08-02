@@ -19,6 +19,8 @@ benchmark:
 paths:
   dataset_root: ${oc.env:JEPAWM_DSET,''}
   robocasa_hdf5: ${oc.env:ROBOCASA_ARTICULATED_HDF5,''}
+  candidate_lerobot_datasets:
+    OpenDrawer: ${oc.env:ROBOCASA_OPEN_DRAWER_LEROBOT,''}
   candidate_datasets:
     OpenDrawer: ${oc.env:ROBOCASA_OPEN_DRAWER_HDF5,''}
     CloseDrawer: ${oc.env:ROBOCASA_CLOSE_DRAWER_HDF5,''}

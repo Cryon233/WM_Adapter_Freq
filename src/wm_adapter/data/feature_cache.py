@@ -130,6 +130,13 @@ class FeatureCacheWriter:
             "window_identity",
             "source_trajectory_identity",
             "task_upstream_commits",
+            "dataset_format",
+            "dataset_source_identifier",
+            "dataset_revision",
+            "dataset_file_count",
+            "robot",
+            "gripper",
+            "controller_contract",
         ):
             if key in self.file.attrs:
                 fingerprint_payload[key] = self.file.attrs[key]

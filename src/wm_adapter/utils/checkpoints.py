@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import subprocess
 import tempfile
@@ -27,6 +28,39 @@ def sha256_file(path: str | Path, chunk_size: int = 8 * 1024 * 1024) -> str:
         while block := handle.read(chunk_size):
             digest.update(block)
     return digest.hexdigest()
+
+
+def sha256_dataset_path(path: str | Path) -> str:
+    """Fingerprint one dataset file or a deterministic local dataset subtree."""
+
+    resolved = Path(path).expanduser().resolve()
+    if resolved.is_file():
+        return sha256_file(resolved)
+    if not resolved.is_dir():
+        raise FileNotFoundError(f"Dataset path does not exist: {resolved}")
+    files = sorted(
+        item
+        for item in resolved.rglob("*")
+        if item.is_file() and ".cache" not in item.relative_to(resolved).parts
+    )
+    if not files:
+        raise FileNotFoundError(
+            f"Dataset directory contains no fingerprintable files: {resolved}"
+        )
+    entries = [
+        {
+            "path": item.relative_to(resolved).as_posix(),
+            "size": item.stat().st_size,
+            "sha256": sha256_file(item),
+        }
+        for item in files
+    ]
+    encoded = json.dumps(
+        entries,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def git_commit(repo: str | Path) -> str:
