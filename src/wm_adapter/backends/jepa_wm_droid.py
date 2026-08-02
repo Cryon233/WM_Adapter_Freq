@@ -47,6 +47,8 @@ class JEPAWMDroidBackend(nn.Module):
         dinov3_checkpoint: str | Path,
         official_planning_config: str | Path,
         device: torch.device | str,
+        planning_tag: str | None = None,
+        planning_subtask: str | None = None,
     ) -> None:
         super().__init__()
         self.device = torch.device(device)
@@ -81,6 +83,10 @@ class JEPAWMDroidBackend(nn.Module):
         os.environ["JEPAWM_OSSCKPT"] = str(self.dinov3_checkpoint.parent.parent)
 
         planning = OmegaConf.load(self.official_planning_config)
+        if planning_tag is not None:
+            planning.tag = planning_tag
+        if planning_subtask is not None:
+            planning.task_specification.env.subtask = planning_subtask
         self.official_planning_template = planning
         data_config = OmegaConf.to_container(planning.model_kwargs.data, resolve=True)
         augmentation_config = OmegaConf.to_container(planning.model_kwargs.data_aug, resolve=True)

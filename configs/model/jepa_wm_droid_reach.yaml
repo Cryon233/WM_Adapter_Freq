@@ -8,8 +8,8 @@ third_party_root: third_party
 jepa_checkpoint: ${oc.env:JEPA_WM_DROID_CKPT,''}
 dinov3_checkpoint: ${oc.env:DINOV3_VITL16_CKPT,''}
 official_planning_config: third_party/jepa-wms/configs/evals/simu_env_planning/rcasa_custom/jepa-wm/place_L2_cem_sourcedset_H3_nas1_maxnorm005_scaleact_repeat5_fskip5_max60_ctxt2.yaml
-planning_tag: online_gc_zeroshot/place_L2_cem_sourcedset_H3_nas1_maxnorm005_scaleact_repeat5_fskip5_max60_ctxt2_r256_alpha0_ep32_decode/epoch-315-plan-only
-planning_subtask: place
+planning_tag: online_gc_zeroshot/reach_L2_cem_sourcedset_H3_nas1_maxnorm005_scaleact_repeat5_fskip5_max60_ctxt2_r256_alpha0_ep32_decode/epoch-315-plan-only
+planning_subtask: reach
 upstream_commits:
   jepa-wms: 13cf1d9c7e476f53c17714d2e0f1dc239a883ce0
   dinov3: 6876159a11b4df116f30f667f8c9888617df0751

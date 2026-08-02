@@ -65,28 +65,55 @@ class SequenceStableAdaptiveDCTAdapter(PEFTMethod):
         rank: int = 8,
         mask_scale: float = 0.5,
         eps: float = 1.0e-6,
+        temporal_pool: str = "mean",
+        mask_type: str = "adaptive",
+        use_rms_norm: bool = True,
     ) -> None:
         super().__init__()
         if embed_dim <= 0 or rank <= 0:
             raise ValueError(f"embed_dim and rank must be positive, received {embed_dim}, {rank}")
+        if temporal_pool not in {"mean", "none"}:
+            raise ValueError(
+                f"temporal_pool must be 'mean' or 'none', received {temporal_pool!r}"
+            )
+        if mask_type not in {"adaptive", "static_low_rank"}:
+            raise ValueError(
+                "mask_type must be 'adaptive' or 'static_low_rank', "
+                f"received {mask_type!r}"
+            )
         self.embed_dim = embed_dim
         self.grid_height = grid_height
         self.grid_width = grid_width
         self.rank = rank
         self.mask_scale = mask_scale
         self.eps = eps
+        self.temporal_pool = temporal_pool
+        self.mask_type = mask_type
+        self.use_rms_norm = use_rms_norm
         self.dct = OrthoDCT2d(grid_height, grid_width)
-        self.router = nn.Sequential(
-            nn.Conv2d(embed_dim, rank, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(rank, rank, kernel_size=3, padding=1, groups=rank),
-            nn.Conv2d(rank, embed_dim, kernel_size=1),
-        )
-        output = self.router[-1]
-        if not isinstance(output, nn.Conv2d):
-            raise TypeError(f"Expected final router module to be Conv2d, found {type(output).__name__}")
-        nn.init.zeros_(output.weight)
-        nn.init.zeros_(output.bias)
+        if mask_type == "adaptive":
+            self.router: nn.Sequential | None = nn.Sequential(
+                nn.Conv2d(embed_dim, rank, kernel_size=1),
+                nn.GELU(),
+                nn.Conv2d(rank, rank, kernel_size=3, padding=1, groups=rank),
+                nn.Conv2d(rank, embed_dim, kernel_size=1),
+            )
+            output = self.router[-1]
+            if not isinstance(output, nn.Conv2d):
+                raise TypeError(
+                    f"Expected final router module to be Conv2d, found {type(output).__name__}"
+                )
+            nn.init.zeros_(output.weight)
+            nn.init.zeros_(output.bias)
+            self.register_parameter("channel_factor", None)
+            self.register_parameter("frequency_factor", None)
+        else:
+            self.router = None
+            self.channel_factor = nn.Parameter(torch.empty(embed_dim, rank))
+            self.frequency_factor = nn.Parameter(
+                torch.zeros(rank, grid_height, grid_width)
+            )
+            nn.init.kaiming_uniform_(self.channel_factor, a=math.sqrt(5))
 
     def apply_patch_tokens(self, patch_tokens: Tensor) -> Tensor:
         if patch_tokens.ndim != 4:
@@ -101,17 +128,45 @@ class SequenceStableAdaptiveDCTAdapter(PEFTMethod):
         spatial = patch_tokens.reshape(batch * time, patches, dimension).transpose(1, 2)
         spatial = spatial.reshape(batch * time, dimension, self.grid_height, self.grid_width)
         coefficients = self.dct(spatial)
-        rms = torch.sqrt(coefficients.float().square().mean(dim=(-2, -1), keepdim=True) + self.eps)
-        normalized = coefficients.float() / rms
-        frame_logits = self.router(normalized.to(dtype=next(self.router.parameters()).dtype))
-        frame_logits = frame_logits.float().reshape(
-            batch, time, dimension, self.grid_height, self.grid_width
-        )
-        sequence_logits = frame_logits.mean(dim=1, keepdim=True)
-        mask = 1.0 + self.mask_scale * torch.tanh(sequence_logits)
         coefficient_grid = coefficients.float().reshape(
             batch, time, dimension, self.grid_height, self.grid_width
         )
+        if self.mask_type == "adaptive":
+            if self.router is None:
+                raise RuntimeError("Adaptive DCT adapter has no router")
+            router_input = coefficients.float()
+            if self.use_rms_norm:
+                rms = torch.sqrt(
+                    router_input.square().mean(dim=(-2, -1), keepdim=True) + self.eps
+                )
+                router_input = router_input / rms
+            frame_logits = self.router(
+                router_input.to(dtype=next(self.router.parameters()).dtype)
+            )
+            frame_logits = frame_logits.float().reshape(
+                batch, time, dimension, self.grid_height, self.grid_width
+            )
+            logits = (
+                frame_logits.mean(dim=1, keepdim=True)
+                if self.temporal_pool == "mean"
+                else frame_logits
+            )
+        else:
+            if self.channel_factor is None or self.frequency_factor is None:
+                raise RuntimeError("Static low-rank DCT adapter factors are unavailable")
+            static_logits = torch.einsum(
+                "dr,rhw->dhw",
+                self.channel_factor.float(),
+                self.frequency_factor.float(),
+            )
+            logits = static_logits.reshape(
+                1,
+                1,
+                dimension,
+                self.grid_height,
+                self.grid_width,
+            )
+        mask = 1.0 + self.mask_scale * torch.tanh(logits)
         delta_coefficients = coefficient_grid * (mask - 1.0)
         # Inverse-transform only the learned frequency delta so zero initialization is exactly identity.
         delta = self.dct.inverse(
@@ -130,7 +185,7 @@ class SequenceStableAdaptiveDCTAdapter(PEFTMethod):
         return self.apply_patch_tokens(patch_tokens)
 
     def config_dict(self) -> dict[str, Any]:
-        return {
+        config = {
             "embed_dim": self.embed_dim,
             "grid_height": self.grid_height,
             "grid_width": self.grid_width,
@@ -138,3 +193,10 @@ class SequenceStableAdaptiveDCTAdapter(PEFTMethod):
             "mask_scale": self.mask_scale,
             "eps": self.eps,
         }
+        if self.temporal_pool != "mean":
+            config["temporal_pool"] = self.temporal_pool
+        if self.mask_type != "adaptive":
+            config["mask_type"] = self.mask_type
+        if not self.use_rms_norm:
+            config["use_rms_norm"] = False
+        return config

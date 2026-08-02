@@ -38,6 +38,9 @@ def build_method(
             rank=int(values["rank"]),
             mask_scale=float(values["mask_scale"]),
             eps=float(values["eps"]),
+            temporal_pool=str(values.get("temporal_pool", "mean")),
+            mask_type=str(values.get("mask_type", "adaptive")),
+            use_rms_norm=bool(values.get("use_rms_norm", True)),
         )
     elif method_name == "token_mlp":
         method = TokenMLPAdapter(embed_dim=backend.token_dim, rank=int(values["rank"]))

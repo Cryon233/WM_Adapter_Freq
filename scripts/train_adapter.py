@@ -21,6 +21,8 @@ def _backend(cfg: Any) -> JEPAWMDroidBackend:
         dinov3_checkpoint=cfg.model.dinov3_checkpoint,
         official_planning_config=cfg.model.official_planning_config,
         device=cfg.device,
+        planning_tag=cfg.model.get("planning_tag"),
+        planning_subtask=cfg.model.get("planning_subtask"),
     )
 
 
@@ -36,7 +38,8 @@ def main() -> None:
             f"Unsupported appearance pipeline version: {cfg.appearance.pipeline_version}"
         )
     appearance_metadata = ComposedPhotometricShift.metadata(
-        float(cfg.appearance.severity), int(cfg.appearance.training_seed)
+        float(cfg.appearance.get("training_severity", cfg.appearance.severity)),
+        int(cfg.appearance.training_seed),
     )
     dataset = FeatureCacheDataset(
         resolve_path(cfg.paths.feature_cache),
@@ -65,6 +68,8 @@ def main() -> None:
         precision=str(cfg.training.precision),
         num_workers=int(cfg.training.num_workers),
         seed=int(cfg.training.seed),
+        canonical_weight=float(cfg.training.get("canonical_weight", 1.0)),
+        dynamics_weight=float(cfg.training.get("dynamics_weight", 1.0)),
     )
     metadata = dict(dataset.metadata)
     metadata["appearance_metadata"] = json.loads(str(metadata["appearance_metadata"]))
@@ -75,11 +80,12 @@ def main() -> None:
         device=cfg.device,
     )
     print(f"Trainable parameters: method={method.method_name}, count={method.parameter_count()}")
-    trainer.fit(
+    final_losses = trainer.fit(
         loader,
         checkpoint_path=resolve_path(cfg.paths.method_checkpoint),
         cache_metadata=metadata,
     )
+    print(f"TRAINING_COMPLETE final_losses={json.dumps(final_losses, sort_keys=True)}")
 
 
 if __name__ == "__main__":

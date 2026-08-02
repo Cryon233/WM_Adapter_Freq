@@ -36,6 +36,8 @@ def _backend(cfg: Any) -> JEPAWMDroidBackend:
         dinov3_checkpoint=cfg.model.dinov3_checkpoint,
         official_planning_config=cfg.model.official_planning_config,
         device=cfg.device,
+        planning_tag=cfg.model.get("planning_tag"),
+        planning_subtask=cfg.model.get("planning_subtask"),
     )
 
 
@@ -179,7 +181,9 @@ def main() -> None:
         num_frames=int(cfg.data.num_frames),
         frameskip=int(cfg.data.frameskip),
         appearance_seed=int(cfg.appearance.training_seed),
-        appearance_severity=float(cfg.appearance.severity),
+        appearance_severity=float(
+            cfg.appearance.get("training_severity", cfg.appearance.severity)
+        ),
     )
     loader = DataLoader(
         windows,
@@ -199,7 +203,8 @@ def main() -> None:
     first_encoded = _encoded_batch(first_batch, clean_prefix, ood_prefix, clean_latent)
     layout = backend.token_layout
     appearance_metadata = ComposedPhotometricShift.metadata(
-        float(cfg.appearance.severity), int(cfg.appearance.training_seed)
+        float(cfg.appearance.get("training_severity", cfg.appearance.severity)),
+        int(cfg.appearance.training_seed),
     )
     preprocessing_metadata = {
         "implementation": "jepa-wms.app.plan_common.datasets.transforms.make_transforms",

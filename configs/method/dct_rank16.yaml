@@ -1,0 +1,4 @@
+name: dct_adapter
+rank: 16
+mask_scale: 0.5
+eps: 1.0e-6

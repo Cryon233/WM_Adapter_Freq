@@ -1,0 +1,81 @@
+protocol: protocol_v2
+state_path: logs/paper_suite/state.json
+log_root: logs/paper_suite/jobs
+analysis_root: outputs/paper_suite/analysis
+formal_cache: storage/feature_cache/jepa_wm_droid_robocasa_pilot.h5
+formal_checkpoints:
+  dct_adapter: checkpoints/jepa_wm_droid/robocasa/dct_adapter_final.pt
+  token_mlp: checkpoints/jepa_wm_droid/robocasa/token_mlp_final.pt
+  lora: checkpoints/jepa_wm_droid/robocasa/lora_final.pt
+tasks:
+  reach: configs/experiment/robocasa_reach.yaml
+  reach-pick: configs/experiment/robocasa_reach_pick.yaml
+  place: configs/experiment/robocasa_place.yaml
+  reach-pick-place: configs/experiment/robocasa_reach_pick_place.yaml
+methods: [base, dct_adapter, token_mlp, lora]
+domains: [clean, ood]
+main:
+  episodes: 32
+  seed: 42
+multiseed:
+  tasks: [place, reach-pick-place]
+  methods: [base, dct_adapter]
+  domains: [clean, ood]
+  seeds: [7, 42, 2026]
+  episodes: 32
+severity:
+  tasks: [place, reach-pick-place]
+  methods: [base, dct_adapter]
+  values: [0.5, 1.0, 1.5]
+  episodes: 20
+  seed: 42
+dct_ablations:
+  full:
+    method_config: configs/method/dct_adapter.yaml
+    canonical_weight: 1.0
+    dynamics_weight: 1.0
+    checkpoint: checkpoints/jepa_wm_droid/robocasa/dct_adapter_final.pt
+  framewise_mask:
+    method_config: configs/method/dct_framewise_mask.yaml
+    canonical_weight: 1.0
+    dynamics_weight: 1.0
+  static_low_rank_mask:
+    method_config: configs/method/dct_static_low_rank_mask.yaml
+    canonical_weight: 1.0
+    dynamics_weight: 1.0
+  no_rms_norm:
+    method_config: configs/method/dct_no_rms_norm.yaml
+    canonical_weight: 1.0
+    dynamics_weight: 1.0
+  canonical_only:
+    method_config: configs/method/dct_adapter.yaml
+    canonical_weight: 1.0
+    dynamics_weight: 0.0
+  dynamics_only:
+    method_config: configs/method/dct_adapter.yaml
+    canonical_weight: 0.0
+    dynamics_weight: 1.0
+  rank2:
+    method_config: configs/method/dct_rank2.yaml
+    canonical_weight: 1.0
+    dynamics_weight: 1.0
+  rank4:
+    method_config: configs/method/dct_rank4.yaml
+    canonical_weight: 1.0
+    dynamics_weight: 1.0
+  rank8:
+    method_config: configs/method/dct_adapter.yaml
+    canonical_weight: 1.0
+    dynamics_weight: 1.0
+    checkpoint: checkpoints/jepa_wm_droid/robocasa/dct_adapter_final.pt
+  rank16:
+    method_config: configs/method/dct_rank16.yaml
+    canonical_weight: 1.0
+    dynamics_weight: 1.0
+closed_loop_ablations: [full, framewise_mask, static_low_rank_mask, canonical_only]
+ablation_tasks: [place, reach-pick-place]
+ablation_episodes: 20
+offline:
+  windows: 32
+  seed: 42
+  bootstrap_samples: 10000

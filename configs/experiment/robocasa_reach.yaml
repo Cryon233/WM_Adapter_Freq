@@ -1,26 +1,20 @@
-model_config: configs/model/jepa_wm_droid.yaml
-method_configs:
+model_config: configs/model/jepa_wm_droid_reach.yaml
+method_configs: &methods
   base: configs/method/base.yaml
   dct_adapter: configs/method/dct_adapter.yaml
   token_mlp: configs/method/token_mlp.yaml
   lora: configs/method/lora.yaml
-
 method: dct_adapter
 domain: ood
 device: cuda
 suite_mode: formal
-
-suite:
-  family: pilot
-  variant: full
-
+suite: {family: main, variant: full}
 paths:
   dataset_root: ${oc.env:JEPAWM_DSET,''}
   robocasa_hdf5: ${oc.env:JEPAWM_ROBOCASA_HDF5,''}
   feature_cache: storage/feature_cache/jepa_wm_droid_robocasa_pilot.h5
   method_checkpoint: checkpoints/jepa_wm_droid/robocasa/${method}_final.pt
-
-data:
+data: &data
   task_name: PnPCounterTop
   camera_view: robot0_leftview
   num_frames: 4
@@ -30,20 +24,15 @@ data:
   train_fraction: 0.8
   split_seed: 42
   window_seed: 42
-
-appearance:
+appearance: &appearance
   name: composed_photometric
   pipeline_version: composed_photometric_v1
   training_severity: 1.0
   severity: 1.0
   training_seed: 42
   seed: 2026
-
-cache:
-  encoder_batch_size: 4
-  num_workers: 4
-
-training:
+cache: {encoder_batch_size: 4, num_workers: 4}
+training: &training
   epochs: 20
   batch_size: 4
   gradient_accumulation: 8
@@ -55,32 +44,14 @@ training:
   seed: 42
   canonical_weight: 1.0
   dynamics_weight: 1.0
-
-planning:
-  task_slug: place
+planning: &planning
+  task_slug: reach
   history_len: 3
   candidate_chunk_size: 300
   inference_precision: bf16
   compile_predictor: true
   allow_tf32: true
-  self_test:
-    iterations: 1
-    num_samples: 8
-    num_elites: 2
-    horizon: 1
-    max_episode_steps: 5
-
-offline:
-  num_frames: 6
-  num_windows: 32
-  batch_size: 1
-  num_workers: 2
-  output_directory: outputs/offline/jepa_wm_droid/robocasa/place/dct_adapter
-
-evaluation:
-  num_episodes: 50
-  eval_seed: 42
-  tqdm_silent: false
-
-output:
-  root_dir: outputs
+  self_test: {iterations: 1, num_samples: 8, num_elites: 2, horizon: 1, max_episode_steps: 5}
+offline: {num_frames: 6, num_windows: 32, batch_size: 1, num_workers: 2, output_directory: outputs/offline/jepa_wm_droid/robocasa/reach/dct_adapter}
+evaluation: {num_episodes: 32, eval_seed: 42, tqdm_silent: false}
+output: {root_dir: outputs}

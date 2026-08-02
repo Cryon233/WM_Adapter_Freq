@@ -110,7 +110,7 @@ prefix 数量不是写死的：运行时以实际 token 总数减去 patch grid 
 
 `composed_photometric` 只改变未 normalization 的 RGB：brightness、contrast、gamma、RGB channel gain 和 smooth low-frequency illumination field。同一窗口四帧共享同一个完整 spec，随后才执行官方 resize/normalization。规划时只对 current observation 应用固定 seed 2026 的 spec，goal image保持 clean。
 
-Cache 使用 fp16 feature、按 window 分块、LZF compression、临时文件原子替换与 finalized marker：
+Cache 的 final latent 使用 fp16；pre-final prefix token 保持 float32，因为官方 DINOv3 prefix 的实际数值可能超过 fp16 有限范围。所有 dataset 均按 window 分块，并使用 LZF compression、临时文件原子替换与 finalized marker；论文套件直接复用这一既有 schema：
 
 | dataset | shape |
 | --- | --- |
@@ -169,7 +169,7 @@ checkpoints/jepa_wm_droid/robocasa/
 
 Protocol 2.0 中，current observation 使用三帧左填充 history：第一步为 `[x0,x0,x0]`，第二步为 `[x0,x0,x1]`，随后始终使用 `[x_{t-2},x_{t-1},x_t]`。goal 使用单张 clean image 独立编码，不进入 current history；Base、Token MLP、LoRA 和 DCT Adapter 共享完全相同的 history。
 
-官方 CEM 预算保持 `horizon=3`、`num_samples=300`、`iterations=15`、`top-k/num_elites=10`。16 GB 显存下 `planning.candidate_chunk_size=16` 只分块计算 candidate rollout cost，汇总全部 300 个 cost 后仍由官方 CEM 做全局 top-k；不会减少候选数、horizon 或 iterations。四种方法使用完全相同的 chunk size 和随机种子。
+官方 CEM 预算保持 `horizon=3`、`num_samples=300`、`iterations=15`、`top-k/num_elites=10`。正式配置使用 `planning.candidate_chunk_size=300` 一次处理完整候选集；该字段只控制 rollout cost 的执行分块，不改变候选顺序、全局 top-k、horizon 或 iterations。四种方法使用完全相同的候选规模和随机种子。
 
 八组运行命令：
 
@@ -256,3 +256,41 @@ bash scripts/publish_and_sync.sh "描述本次修改的 commit message"
 ```
 
 部署端只执行当前 branch 的 `git fetch`、`git reset --hard origin/<branch>` 和第三方 patch 应用，不会重建 feature cache、重新训练或启动 planning。`storage/`、RoboCasa assets、`outputs/`、`checkpoints/`、feature cache 与训练 checkpoint 均不上传 GitHub，也不会被部署流程清理。当前依赖使用 editable install，纯 Python 源码更新后无需重新执行 `pip install`。
+
+## ICRA 2027 完整实验套件
+
+论文套件固定使用 `protocol_v2`，保留并复用已完成的 place/seed-42 正式结果，不会覆盖它们。四任务配置由同一份官方 place planning YAML 派生，只改变 `tag` 与 `task_specification.env.subtask`：`reach`、`reach-pick`、`place` 和 `reach-pick-place`。正式运行前会硬性核对 CEM 为 15 iterations、300 samples、10 elites、horizon 3、`num_act_stepped=1`，以及 60 个环境步骤；只有隔离 self-test 配置允许 1/8/2、horizon 1 和 5 个环境步骤。
+
+用户只运行三个入口：
+
+```bash
+cd /data/users/zhaoyanghe/control-frequency-wm && bash scripts/test_full_pipeline.sh
+cd /data/users/zhaoyanghe/control-frequency-wm && bash scripts/run_all_paper_experiments.sh
+cd /data/users/zhaoyanghe/control-frequency-wm && bash scripts/watch_all_paper_experiments.sh
+```
+
+三个 wrapper 默认激活 `wm-a100`。自检不是 mock 或 import-only 检查：它使用真实 JEPA-WM、DINOv3、RoboCasa HDF5、assets 和 CUDA，在 `storage/self_test/`、`checkpoints/self_test/`、`outputs/self_test/`、`logs/self_test/` 中依次构建 16-window cache，训练三个方法各一 epoch，运行四方法 clean/OOD 离线评测与八个最小 place planning job，最后调用正式分析器。任一资源缺失或任一路径失败都会写入 `outputs/self_test/self_test_report.{json,md}` 并返回非零；它不会使用假数据或静默 fallback。开始自检时只会清理上述四个 `self_test` 目录。
+
+正式 runner 自动完成资源/commit preflight、共享 2,000-window cache、三种正式 PEFT checkpoint、十项 DCT 离线消融、四任务主表、多 seed、severity、关键闭环消融与统计分析。它从 `GPUS`（默认 `0,1,2,3`）分配空闲 GPU，每张卡最多一个重任务；失败后停止提交新任务、等待已启动任务结束并返回非零。重新运行同一命令会验证并复用完整 artifact；复用结果在分析表中记录源路径和 SHA256。未完成或损坏的 planning/offline JSON 会先按 SHA 保留为 `*.incomplete-<sha>.json`，再从该 job 起点重跑，有效结果从不覆盖。
+
+DCT 消融由同一个 `SequenceStableAdaptiveDCTAdapter` 提供：`temporal_pool=mean|none`、`mask_type=adaptive|static_low_rank` 和 `use_rms_norm`。默认参数不会改变既有 checkpoint 的 method metadata；static low-rank mask 使用 `[D,rank]` 与 `[rank,H,W]` 因子，频率因子零初始化以保持严格 identity。训练目标权重 `canonical_weight`、`dynamics_weight` 默认均为 1，禁止同时为 0。
+
+OOD severity 中 `appearance.training_severity=1.0` 始终描述 checkpoint/cache 的训练域，`appearance.severity` 独立描述评估域，因此 0.5、1.0、1.5 不会改变 checkpoint 绑定。正式输出位于 `outputs/jepa_wm_droid/robocasa/protocol_v2/` 与 `outputs/paper_suite/protocol_v2/`；论文产物为：
+
+```text
+outputs/paper_suite/analysis/
+├── main_results.csv
+├── main_results.md
+├── main_results.tex
+├── multiseed.csv
+├── severity.csv
+├── ablations.csv
+├── offline_metrics.csv
+├── efficiency.csv
+├── statistics.json
+└── paper_summary.md
+```
+
+统计器生成 Wilson 95% CI、10,000 次 paired bootstrap、exact McNemar、Holm 校正和多 seed mean/std。任何需要配对的记录若 environment/episode identity 不一致会立即拒绝统计。调度状态原子写入 `logs/paper_suite/state.json`；监控器显示 phase、job/GPU/PID、训练 loss、离线窗口进度、planning episode/step/success/CEM 和日志心跳。
+
+本机若没有 `wm-a100`、CUDA、checkpoint、HDF5 或 RoboCasa assets，只应提交代码到服务器，不应运行 `test_full_pipeline.sh`。上传服务器、设置前述四个资源环境变量并应用固定上游 patch 后，先运行真实自检；只有它退出码为 0 后再启动正式 runner。

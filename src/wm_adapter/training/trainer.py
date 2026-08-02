@@ -28,6 +28,8 @@ class TrainingConfig:
     precision: str
     num_workers: int
     seed: int
+    canonical_weight: float = 1.0
+    dynamics_weight: float = 1.0
 
 
 class AdapterTrainer:
@@ -45,6 +47,10 @@ class AdapterTrainer:
         self.method = method
         self.config = config
         self.device = torch.device(device)
+        if config.canonical_weight < 0.0 or config.dynamics_weight < 0.0:
+            raise ValueError("canonical_weight and dynamics_weight must be non-negative")
+        if config.canonical_weight == 0.0 and config.dynamics_weight == 0.0:
+            raise ValueError("canonical_weight and dynamics_weight cannot both be zero")
         self.method.to(self.device)
         self.backend.eval()
         trainable = list(self.method.trainable_parameters())
@@ -125,7 +131,11 @@ class AdapterTrainer:
         predicted = self.backend.predict(context, actions[:, :3])
         dynamics_target = torch.cat((clean_context[:, 1:], clean_future), dim=1)
         dynamics = F.mse_loss(predicted, dynamics_target)
-        return canonical + dynamics, canonical, dynamics
+        total = (
+            self.config.canonical_weight * canonical
+            + self.config.dynamics_weight * dynamics
+        )
+        return total, canonical, dynamics
 
     def fit(
         self,
@@ -133,12 +143,13 @@ class AdapterTrainer:
         *,
         checkpoint_path: str | Path,
         cache_metadata: dict[str, Any],
-    ) -> None:
+    ) -> dict[str, float]:
         first_batch = next(iter(loader))
         self._identity_invariant(first_batch)
         self.method.train()
         self.backend.eval()
         self.optimizer.zero_grad(set_to_none=True)
+        final_losses: dict[str, float] | None = None
         for epoch in range(self.config.epochs):
             total_sum = 0.0
             canonical_sum = 0.0
@@ -178,6 +189,15 @@ class AdapterTrainer:
                 f"epoch={epoch + 1} total={total_sum / batches:.6f} "
                 f"canonical={canonical_sum / batches:.6f} dynamics={dynamics_sum / batches:.6f}"
             )
+            final_losses = {
+                "total": total_sum / batches,
+                "canonical": canonical_sum / batches,
+                "dynamics": dynamics_sum / batches,
+            }
+        if final_losses is None or not all(
+            torch.isfinite(torch.tensor(value)) for value in final_losses.values()
+        ):
+            raise RuntimeError(f"Training produced invalid final losses: {final_losses}")
         payload = {
             "method_name": self.method.method_name,
             "peft_state_dict": self.method.state_dict_for_checkpoint(),
@@ -191,3 +211,4 @@ class AdapterTrainer:
             "training_config": asdict(self.config),
         }
         atomic_torch_save(payload, checkpoint_path)
+        return final_losses

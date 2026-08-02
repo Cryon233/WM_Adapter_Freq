@@ -24,6 +24,8 @@ def _backend(cfg: Any) -> JEPAWMDroidBackend:
         dinov3_checkpoint=cfg.model.dinov3_checkpoint,
         official_planning_config=cfg.model.official_planning_config,
         device=cfg.device,
+        planning_tag=cfg.model.get("planning_tag"),
+        planning_subtask=cfg.model.get("planning_subtask"),
     )
 
 
@@ -37,7 +39,8 @@ def main() -> None:
     backend = _backend(cfg)
     method = build_method(method_name, backend, cfg.method_config).to(backend.device)
     training_appearance = ComposedPhotometricShift.metadata(
-        float(cfg.appearance.severity), int(cfg.appearance.training_seed)
+        float(cfg.appearance.get("training_severity", cfg.appearance.severity)),
+        int(cfg.appearance.training_seed),
     )
     checkpoint_fingerprint: str | None = None
     cache_fingerprint: str | None = None
@@ -76,21 +79,34 @@ def main() -> None:
     )
     task = str(cfg.planning.task_slug)
     seed = int(cfg.evaluation.eval_seed)
+    configured_run_directory = cfg.output.get("run_directory")
     output_directory = (
-        resolve_path(cfg.output.root_dir)
-        / "jepa_wm_droid"
-        / "robocasa"
-        / EVALUATION_PROTOCOL_DIRECTORY
-        / task
-        / f"seed_{seed}"
-        / method_name
-        / domain
+        resolve_path(configured_run_directory)
+        if configured_run_directory
+        else (
+            resolve_path(cfg.output.root_dir)
+            / "jepa_wm_droid"
+            / "robocasa"
+            / EVALUATION_PROTOCOL_DIRECTORY
+            / task
+            / f"seed_{seed}"
+            / method_name
+            / domain
+        )
     )
+    result_path = output_directory / "results.json"
+    if configured_run_directory and result_path.exists():
+        raise FileExistsError(
+            f"Suite planning result already exists and will not be overwritten: {result_path}"
+        )
     result = run_robocasa_planning(
         experiment_config=cfg,
         backend=backend,
         method=method,
         output_directory=output_directory,
+    )
+    suite_metadata = (
+        OmegaConf.to_container(cfg.suite, resolve=True) if "suite" in cfg else {}
     )
     metadata = {
         "backend": "jepa_wm_droid",
@@ -106,6 +122,7 @@ def main() -> None:
         "upstream_commits": backend.upstream_commits,
         "training_appearance": training_appearance,
         "planning_history_len": int(cfg.planning.history_len),
+        "suite": suite_metadata,
         "planning_inference": {
             "precision": str(cfg.planning.inference_precision),
             "allow_tf32": bool(cfg.planning.allow_tf32),
@@ -122,8 +139,8 @@ def main() -> None:
         },
         "config": OmegaConf.to_container(cfg, resolve=True),
     }
-    save_planning_results(output_directory / "results.json", result, metadata)
-    print(f"Planning results written: {output_directory / 'results.json'}")
+    save_planning_results(result_path, result, metadata)
+    print(f"Planning results written: {result_path}")
 
 
 if __name__ == "__main__":

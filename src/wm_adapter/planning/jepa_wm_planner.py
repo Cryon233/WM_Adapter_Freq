@@ -256,6 +256,41 @@ def run_robocasa_planning(
     official_cfg.logging.tqdm_silent = bool(experiment_config.evaluation.tqdm_silent)
     official_cfg.planner.decode_each_iteration = False
     official_cfg.planner.candidate_chunk_size = int(experiment_config.planning.candidate_chunk_size)
+    suite_mode = str(experiment_config.get("suite_mode", "formal"))
+    if suite_mode == "self_test":
+        self_test = experiment_config.planning.self_test
+        official_cfg.planner.iterations = int(self_test.iterations)
+        official_cfg.planner.num_samples = int(self_test.num_samples)
+        official_cfg.planner.num_elites = int(self_test.num_elites)
+        official_cfg.planner.horizon = int(self_test.horizon)
+        official_cfg.task_specification.max_episode_steps = int(
+            self_test.max_episode_steps
+        )
+    elif suite_mode != "formal":
+        raise ValueError(
+            f"suite_mode must be 'formal' or 'self_test', received {suite_mode!r}"
+        )
+    if suite_mode == "formal":
+        required_planner_values = {
+            "iterations": 15,
+            "num_samples": 300,
+            "num_elites": 10,
+            "horizon": 3,
+            "num_act_stepped": 1,
+        }
+        actual_planner_values = {
+            key: int(official_cfg.planner[key]) for key in required_planner_values
+        }
+        if actual_planner_values != required_planner_values:
+            raise RuntimeError(
+                "Formal RoboCasa planning budget changed: "
+                f"expected={required_planner_values}, actual={actual_planner_values}"
+            )
+        if int(official_cfg.task_specification.max_episode_steps) != 60:
+            raise RuntimeError(
+                "Formal RoboCasa max_episode_steps must remain 60, found "
+                f"{official_cfg.task_specification.max_episode_steps}"
+            )
     official_cfg = parse_cfg(official_cfg)
     official_cfg.rank = 0
     official_cfg.world_size = 1

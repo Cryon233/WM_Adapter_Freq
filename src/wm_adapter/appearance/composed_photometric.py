@@ -49,8 +49,8 @@ class ComposedPhotometricShift:
         }
 
     def sample_spec(self, seed: int, severity: float) -> AppearanceShiftSpec:
-        if not 0.0 <= severity <= 1.0:
-            raise ValueError(f"Appearance severity must be in [0,1], received {severity}")
+        if not 0.0 <= severity <= 1.5:
+            raise ValueError(f"Appearance severity must be in [0,1.5], received {severity}")
         generator = np.random.default_rng(seed)
         brightness = float(1.0 + severity * generator.uniform(-0.25, 0.25))
         contrast = float(1.0 + severity * generator.uniform(-0.30, 0.30))
