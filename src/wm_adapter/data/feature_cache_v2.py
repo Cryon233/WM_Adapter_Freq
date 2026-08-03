@@ -81,6 +81,11 @@ class FeatureCacheV2Writer:
         self.file.attrs["schema_version"] = CACHE_SCHEMA_VERSION_V2
         self.file.attrs["finalized"] = False
         for key, value in metadata.items():
+            # HDF5 has no native representation for Python None.  Optional task
+            # metadata is therefore represented by an absent attribute; readers
+            # already normalize an absent attribute to None for contract checks.
+            if value is None:
+                continue
             self.file.attrs[key] = _json(value) if isinstance(value, (dict, list, tuple)) else value
         self.count = 0
         self._content_hashers = {

@@ -354,6 +354,40 @@ class CrossBenchmarkContractTest(unittest.TestCase):
                 )
             self.assertNotEqual(*fingerprints)
 
+            optional_metadata = _cache_metadata()
+            optional_metadata["dataset_revision"] = None
+            optional_path = Path(directory) / "optional-metadata.h5"
+            writer = FeatureCacheV2Writer(optional_path, optional_metadata)
+            writer.append(_cache_batch(2.5))
+            writer.finalize()
+            with h5py.File(optional_path, "r") as handle:
+                self.assertNotIn("dataset_revision", handle.attrs)
+            validate_cache_v2(
+                optional_path,
+                1,
+                benchmark="libero",
+                task="libero_goal_0",
+                expected_task_manifest_sha256="manifest",
+                expected_dataset_sha256="dataset",
+                expected_camera_key="agentview_rgb",
+                expected_task_upstream_commits={"libero": "commit"},
+                expected_dataset_format="hdf5",
+                expected_dataset_source_identifier="official",
+                expected_dataset_revision=None,
+                expected_robot="robot",
+                expected_gripper="gripper",
+                expected_controller_contract={"type": "OSC_POSE"},
+                expected_action_transform=_transform().as_dict(),
+                expected_camera_contract={
+                    "camera_height": 128,
+                    "camera_width": 160,
+                    "camera_channel_order": "RGB",
+                    "camera_vertical_flip": True,
+                },
+                expected_base_checkpoint_sha256="base",
+                expected_dinov3_checkpoint_sha256="dino",
+            )
+
             missing_metadata = Path(directory) / "missing-metadata.h5"
             writer = FeatureCacheV2Writer(missing_metadata, _cache_metadata())
             writer.append(_cache_batch(3.0))
