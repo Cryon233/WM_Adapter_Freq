@@ -317,8 +317,6 @@ class RoboCasaWrapper(gym.Wrapper):
                 elif hasattr(self.env, "set_ep_meta"):
                     self.env.set_ep_meta(ep_meta)
 
-            obs, info = self.reset()
-
             logger.info("Resetting from provided model XML")
             xml = _prepare_xml(self.env, model_xml)
             xml = path_change(xml)
@@ -334,7 +332,7 @@ class RoboCasaWrapper(gym.Wrapper):
             self.env.sim.reset()
             logger.info("Finished resetting from provided model XML")
         else:
-            obs, info = self.reset()
+            self.reset()
 
         flattened_init_state = np.asarray(init_state).reshape(-1)
         model = self.env.sim.model
@@ -370,9 +368,14 @@ class RoboCasaWrapper(gym.Wrapper):
             self.env.update_state()
 
         if hasattr(self.env, "_get_observation"):
-            obs = self.env._get_observation()
+            current_info = self.env._get_observation()
         elif hasattr(self.env, "_get_observations"):
-            obs = self.env._get_observations(force_update=True)
+            current_info = self.env._get_observations(force_update=True)
+        else:
+            raise RuntimeError(
+                "RoboCasa environment cannot provide observations after state restore"
+            )
+        obs, info = self.get_obs_proprio_succ_from_info(current_info)
 
         logger.info(f"robocasa env.prepare() took {time.time() - prep_start_time:.2f} seconds")
         return obs, info
