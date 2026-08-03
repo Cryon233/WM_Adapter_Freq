@@ -229,6 +229,9 @@ def _build_v1(cfg: Any) -> None:
         "dataset_format": resolved_task.dataset_format,
         "dataset_source_identifier": resolved_task.dataset_source_identifier,
         "dataset_revision": resolved_task.dataset_revision,
+        "dataset_format": resolved_task.dataset_format,
+        "dataset_source_identifier": resolved_task.dataset_source_identifier,
+        "dataset_revision": resolved_task.dataset_revision,
         "dataset_file_count": resolved_task.dataset_file_count,
         "robot": resolved_task.robot,
         "gripper": resolved_task.gripper,
@@ -240,6 +243,9 @@ def _build_v1(cfg: Any) -> None:
         "camera_vertical_flip": resolved_task.camera_vertical_flip,
         "action_convention": resolved_task.action_convention,
         "action_transform": resolved_task.action_transform,
+        "robot": resolved_task.robot,
+        "gripper": resolved_task.gripper,
+        "controller_contract": resolved_task.controller_contract,
         "source_trajectory_ids": list(
             resolved_task.selected_train_demonstrations
         ),
@@ -417,6 +423,11 @@ def _build_v2(cfg: Any) -> None:
     layout_images = next(iter(loader))["clean_images"][:1]
     _assert_split_encoder_parity(backend, layout_images)
     layout = backend.token_layout
+    if not resolved_task.dataset_sha256:
+        raise RuntimeError(
+            "V2 cache requires a task-resolution dataset fingerprint: "
+            f"task={resolved_task.task_key}, dataset={resolved_task.dataset_path}"
+        )
     metadata = {
         "backend": "jepa_wm_droid",
         "benchmark": resolved_task.benchmark,
@@ -425,7 +436,7 @@ def _build_v2(cfg: Any) -> None:
         "task_name": resolved_task.task_name,
         "task_key": resolved_task.task_key,
         "task_manifest_sha256": task_manifest["task_manifest_sha256"],
-        "dataset_sha256": resolved_task.dataset_sha256 or "directory_manifest",
+        "dataset_sha256": resolved_task.dataset_sha256,
         "base_checkpoint_sha256": backend.base_checkpoint_sha256,
         "dinov3_checkpoint_sha256": backend.dinov3_checkpoint_sha256,
         "upstream_commits": backend.upstream_commits,
@@ -442,6 +453,7 @@ def _build_v2(cfg: Any) -> None:
         "frameskip": int(cfg.data.frameskip),
         "action_convention": resolved_task.action_convention,
         "action_transform": resolved_task.action_transform,
+        "camera_key": resolved_task.camera_key,
         "camera_height": resolved_task.camera_height,
         "camera_width": resolved_task.camera_width,
         "camera_channel_order": resolved_task.camera_channel_order,
@@ -453,6 +465,7 @@ def _build_v2(cfg: Any) -> None:
             "channel_order": resolved_task.camera_channel_order,
             "vertical_flip": resolved_task.camera_vertical_flip,
         },
+        "task_upstream_commits": resolved_task.upstream_commits,
         "appearance_distribution": {
             "pipeline_version": str(cfg.appearance.pipeline_version),
             "seed_rule": "sha256(training_seed,episode_id,window_id)",

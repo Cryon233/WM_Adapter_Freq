@@ -214,6 +214,8 @@ class TrajectoryAdapterTrainer:
             elif hasattr(value, "item"):
                 value = value.item()
             data_metadata[key] = value
+        serialized_training_config = asdict(self.config)
+        serialized_training_config["betas"] = list(self.config.betas)
         payload = {
             "schema_version": CHECKPOINT_SCHEMA_V2,
             "method_name": self.method.method_name,
@@ -234,7 +236,7 @@ class TrajectoryAdapterTrainer:
             "goal_encoder": "frozen_base",
             "git_commit": git_commit,
             "git_dirty": git_dirty,
-            "training_config": asdict(self.config),
+            "training_config": serialized_training_config,
         }
         atomic_torch_save(payload, checkpoint_path)
         print(f"TRAIN_COMPLETE step={optimizer_step} total={self.config.max_optimizer_steps} loss={final['loss']:.8f} checkpoint={Path(checkpoint_path).resolve()}", flush=True)

@@ -20,6 +20,10 @@ from wm_adapter.appearance.composed_photometric import ComposedPhotometricShift
 from wm_adapter.backends.jepa_wm_droid import JEPAWMDroidBackend
 from wm_adapter.backends.frozen_projection import frozen_base_projection
 from wm_adapter.benchmarks.factory import build_benchmark
+from wm_adapter.experiments.cross_benchmark import (
+    training_contract_mismatches_v2,
+    training_contract_v2,
+)
 from wm_adapter.utils.checkpoints import load_method_checkpoint, sha256_file
 from wm_adapter.utils.reproducibility import (
     load_experiment_config,
@@ -125,16 +129,12 @@ def _load_method(
             f"Offline checkpoint training-contract mismatch: {training_mismatch}"
         )
     if checkpoint_v2:
-        expected_v2 = {
-            "loss_name": "unified_trajectory_mse",
-            "goal_encoder": "frozen_base",
-            "completed_optimizer_steps": int(cfg.training.max_optimizer_steps),
-        }
-        mismatch = {
-            key: {"expected": value, "actual": checkpoint.get(key)}
-            for key, value in expected_v2.items()
-            if checkpoint.get(key) != value
-        }
+        training_values = OmegaConf.to_container(cfg.training, resolve=True)
+        if not isinstance(training_values, dict):
+            raise TypeError("V2 offline training configuration is not a mapping")
+        mismatch = training_contract_mismatches_v2(
+            checkpoint, training_contract_v2(training_values)
+        )
         if mismatch:
             raise RuntimeError(f"Offline V2 checkpoint mismatch: {mismatch}")
     method.load_method_checkpoint(checkpoint["peft_state_dict"])
@@ -455,6 +455,7 @@ def main() -> None:
         "task_id": resolved_task.task_id,
         "task_name": resolved_task.task_name,
         "task_manifest_sha256": benchmark.task_manifest_sha256(resolved_task),
+        "dataset_sha256": resolved_task.dataset_sha256,
         "camera_key": resolved_task.camera_key,
         "camera_height": resolved_task.camera_height,
         "camera_width": resolved_task.camera_width,
@@ -490,6 +491,7 @@ def main() -> None:
         "base_checkpoint_sha256": backend.base_checkpoint_sha256,
         "dinov3_checkpoint_sha256": backend.dinov3_checkpoint_sha256,
         "upstream_commits": backend.upstream_commits,
+        "task_upstream_commits": resolved_task.upstream_commits,
         "appearance": ComposedPhotometricShift.metadata(
             float(cfg.appearance.severity), int(cfg.appearance.seed)
         ),

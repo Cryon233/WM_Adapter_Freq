@@ -89,10 +89,16 @@ class HFRASiteAdapter(nn.Module):
             )
         core = self.activation(self.down(self.norm(patch_tokens)))
         spectral = self._spectral_residual(core)
+        core_delta = self.up(core)
+        spectral_delta = self.up(spectral)
+        total_delta = core_delta + spectral_delta
         denominator = patch_tokens.float().square().mean().sqrt().clamp_min(1.0e-12)
+        # Diagnostics describe the residual written back to DINO tokens, not the
+        # rank-space bottleneck activations that precede the zero-initialized up map.
         self._latest_diagnostics = {
-            "core_delta_ratio": (core.float().square().mean().sqrt() / denominator).detach(),
-            "spectral_delta_ratio": (spectral.float().square().mean().sqrt() / denominator).detach(),
+            "core_delta_ratio": (core_delta.float().square().mean().sqrt() / denominator).detach(),
+            "spectral_delta_ratio": (spectral_delta.float().square().mean().sqrt() / denominator).detach(),
+            "total_delta_ratio": (total_delta.float().square().mean().sqrt() / denominator).detach(),
         }
         if self.fourier_enabled:
             magnitude = torch.complex(
@@ -102,15 +108,20 @@ class HFRASiteAdapter(nn.Module):
                 frequency_filter_abs_mean=magnitude.mean().detach(),
                 frequency_filter_abs_max=magnitude.max().detach(),
             )
-        return patch_tokens + self.up(core + spectral)
+        return patch_tokens + total_delta
 
     def diagnostics(self, patch_tokens: Tensor) -> dict[str, Tensor]:
         core = self.activation(self.down(self.norm(patch_tokens)))
         spectral = self._spectral_residual(core)
+        core_delta = self.up(core)
+        spectral_delta = self.up(spectral)
+        total_delta = core_delta + spectral_delta
         denominator = patch_tokens.float().square().mean().sqrt().clamp_min(1.0e-12)
         values = {
-            "core_delta_ratio": core.float().square().mean().sqrt() / denominator,
-            "spectral_delta_ratio": spectral.float().square().mean().sqrt()
+            "core_delta_ratio": core_delta.float().square().mean().sqrt() / denominator,
+            "spectral_delta_ratio": spectral_delta.float().square().mean().sqrt()
+            / denominator,
+            "total_delta_ratio": total_delta.float().square().mean().sqrt()
             / denominator,
         }
         if self.fourier_enabled:

@@ -10,7 +10,9 @@ if [[ ! -f "$CONDA_SH" ]]; then
     exit 1
 fi
 source "$CONDA_SH"
+set +u
 conda activate "${CONDA_ENV:-wm-a100}"
+set -u
 if [[ ! -f ./env_jepa.sh ]]; then
     echo "Required JEPA-WM environment file not found: $ROOT/env_jepa.sh" >&2
     exit 1

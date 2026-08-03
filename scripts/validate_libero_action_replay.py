@@ -19,30 +19,51 @@ def _sim(environment: Any) -> Any:
     raise RuntimeError("LIBERO replay validator cannot locate the MuJoCo simulator")
 
 
-def _state_metrics(sim: Any, target: np.ndarray) -> dict[str, float]:
-    qpos = np.asarray(sim.data.qpos).reshape(-1)
-    qvel = np.asarray(sim.data.qvel).reshape(-1)
-    target = np.asarray(target).reshape(-1)
-    if target.size < qpos.size + qvel.size:
+def _capture_sim_state(sim: Any) -> dict[str, np.ndarray | None]:
+    qpos = np.asarray(sim.data.qpos, dtype=np.float64).reshape(-1).copy()
+    qvel = np.asarray(sim.data.qvel, dtype=np.float64).reshape(-1).copy()
+    flattened = np.asarray(sim.get_state().flatten(), dtype=np.float64).reshape(-1)
+    expected_prefix = 1 + qpos.size + qvel.size
+    additional = (
+        flattened[expected_prefix:].copy()
+        if flattened.size > expected_prefix
+        else None
+    )
+    return {"qpos": qpos, "qvel": qvel, "additional": additional}
+
+
+def _state_metrics(
+    sim: Any, target: dict[str, np.ndarray | None]
+) -> dict[str, float]:
+    current = _capture_sim_state(sim)
+    qpos = current["qpos"]
+    qvel = current["qvel"]
+    target_qpos = target["qpos"]
+    target_qvel = target["qvel"]
+    if qpos is None or qvel is None or target_qpos is None or target_qvel is None:
+        raise RuntimeError("LIBERO simulator did not expose qpos/qvel state")
+    if qpos.shape != target_qpos.shape or qvel.shape != target_qvel.shape:
         raise RuntimeError(
-            f"LIBERO state is too short for qpos/qvel: state={target.size}, "
-            f"nq={qpos.size}, nv={qvel.size}"
+            "LIBERO replay simulator-state shape changed: "
+            f"qpos={qpos.shape}/{target_qpos.shape}, "
+            f"qvel={qvel.shape}/{target_qvel.shape}"
         )
-    target_qpos = target[: qpos.size]
-    target_qvel = target[qpos.size : qpos.size + qvel.size]
-    target_object = target[qpos.size + qvel.size :]
-    current_flat = np.asarray(sim.get_state().flatten()).reshape(-1)
-    current_object = current_flat[qpos.size + qvel.size :]
-    object_count = min(current_object.size, target_object.size)
-    return {
+    metrics = {
         "qpos_mae": float(np.mean(np.abs(qpos - target_qpos))),
         "qvel_mae": float(np.mean(np.abs(qvel - target_qvel))),
-        "object_state_mae": (
-            float(np.mean(np.abs(current_object[:object_count] - target_object[:object_count])))
-            if object_count
-            else 0.0
-        ),
     }
+    current_additional = current["additional"]
+    target_additional = target["additional"]
+    if current_additional is not None and target_additional is not None:
+        if current_additional.shape != target_additional.shape:
+            raise RuntimeError(
+                "LIBERO additional simulator-state shape changed: "
+                f"actual={current_additional.shape}, target={target_additional.shape}"
+            )
+        metrics["additional_state_mae"] = float(
+            np.mean(np.abs(current_additional - target_additional))
+        )
+    return metrics
 
 
 def _image_metrics(actual: np.ndarray, target: np.ndarray) -> dict[str, float]:
@@ -87,7 +108,11 @@ def _eef_metrics(actual: dict[str, Any], target: dict[str, Any]) -> dict[str, fl
 
 
 def _aggregate(rows: list[dict[str, float]]) -> dict[str, float]:
-    return {key: float(np.mean([row[key] for row in rows])) for key in rows[0]}
+    shared_keys = set.intersection(*(set(row) for row in rows))
+    return {
+        key: float(np.mean([row[key] for row in rows]))
+        for key in sorted(shared_keys)
+    }
 
 
 def main() -> None:
@@ -126,6 +151,7 @@ def main() -> None:
                 target_environment_observation = environment.set_init_state(
                     states[5].numpy()
                 )
+                target_sim_state = _capture_sim_state(_sim(environment))
                 rows_for_modes: list[dict[str, float]] = []
                 for repeated in (False, True):
                     environment.reset()
@@ -133,7 +159,7 @@ def main() -> None:
                     for offset in range(5):
                         action = environment_actions[0 if repeated else offset]
                         current, _, _, _ = environment.step(action)
-                    metrics = _state_metrics(_sim(environment), states[5].numpy())
+                    metrics = _state_metrics(_sim(environment), target_sim_state)
                     metrics.update(
                         _image_metrics(benchmark._observation_image(current), target_image)
                     )
@@ -150,8 +176,11 @@ def main() -> None:
         environment.close()
     sequence = _aggregate(sequence_rows)
     repeated = _aggregate(repeated_rows)
-    sequence_state = sequence["qpos_mae"] + sequence["qvel_mae"] + sequence["object_state_mae"]
-    repeated_state = repeated["qpos_mae"] + repeated["qvel_mae"] + repeated["object_state_mae"]
+    stable_state_metrics = ["qpos_mae", "qvel_mae"]
+    if "additional_state_mae" in sequence and "additional_state_mae" in repeated:
+        stable_state_metrics.append("additional_state_mae")
+    sequence_state = sum(sequence[key] for key in stable_state_metrics)
+    repeated_state = sum(repeated[key] for key in stable_state_metrics)
     sequence_limit = float(cfg.protocol_validation.get("sequence_state_mae_max", 1.0e-3))
     sequence_passed = bool(np.isfinite(sequence_state) and sequence_state <= sequence_limit)
     repeat_passed = bool(repeated_state <= sequence_state * 1.05 + 1.0e-8)
@@ -162,10 +191,36 @@ def main() -> None:
         "starts_per_episode": starts_per_episode,
         "sequence_replay": sequence,
         "repeated_action_replay": repeated,
+        "state_comparison": {
+            "metrics": stable_state_metrics,
+            "object_state": (
+                "included in simulator qpos; no unsupported flattened-state slicing"
+            ),
+            "additional_state": (
+                "supported"
+                if "additional_state_mae" in stable_state_metrics
+                else "unsupported by the active simulator state binding"
+            ),
+        },
+        "thresholds": {"sequence_state_mae_max": sequence_limit},
         "sequence_replay_contract": "passed" if sequence_passed else "failed",
         "repeat_action_contract": "passed" if repeat_passed else "failed",
         "action_transform": task.action_transform,
         "status": "passed" if sequence_passed and repeat_passed else "failed",
+        "failure_reasons": [
+            reason
+            for condition, reason in (
+                (
+                    not sequence_passed,
+                    f"sequence state error {sequence_state} exceeds {sequence_limit}",
+                ),
+                (
+                    not repeat_passed,
+                    "repeated-action replay is not distinguishable from sequence replay",
+                ),
+            )
+            if condition
+        ],
     }
     output = resolve_path(cfg.protocol_validation.output)
     atomic_json(output, payload)

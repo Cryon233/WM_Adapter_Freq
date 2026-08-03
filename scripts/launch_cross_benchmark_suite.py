@@ -18,7 +18,7 @@ from wm_adapter.utils.reproducibility import project_root, resolve_path
 DEFAULT_CONFIG = "configs/experiment/cross_benchmark_v2.yaml"
 
 
-def _args() -> argparse.Namespace:
+def _args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Launch or attach to a cross-benchmark suite")
     parser.add_argument("--config", default=DEFAULT_CONFIG)
     action = parser.add_mutually_exclusive_group()
@@ -26,8 +26,8 @@ def _args() -> argparse.Namespace:
     action.add_argument("--attach", action="store_true")
     action.add_argument("--status", action="store_true")
     action.add_argument("--dry-run", action="store_true")
-    action.add_argument("--self-test", action="store_true")
-    return parser.parse_args()
+    parser.add_argument("--self-test", action="store_true")
+    return parser.parse_args(argv)
 
 
 def _paths(suite: Any, self_test: bool) -> tuple[Path, Path, Path]:
@@ -95,9 +95,18 @@ def main() -> None:
         pid_path.unlink(missing_ok=True)
         pid = None
     if args.dry_run:
+        command = [
+            sys.executable,
+            "scripts/run_cross_benchmark_suite.py",
+            "--config",
+            args.config,
+            "--dry-run",
+        ]
+        if args.self_test:
+            command.append("--self-test")
         raise SystemExit(
             subprocess.call(
-                [sys.executable, "scripts/run_cross_benchmark_suite.py", "--config", args.config, "--dry-run"],
+                command,
                 cwd=project_root(),
             )
         )

@@ -56,6 +56,18 @@ def build_job_graph(suite: Any, *, self_test: bool = False) -> list[JobSpec]:
         task_items = [(key, value) for key, value in task_items if str(key) in selected]
         methods = [str(value) for value in suite.self_test.methods]
         domains = [str(value) for value in suite.self_test.domains]
+    self_test_v2_training_overrides = (
+        [
+            f"training.max_optimizer_steps={int(suite.self_test.optimizer_steps)}",
+            "training.warmup_steps=0",
+            "training.num_workers=0",
+            "training.microbatch_windows=1",
+            "training.views_per_window=2",
+            "training.gradient_accumulation=1",
+        ]
+        if self_test and is_v2
+        else []
+    )
     jobs: list[JobSpec] = []
     for task_key, config_value in task_items:
         config = str(config_value)
@@ -150,13 +162,13 @@ def build_job_graph(suite: Any, *, self_test: bool = False) -> list[JobSpec]:
             ]
             if self_test:
                 if is_v2:
-                    command.extend([
-                        "suite_mode=self_test",
-                        f"training.max_optimizer_steps={int(suite.self_test.optimizer_steps)}",
-                        "training.warmup_steps=0", "training.num_workers=0",
-                        "training.microbatch_windows=1", "training.views_per_window=2",
-                        "training.gradient_accumulation=1", *manifest_overrides,
-                    ])
+                    command.extend(
+                        [
+                            "suite_mode=self_test",
+                            *self_test_v2_training_overrides,
+                            *manifest_overrides,
+                        ]
+                    )
                 else:
                     command.extend([
                         f"training.epochs={int(suite.self_test.epochs)}",
@@ -196,7 +208,13 @@ def build_job_graph(suite: Any, *, self_test: bool = False) -> list[JobSpec]:
                 )
             if self_test:
                 command.extend(
-                    ["offline.num_workers=0", "offline.batch_size=1", *manifest_overrides]
+                    [
+                        "offline.num_workers=0",
+                        "offline.batch_size=1",
+                        "suite_mode=self_test",
+                        *self_test_v2_training_overrides,
+                        *manifest_overrides,
+                    ]
                 )
             jobs.append(
                 JobSpec(
@@ -240,7 +258,9 @@ def build_job_graph(suite: Any, *, self_test: bool = False) -> list[JobSpec]:
                         f"paths.method_checkpoint={_main_checkpoint(suite, benchmark, task, method)}"
                     )
                 if self_test:
-                    command.extend(manifest_overrides)
+                    command.extend(
+                        [*self_test_v2_training_overrides, *manifest_overrides]
+                    )
                 jobs.append(
                     JobSpec(
                         job_id=f"planning/main/{task}/{method}/{domain}",

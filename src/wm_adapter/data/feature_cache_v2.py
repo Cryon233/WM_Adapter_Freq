@@ -13,7 +13,7 @@ from torch import Tensor
 from torch.utils.data import Dataset, get_worker_info
 
 
-CACHE_SCHEMA_VERSION_V2 = "jepa_wm_feature_cache_v2"
+CACHE_SCHEMA_VERSION_V2 = "jepa_wm_feature_cache_v2.1"
 V2_ARRAY_KEYS = (
     "clean_context_middle_tokens",
     "ood_context_middle_tokens",
@@ -31,6 +31,43 @@ def _json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
+_GENERATED_FINGERPRINT_ATTRS = {
+    "finalized",
+    "cache_fingerprint",
+    "window_count",
+    "tensor_shapes",
+    "array_content_sha256",
+    "content_sha256",
+}
+
+
+def _attribute_value(value: Any) -> Any:
+    if hasattr(value, "item"):
+        value = value.item()
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return value
+
+
+def cache_fingerprint_v2(handle: h5py.File) -> str:
+    """Recreate the v2 fingerprint from metadata, shapes and stored content hashes."""
+    shapes = {key: list(handle[key].shape) for key in V2_ARRAY_KEYS}
+    raw_hashes = _attribute_value(handle.attrs.get("array_content_sha256", ""))
+    array_hashes = json.loads(raw_hashes) if isinstance(raw_hashes, str) else raw_hashes
+    content_hash = str(_attribute_value(handle.attrs.get("content_sha256", "")))
+    fields: dict[str, Any] = {
+        "schema_version": CACHE_SCHEMA_VERSION_V2,
+        "window_count": int(handle[V2_ARRAY_KEYS[0]].shape[0]),
+        "tensor_shapes": shapes,
+        "array_content_sha256": array_hashes,
+        "content_sha256": content_hash,
+    }
+    for key in sorted(handle.attrs):
+        if key not in _GENERATED_FINGERPRINT_ATTRS:
+            fields[key] = _attribute_value(handle.attrs[key])
+    return hashlib.sha256(_json(fields).encode("utf-8")).hexdigest()
+
+
 class FeatureCacheV2Writer:
     def __init__(self, output_path: str | Path, metadata: dict[str, Any]) -> None:
         self.output_path = Path(output_path).expanduser().resolve()
@@ -46,6 +83,11 @@ class FeatureCacheV2Writer:
         for key, value in metadata.items():
             self.file.attrs[key] = _json(value) if isinstance(value, (dict, list, tuple)) else value
         self.count = 0
+        self._content_hashers = {
+            key: hashlib.sha256(f"{key}\0".encode("utf-8"))
+            for key in V2_ARRAY_KEYS
+        }
+        self._content_layouts: dict[str, tuple[str, tuple[int, ...]]] = {}
 
     @staticmethod
     def _numeric_dtype(key: str) -> np.dtype[Any]:
@@ -82,6 +124,13 @@ class FeatureCacheV2Writer:
         for key in V2_ARRAY_KEYS:
             array = arrays[key]
             if key == "source_trajectory_id":
+                strings = [str(value) for value in array.tolist()]
+                for value in strings:
+                    encoded = value.encode("utf-8")
+                    self._content_hashers[key].update(
+                        len(encoded).to_bytes(8, "little")
+                    )
+                    self._content_hashers[key].update(encoded)
                 if key not in self.file:
                     self.file.create_dataset(
                         key, shape=(0,), maxshape=(None,), chunks=(1,),
@@ -89,9 +138,21 @@ class FeatureCacheV2Writer:
                     )
                 dataset = self.file[key]
                 dataset.resize(stop, axis=0)
-                dataset[start:stop] = [str(value) for value in array.tolist()]
+                dataset[start:stop] = strings
                 continue
             array = array.astype(self._numeric_dtype(key), copy=False)
+            layout = (array.dtype.str, tuple(int(value) for value in array.shape[1:]))
+            if key not in self._content_layouts:
+                self._content_layouts[key] = layout
+                self._content_hashers[key].update(_json(layout).encode("utf-8"))
+            elif self._content_layouts[key] != layout:
+                raise ValueError(
+                    f"V2 cache content layout changed for {key}: "
+                    f"expected={self._content_layouts[key]}, actual={layout}"
+                )
+            self._content_hashers[key].update(
+                np.ascontiguousarray(array).tobytes(order="C")
+            )
             if key not in self.file:
                 self.file.create_dataset(
                     key,
@@ -116,18 +177,18 @@ class FeatureCacheV2Writer:
         if self.count <= 0:
             raise RuntimeError("Cannot finalize an empty v2 feature cache")
         shapes = {key: list(self.file[key].shape) for key in V2_ARRAY_KEYS}
-        fingerprint_fields: dict[str, Any] = {
-            "schema_version": CACHE_SCHEMA_VERSION_V2,
-            "window_count": self.count,
-            "tensor_shapes": shapes,
+        array_hashes = {
+            key: hasher.hexdigest()
+            for key, hasher in self._content_hashers.items()
         }
-        for key in sorted(self.file.attrs):
-            if key not in {"finalized", "cache_fingerprint"}:
-                value = self.file.attrs[key]
-                fingerprint_fields[key] = value.item() if hasattr(value, "item") else value
-        fingerprint = hashlib.sha256(_json(fingerprint_fields).encode("utf-8")).hexdigest()
+        content_hash = hashlib.sha256(
+            _json(array_hashes).encode("utf-8")
+        ).hexdigest()
         self.file.attrs["window_count"] = self.count
         self.file.attrs["tensor_shapes"] = _json(shapes)
+        self.file.attrs["array_content_sha256"] = _json(array_hashes)
+        self.file.attrs["content_sha256"] = content_hash
+        fingerprint = cache_fingerprint_v2(self.file)
         self.file.attrs["cache_fingerprint"] = fingerprint
         self.file.attrs["finalized"] = True
         self.file.flush()
@@ -165,6 +226,22 @@ class FeatureCacheV2Dataset(Dataset[dict[str, Tensor | str]]):
             missing = sorted(set(V2_ARRAY_KEYS).difference(cache.keys()))
             if missing:
                 raise RuntimeError(f"V2 feature cache is missing arrays {missing}")
+            for attribute in (
+                "array_content_sha256",
+                "content_sha256",
+                "cache_fingerprint",
+            ):
+                if not str(cache.attrs.get(attribute, "")):
+                    raise RuntimeError(
+                        f"V2 feature cache lacks required {attribute}: {self.path}"
+                    )
+            expected_fingerprint = cache_fingerprint_v2(cache)
+            if str(cache.attrs["cache_fingerprint"]) != expected_fingerprint:
+                raise RuntimeError(
+                    "V2 feature-cache fingerprint does not match its content hashes: "
+                    f"expected={expected_fingerprint}, "
+                    f"actual={cache.attrs['cache_fingerprint']}, path={self.path}"
+                )
             lengths = {key: int(cache[key].shape[0]) for key in V2_ARRAY_KEYS}
             if len(set(lengths.values())) != 1:
                 raise RuntimeError(f"V2 feature cache lengths differ: {lengths}")

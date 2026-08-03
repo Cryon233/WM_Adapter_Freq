@@ -274,7 +274,7 @@ def _runner_pid_path(suite_path: Path, state: dict[str, Any]) -> Path:
     return resolve_path(str(suite.pid_path))
 
 
-def _mark_stopped(state_path: Path) -> None:
+def _mark_stopped(state_path: Path, suite_path: Path) -> None:
     suite = load_suite_config(suite_path)
     state = _state(state_path, str(suite.suite_name))
     stopped = time.time()
@@ -348,7 +348,7 @@ def _terminate_suite(state_path: Path, suite_path: Path) -> str:
             f"Runner process group remains active after SIGKILL: pgid={process_group}"
         )
     pid_path.unlink(missing_ok=True)
-    _mark_stopped(state_path)
+    _mark_stopped(state_path, suite_path)
     return f"Terminated runner process group {process_group}"
 
 

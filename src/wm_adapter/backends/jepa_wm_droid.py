@@ -538,46 +538,34 @@ class JEPAWMDroidBackend(nn.Module):
                 "Differentiable rollout actions must be [B,3,7], "
                 f"received {tuple(actions.shape)}"
             )
-        visual = rearrange(
-            context_latents,
-            "b t (h w) d -> b t 1 h w d",
-            h=self.grid_height,
-            w=self.grid_width,
+        visual = self.planning_latents(context_latents)
+        time_major_actions = rearrange(actions, "b t a -> t b a")
+        rollout = self.official_model.unroll(
+            visual,
+            act_suffix=time_major_actions,
         )
-        context_window = int(self.official_model.ctxt_window)
-        if context_window <= 0:
-            raise ValueError(
-                f"JEPA-WM ctxt_window must be positive, received {context_window}"
+        if not isinstance(rollout, Tensor) or rollout.ndim != 6:
+            raise RuntimeError(
+                "Official JEPA-WM unroll returned an invalid visual rollout: "
+                f"type={type(rollout).__name__}, "
+                f"shape={getattr(rollout, 'shape', None)}"
             )
-        history_steps = max(min(context_window, visual.shape[1]) - 1, 0)
-        raw_timeline = actions
-        if history_steps:
-            raw_timeline = torch.cat(
-                (torch.zeros_like(actions[:, :1]).repeat(1, history_steps, 1), actions),
-                dim=1,
+        expected_time = int(context_latents.shape[1] + actions.shape[1])
+        expected_tail = (
+            context_latents.shape[0],
+            1,
+            self.grid_height,
+            self.grid_width,
+            self.token_dim,
+        )
+        if int(rollout.shape[0]) != expected_time or tuple(rollout.shape[1:]) != expected_tail:
+            raise RuntimeError(
+                "Official JEPA-WM unroll layout mismatch: "
+                f"expected=[{expected_time},{','.join(str(value) for value in expected_tail)}], "
+                f"received={tuple(rollout.shape)}"
             )
-        action_features = self.video_model.encode_act(raw_timeline)
-        predictions: list[Tensor] = []
-        for step in range(3):
-            action_end = history_steps + step + 1
-            visual_window = visual[:, -context_window:]
-            action_window = action_features[
-                :, max(0, action_end - context_window) : action_end
-            ]
-            if visual_window.shape[1] != action_window.shape[1]:
-                raise RuntimeError(
-                    "Differentiable JEPA-WM rollout context mismatch: "
-                    f"step={step}, visual={tuple(visual_window.shape)}, "
-                    f"actions={tuple(action_window.shape)}"
-                )
-            predicted, _, _ = self.video_model.forward_pred(
-                visual_window, action_window, None
-            )
-            next_visual = predicted[:, -1:]
-            predictions.append(next_visual)
-            visual = torch.cat((visual, next_visual), dim=1)
-        future = torch.cat(predictions, dim=1)
-        return rearrange(future, "b t 1 h w d -> b t (h w) d")
+        future = rollout[-actions.shape[1] :]
+        return rearrange(future, "t b 1 h w d -> b t (h w) d")
 
     def predict(self, context_latents: Tensor, actions: Tensor) -> Tensor:
         if context_latents.ndim != 4 or context_latents.shape[2:] != (

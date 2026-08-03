@@ -12,6 +12,10 @@ from wm_adapter.backends.jepa_wm_droid import JEPAWMDroidBackend
 from wm_adapter.benchmarks.factory import build_benchmark
 from wm_adapter.data.feature_cache import CACHE_SCHEMA_VERSION
 from wm_adapter.data.feature_cache_v2 import CACHE_SCHEMA_VERSION_V2
+from wm_adapter.experiments.cross_benchmark import (
+    training_contract_mismatches_v2,
+    training_contract_v2,
+)
 from wm_adapter.planning.jepa_wm_planner import (
     EVALUATION_PROTOCOL_DIRECTORY,
     EVALUATION_PROTOCOL_VERSION,
@@ -134,7 +138,7 @@ def main() -> None:
                 "Method checkpoint benchmark/task mismatch: "
                 f"expected={expected_identity}, actual={actual_identity}, path={checkpoint_path}"
             )
-        if not legacy_place and not checkpoint_v2:
+        if not legacy_place:
             checkpoint_contract = {
                 "task_manifest_sha256": task_manifest["task_manifest_sha256"],
                 "dataset_sha256": resolved_task.dataset_sha256,
@@ -163,16 +167,12 @@ def main() -> None:
                     f"Method checkpoint task/data contract mismatch: {contract_mismatch}"
                 )
         if checkpoint_v2:
-            expected_v2 = {
-                "loss_name": "unified_trajectory_mse",
-                "goal_encoder": "frozen_base",
-                "completed_optimizer_steps": int(cfg.training.max_optimizer_steps),
-            }
-            mismatch = {
-                key: {"expected": value, "actual": checkpoint.get(key)}
-                for key, value in expected_v2.items()
-                if checkpoint.get(key) != value
-            }
+            training_values = OmegaConf.to_container(cfg.training, resolve=True)
+            if not isinstance(training_values, dict):
+                raise TypeError("V2 planning training configuration is not a mapping")
+            mismatch = training_contract_mismatches_v2(
+                checkpoint, training_contract_v2(training_values)
+            )
             if mismatch:
                 raise RuntimeError(f"V2 planning checkpoint contract mismatch: {mismatch}")
         checkpoint_fingerprint = sha256_file(checkpoint_path)

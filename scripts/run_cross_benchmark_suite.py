@@ -23,10 +23,12 @@ from wm_adapter.experiments.cross_benchmark import (
     JobSpec,
     archive_incomplete,
     benchmark_subprocess_environment,
+    block_job_for_failed_dependencies,
     load_suite_config,
     load_task_config,
     phase_summary,
     run_gpu_phase,
+    training_contract_v2,
     validate_cache,
     validate_cache_v2,
     validate_checkpoint,
@@ -626,6 +628,11 @@ def _validate_job(
                 path, int(job.required_count or 0), benchmark=job.benchmark,
                 task=job.task,
                 expected_task_manifest_sha256=str(task_manifest["task_manifest_sha256"]),
+                expected_dataset_sha256=str(task_manifest["dataset_sha256"]),
+                expected_camera_key=str(task_manifest["camera_key"]),
+                expected_task_upstream_commits=dict(
+                    task_manifest.get("upstream_commits", {})
+                ),
                 expected_action_transform=task_manifest.get("action_transform"),
                 expected_camera_contract=camera_contract,
                 expected_base_checkpoint_sha256=str(resources["jepa_checkpoint_sha256"]),
@@ -675,18 +682,41 @@ def _validate_job(
         if not isinstance(method_config, dict):
             raise TypeError(f"Method config is not a mapping: {method_config_path}")
         if is_v2:
-            expected_steps = int(
-                suite.self_test.optimizer_steps if self_test
-                else task_config.training.max_optimizer_steps
+            training_values = OmegaConf.to_container(
+                task_config.training, resolve=True
             )
+            if not isinstance(training_values, dict):
+                raise TypeError(
+                    f"V2 training configuration is not a mapping: {task_config_path}"
+                )
+            training_values["seed"] = int(job.seed or 42)
+            if self_test:
+                training_values.update(
+                    max_optimizer_steps=int(suite.self_test.optimizer_steps),
+                    warmup_steps=0,
+                    num_workers=0,
+                    microbatch_windows=1,
+                    views_per_window=2,
+                    gradient_accumulation=1,
+                )
+            expected_training = training_contract_v2(training_values)
             return validate_checkpoint_v2(
                 path, str(job.method), str(cache["cache_fingerprint"]),
                 benchmark=job.benchmark, task=job.task,
-                expected_training_seed=int(job.seed or 42),
                 expected_method_config=method_config,
-                expected_optimizer_steps=expected_steps,
+                expected_training_contract=expected_training,
                 expected_action_transform=task_manifest.get("action_transform"),
                 expected_camera_contract=camera_contract,
+                expected_data_contract={
+                    "task_manifest_sha256": str(
+                        task_manifest["task_manifest_sha256"]
+                    ),
+                    "dataset_sha256": str(task_manifest["dataset_sha256"]),
+                    "camera_key": str(task_manifest["camera_key"]),
+                    "task_upstream_commits": dict(
+                        task_manifest.get("upstream_commits", {})
+                    ),
+                },
             )
         return validate_checkpoint(
             path, str(job.method), str(cache["cache_fingerprint"]),
@@ -716,6 +746,14 @@ def _validate_job(
                     str(checkpoint["sha256"]) if checkpoint is not None else None
                 ),
                 expected_action_transform=task_manifest.get("action_transform"),
+                expected_task_manifest_sha256=str(
+                    task_manifest["task_manifest_sha256"]
+                ),
+                expected_dataset_sha256=str(task_manifest["dataset_sha256"]),
+                expected_camera_key=str(task_manifest["camera_key"]),
+                expected_task_upstream_commits=dict(
+                    task_manifest.get("upstream_commits", {})
+                ),
             )
         return validate_offline(
             path, int(job.required_count or 0), benchmark=job.benchmark,
@@ -758,6 +796,19 @@ def _validate_job(
             expected_action_convention=dict(task_manifest["action_convention"]),
             expected_action_transform=task_manifest.get("action_transform"),
             expected_camera_contract=camera_contract,
+            **(
+                {
+                    "expected_camera_key": str(task_manifest["camera_key"]),
+                    "expected_dataset_fingerprint": str(
+                        task_manifest["dataset_sha256"]
+                    ),
+                    "expected_task_upstream_commits": dict(
+                        task_manifest.get("upstream_commits", {})
+                    ),
+                }
+                if is_v2
+                else {}
+            ),
             formal_cem=not self_test,
             expected_base_checkpoint_sha256=resources.get("jepa_checkpoint_sha256"),
             expected_dinov3_checkpoint_sha256=resources.get("dinov3_checkpoint_sha256"),
@@ -936,22 +987,7 @@ def _run(suite: Any, jobs: list[JobSpec], *, self_test: bool) -> None:
             wave_jobs = [job for job in phase_jobs if job.kind in kinds]
             pending: list[JobSpec] = []
             for job in wave_jobs:
-                failed_dependencies = [
-                    dependency
-                    for dependency in job.dependencies
-                    if state["jobs"].get(dependency, {}).get("status")
-                    in {"failed", "blocked", "stopped"}
-                ]
-                if failed_dependencies:
-                    entry = job.state_fields()
-                    entry.update(
-                        status="blocked",
-                        error=(
-                            "blocked because dependencies failed: "
-                            + ", ".join(failed_dependencies)
-                        ),
-                    )
-                    state["jobs"][job.job_id] = entry
+                if block_job_for_failed_dependencies(job, state):
                     continue
                 incomplete_dependencies = [
                     dependency
