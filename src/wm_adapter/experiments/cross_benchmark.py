@@ -150,8 +150,12 @@ def archive_incomplete(path: str | Path) -> Path:
     source = resolve_path(path)
     digest = sha256_file(source)[:12]
     destination = source.with_name(f"{source.name}.incomplete-{digest}")
-    if destination.exists():
-        raise RuntimeError(f"Incomplete artifact archive already exists: {destination}")
+    archive_index = 2
+    while destination.exists():
+        destination = source.with_name(
+            f"{source.name}.incomplete-{digest}.{archive_index}"
+        )
+        archive_index += 1
     source.replace(destination)
     return destination
 

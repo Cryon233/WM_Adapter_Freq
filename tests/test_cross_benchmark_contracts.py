@@ -27,6 +27,7 @@ from wm_adapter.benchmarks.libero import (
 )
 from wm_adapter.experiments.cross_benchmark import (
     JobSpec,
+    archive_incomplete,
     block_job_for_failed_dependencies,
     load_suite_config,
     run_gpu_phase,
@@ -195,6 +196,17 @@ def _task(*, benchmark: str, transform: dict[str, object] | None) -> ResolvedTas
 
 
 class CrossBenchmarkContractTest(unittest.TestCase):
+    def test_repeated_incomplete_artifacts_are_archived_without_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "protocol.json"
+            artifact.write_text('{"status":"failed"}', encoding="utf-8")
+            first = archive_incomplete(artifact)
+            artifact.write_text('{"status":"failed"}', encoding="utf-8")
+            second = archive_incomplete(artifact)
+            self.assertNotEqual(first, second)
+            self.assertTrue(first.is_file())
+            self.assertTrue(second.is_file())
+
     def test_hfra_identity_parameters_sites_and_gradients(self) -> None:
         adapter = HybridFourierResidualAdapter(
             embed_dim=1024,
