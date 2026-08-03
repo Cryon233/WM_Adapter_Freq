@@ -34,6 +34,13 @@ PHASES = (
     "Final analysis",
 )
 
+_DEFAULT_MIN_GPU_FREE_MIB = 18 * 1024
+_CUDA_OOM_SIGNATURES = (
+    b"cuda out of memory",
+    b"torch.outofmemoryerror",
+    b"cuda error: out of memory",
+)
+
 
 @dataclass(frozen=True)
 class JobSpec:
@@ -550,6 +557,43 @@ def _write_state(path: str | Path, state: dict[str, Any]) -> None:
     atomic_json(path, state)
 
 
+def _gpu_free_memory_mib(gpu_ids: Sequence[int]) -> dict[int, int]:
+    completed = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-gpu=index,memory.free",
+            "--format=csv,noheader,nounits",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    available: dict[int, int] = {}
+    requested = set(int(value) for value in gpu_ids)
+    for line in completed.stdout.splitlines():
+        fields = [value.strip() for value in line.split(",")]
+        if len(fields) != 2:
+            raise RuntimeError(f"Cannot parse nvidia-smi GPU memory row: {line!r}")
+        index, free_memory = int(fields[0]), int(fields[1])
+        if index in requested:
+            available[index] = free_memory
+    missing = sorted(requested.difference(available))
+    if missing:
+        raise RuntimeError(
+            f"nvidia-smi did not report configured GPUs {missing}; reported={available}"
+        )
+    return available
+
+
+def _log_segment_has_cuda_oom(path: Path, start_offset: int) -> bool:
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        end_offset = handle.tell()
+        handle.seek(max(start_offset, end_offset - 2 * 1024 * 1024))
+        output = handle.read().lower()
+    return any(signature in output for signature in _CUDA_OOM_SIGNATURES)
+
+
 def run_gpu_phase(
     jobs: Sequence[JobSpec],
     gpu_ids: Sequence[int],
@@ -558,16 +602,50 @@ def run_gpu_phase(
     validator: Any,
 ) -> None:
     pending = list(jobs)
-    running: dict[int, tuple[JobSpec, subprocess.Popen[str], Any, float]] = {}
+    running: dict[
+        int,
+        tuple[JobSpec, subprocess.Popen[str], Any, float, int],
+    ] = {}
+    attempted_gpus: dict[str, set[int]] = {job.job_id: set() for job in jobs}
+    attempt_history: dict[str, list[dict[str, Any]]] = {
+        job.job_id: [] for job in jobs
+    }
+    minimum_free_mib = int(
+        os.environ.get("WM_ADAPTER_MIN_GPU_FREE_MIB", _DEFAULT_MIN_GPU_FREE_MIB)
+    )
+    if minimum_free_mib < 0:
+        raise ValueError(
+            "WM_ADAPTER_MIN_GPU_FREE_MIB must be non-negative, "
+            f"received {minimum_free_mib}"
+    )
     failure = False
     while pending or running:
         if not failure:
-            for gpu in gpu_ids:
-                if gpu in running or not pending:
+            free_memory = _gpu_free_memory_mib(gpu_ids)
+            idle_gpus = sorted(
+                (int(gpu) for gpu in gpu_ids if int(gpu) not in running),
+                key=lambda gpu: (-free_memory[gpu], gpu),
+            )
+            for gpu in idle_gpus:
+                candidate_index = next(
+                    (
+                        index
+                        for index, candidate in enumerate(pending)
+                        if gpu not in attempted_gpus[candidate.job_id]
+                        and (
+                            candidate.kind == "analysis"
+                            or free_memory[gpu] >= minimum_free_mib
+                        )
+                    ),
+                    None,
+                )
+                if candidate_index is None:
                     continue
-                job = pending.pop(0)
+                job = pending.pop(candidate_index)
+                attempted_gpus[job.job_id].add(gpu)
                 log_path = resolve_path(job.log_path)
                 log_path.parent.mkdir(parents=True, exist_ok=True)
+                log_start_offset = log_path.stat().st_size if log_path.exists() else 0
                 log = log_path.open("a", encoding="utf-8")
                 environment = benchmark_subprocess_environment(job.benchmark, gpu=gpu)
                 process = subprocess.Popen(
@@ -580,33 +658,121 @@ def run_gpu_phase(
                 )
                 started = time.time()
                 entry = _state_job(job, "running")
-                entry.update(gpu=gpu, pid=process.pid, start_time=started)
+                entry.update(
+                    gpu=gpu,
+                    pid=process.pid,
+                    start_time=started,
+                    gpu_attempts=sorted(attempted_gpus[job.job_id]),
+                    oom_retries=len(attempt_history[job.job_id]),
+                    gpu_free_memory_mib_at_launch=free_memory[gpu],
+                    minimum_gpu_free_memory_mib=minimum_free_mib,
+                    scheduler_status="running",
+                    attempt_history=list(attempt_history[job.job_id]),
+                )
                 state["jobs"][job.job_id] = entry
-                running[gpu] = (job, process, log, started)
+                running[gpu] = (
+                    job,
+                    process,
+                    log,
+                    started,
+                    log_start_offset,
+                )
                 _write_state(state_path, state)
         if not running:
+            if pending and not failure:
+                free_memory = _gpu_free_memory_mib(gpu_ids)
+                waiting_payload = {
+                    "scheduler_status": "waiting_for_eligible_gpu",
+                    "minimum_gpu_free_memory_mib": minimum_free_mib,
+                    "gpu_free_memory_mib": {
+                        str(gpu): free_memory[int(gpu)] for gpu in gpu_ids
+                    },
+                }
+                changed = False
+                for job in pending:
+                    entry = state["jobs"].setdefault(
+                        job.job_id, _state_job(job, "pending")
+                    )
+                    for key, value in waiting_payload.items():
+                        if entry.get(key) != value:
+                            entry[key] = value
+                            changed = True
+                if changed:
+                    _write_state(state_path, state)
+                time.sleep(5.0)
+                continue
             break
         time.sleep(1.0)
-        for gpu, (job, process, log, started) in list(running.items()):
+        for gpu, (job, process, log, started, log_start_offset) in list(
+            running.items()
+        ):
             return_code = process.poll()
             if return_code is None:
                 continue
+            log.flush()
             log.close()
+            cuda_oom = return_code != 0 and _log_segment_has_cuda_oom(
+                resolve_path(job.log_path), log_start_offset
+            )
+            ended = time.time()
+            attempt_history[job.job_id].append(
+                {
+                    "gpu": gpu,
+                    "start_time": started,
+                    "end_time": ended,
+                    "elapsed_seconds": ended - started,
+                    "return_code": return_code,
+                    "cuda_oom": cuda_oom,
+                }
+            )
             entry = state["jobs"][job.job_id]
-            entry["end_time"] = time.time()
+            entry["end_time"] = ended
             entry["elapsed_seconds"] = entry["end_time"] - started
             entry["return_code"] = return_code
+            entry["attempt_history"] = list(attempt_history[job.job_id])
             if return_code == 0:
                 try:
                     entry["artifact_validation"] = validator(job, job.artifact_path)
                     entry["status"] = "completed"
+                    entry["scheduler_status"] = "completed"
                 except Exception as error:
                     entry["status"] = "failed"
                     entry["error"] = f"{type(error).__name__}: {error}"
                     failure = True
+            elif cuda_oom and len(attempted_gpus[job.job_id]) < len(gpu_ids):
+                remaining = sorted(
+                    set(int(value) for value in gpu_ids).difference(
+                        attempted_gpus[job.job_id]
+                    )
+                )
+                with resolve_path(job.log_path).open("a", encoding="utf-8") as marker:
+                    marker.write(
+                        "\nGPU_SCHEDULER_RETRY reason=cuda_oom "
+                        f"failed_gpu={gpu} remaining_gpus={remaining}\n"
+                    )
+                entry.update(
+                    status="pending",
+                    gpu=None,
+                    pid=None,
+                    error=None,
+                    scheduler_status="retrying_after_cuda_oom",
+                    last_oom_gpu=gpu,
+                    oom_retries=sum(
+                        bool(value["cuda_oom"])
+                        for value in attempt_history[job.job_id]
+                    ),
+                    gpu_attempts=sorted(attempted_gpus[job.job_id]),
+                )
+                pending.append(job)
             else:
                 entry["status"] = "failed"
-                entry["error"] = f"process exited with code {return_code}"
+                entry["scheduler_status"] = "failed"
+                entry["error"] = (
+                    "CUDA OOM on every configured GPU attempted by this job: "
+                    f"{sorted(attempted_gpus[job.job_id])}"
+                    if cuda_oom
+                    else f"process exited with code {return_code}"
+                )
                 failure = True
             del running[gpu]
             _write_state(state_path, state)
