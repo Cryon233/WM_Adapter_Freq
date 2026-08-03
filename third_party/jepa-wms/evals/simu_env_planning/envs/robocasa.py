@@ -11,6 +11,7 @@ import time
 
 import gym
 import numpy as np
+import robocasa
 import robosuite
 from robocasa.utils.dataset_registry import MULTI_STAGE_TASK_DATASETS, SINGLE_STAGE_TASK_DATASETS
 from robocasa.utils.env_utils import create_env
@@ -18,9 +19,10 @@ from scipy.spatial.transform import Rotation as R
 
 from evals.simu_env_planning.envs.wrappers.time_limit import TimeLimit
 
-BASE_ASSET_ROOT_PATH = os.path.join(
-    os.environ.get("JEPAWM_HOME", os.path.expanduser("~")), "robocasa/robocasa/models/assets/objects"
+ROBOCASA_ASSET_ROOT_PATH = os.path.join(
+    os.path.dirname(robocasa.__file__), "models", "assets"
 )
+BASE_ASSET_ROOT_PATH = os.path.join(ROBOCASA_ASSET_ROOT_PATH, "objects")
 
 os.environ["MUJOCO_GL"] = "egl"
 os.environ["PYOPENGL_PLATFORM"] = "egl"
@@ -477,6 +479,16 @@ def path_change(xml_string):
 
     def replace_path(match):
         original_path = match.group(1)
+        asset_marker = "robocasa/models/assets/"
+        normalized_path = original_path.replace("\\", "/")
+        asset_index = normalized_path.find(asset_marker)
+        if asset_index != -1:
+            relative_path = normalized_path[asset_index + len(asset_marker) :]
+            new_path = os.path.normpath(
+                os.path.join(ROBOCASA_ASSET_ROOT_PATH, relative_path)
+            )
+            return f'file="{new_path}"'
+
         model_index = original_path.find("objects/")
         if model_index == -1:
             return f'file="{original_path}"'
