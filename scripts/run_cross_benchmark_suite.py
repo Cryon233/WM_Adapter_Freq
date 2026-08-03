@@ -13,6 +13,10 @@ from typing import Any
 
 from omegaconf import OmegaConf
 
+from wm_adapter.benchmarks.base import (
+    EVALUATION_MANIFEST_SCHEMA,
+    canonical_sha256,
+)
 from wm_adapter.benchmarks.factory import build_benchmark
 from wm_adapter.experiments.cross_benchmark import (
     PHASES,
@@ -371,6 +375,154 @@ def _manifest_paths(suite: Any, task: str) -> tuple[Path, Path]:
     return root / "tasks" / f"{task}.json", root / "evaluation" / f"{task}.json"
 
 
+def _validate_evaluation_manifest(
+    path: Path,
+    task_manifest: dict[str, Any],
+    required_count: int,
+) -> dict[str, Any]:
+    if not path.is_file():
+        raise FileNotFoundError(f"Evaluation manifest is missing: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("schema_version") != EVALUATION_MANIFEST_SCHEMA:
+        raise RuntimeError(f"Evaluation manifest schema mismatch: {path}")
+    supplied_hash = str(payload.get("evaluation_manifest_sha256", ""))
+    hash_payload = {
+        key: value
+        for key, value in payload.items()
+        if key != "evaluation_manifest_sha256"
+    }
+    if supplied_hash != canonical_sha256(hash_payload):
+        raise RuntimeError(f"Evaluation manifest fingerprint is invalid: {path}")
+    if str(payload.get("task_key")) != str(task_manifest["task_key"]):
+        raise RuntimeError(f"Evaluation manifest task identity mismatch: {path}")
+    if str(payload.get("task_manifest_sha256")) != str(
+        task_manifest["task_manifest_sha256"]
+    ):
+        raise RuntimeError(f"Evaluation manifest task fingerprint mismatch: {path}")
+    instances = list(payload.get("instances", []))
+    if len(instances) < required_count:
+        raise RuntimeError(
+            "Evaluation manifest has too few instances: "
+            f"required={required_count}, actual={len(instances)}, path={path}"
+        )
+    instance_ids = [str(value.get("instance_id", "")) for value in instances]
+    if any(not value for value in instance_ids) or len(instance_ids) != len(
+        set(instance_ids)
+    ):
+        raise RuntimeError(f"Evaluation manifest instance IDs are invalid: {path}")
+    return {
+        "path": str(path),
+        "sha256": sha256_file(path),
+        "evaluation_manifest_sha256": supplied_hash,
+        "available_instances": len(instances),
+    }
+
+
+def _reuse_completed_preflight(
+    suite: Any,
+    state: dict[str, Any],
+    job: JobSpec,
+    *,
+    self_test: bool,
+) -> bool:
+    entry = state.get("jobs", {}).get(job.job_id, {})
+    if entry.get("status") not in {"completed", "reused"}:
+        return False
+    stored_validation = entry.get("artifact_validation")
+    if not isinstance(stored_validation, dict):
+        return False
+    report = stored_validation.get("report")
+    if not isinstance(report, dict) or report.get("errors"):
+        return False
+    benchmark_report = report.get("benchmark_preflight")
+    if not isinstance(benchmark_report, dict) or not bool(
+        benchmark_report.get("deep_environment_check", False)
+    ):
+        return False
+    try:
+        task_validation = _validate_job(
+            suite,
+            state,
+            job,
+            job.artifact_path,
+            self_test=self_test,
+        )
+        task_manifest = json.loads(
+            resolve_path(job.artifact_path).read_text(encoding="utf-8")
+        )
+        _, evaluation_path = _manifest_paths(suite, job.task)
+        required_count = int(
+            suite.self_test.episodes if self_test else suite.main.episodes
+        )
+        evaluation_validation = _validate_evaluation_manifest(
+            evaluation_path,
+            task_manifest,
+            required_count,
+        )
+        reported_task = report.get("task", {})
+        reported_evaluation = report.get("evaluation_manifest", {})
+        resources = report.get("resources", {})
+        if str(reported_task.get("task_manifest_sha256")) != str(
+            task_manifest["task_manifest_sha256"]
+        ):
+            return False
+        if str(reported_evaluation.get("evaluation_manifest_sha256")) != str(
+            evaluation_validation["evaluation_manifest_sha256"]
+        ):
+            return False
+        if dict(resources.get("upstream_commits", {})) != UPSTREAM_COMMITS:
+            return False
+        for key in ("jepa_checkpoint", "dinov3_checkpoint", "official_planning_config"):
+            if not Path(str(resources.get(key, ""))).is_file():
+                return False
+    except (KeyError, OSError, TypeError, ValueError, RuntimeError):
+        return False
+    refreshed = dict(entry)
+    refreshed.update(
+        status="reused",
+        artifact_validation={
+            **stored_validation,
+            **task_validation,
+            "report": report,
+            "evaluation_manifest": evaluation_validation,
+        },
+        gpu=None,
+        pid=None,
+        error=None,
+        return_code=0,
+    )
+    state["jobs"][job.job_id] = refreshed
+    return True
+
+
+def _reset_failed_state_for_resume(
+    state: dict[str, Any], jobs: list[JobSpec]
+) -> None:
+    previous_jobs = dict(state.get("jobs", {}))
+    resumed_jobs: dict[str, dict[str, Any]] = {}
+    for job in jobs:
+        previous = previous_jobs.get(job.job_id)
+        if isinstance(previous, dict) and previous.get("status") in {
+            "completed",
+            "reused",
+        }:
+            resumed_jobs[job.job_id] = previous
+        else:
+            resumed_jobs[job.job_id] = job.state_fields() | {"status": "pending"}
+    state["jobs"] = resumed_jobs
+    for key in (
+        "error",
+        "traceback",
+        "failed_at_unix",
+        "completed_at_unix",
+        "stopped_at_unix",
+    ):
+        state.pop(key, None)
+    state["status"] = "preflight"
+    state["last_started_at_unix"] = time.time()
+    state["restart_count"] = int(state.get("restart_count", 0)) + 1
+
+
 def _cache_info(state: dict[str, Any], task: str) -> dict[str, Any]:
     entry = state["jobs"][f"cache/{task}"]
     return dict(entry["artifact_validation"])
@@ -578,6 +730,7 @@ def _run(suite: Any, jobs: list[JobSpec], *, self_test: bool) -> None:
             "suite": str(suite.suite_name), "protocol": str(suite.protocol),
             "status": "preflight", "started_at_unix": time.time(), "jobs": {},
         }
+    _reset_failed_state_for_resume(state, jobs)
     state["expected_jobs"] = len(jobs)
     state["state_path"] = str(state_path)
     state["git"] = {
@@ -591,10 +744,6 @@ def _run(suite: Any, jobs: list[JobSpec], *, self_test: bool) -> None:
     }
     state["gpu_ids"] = _gpu_ids(suite)
     state["self_test"] = self_test
-    for job in jobs:
-        state["jobs"].setdefault(
-            job.job_id, job.state_fields() | {"status": "pending"}
-        )
     state["phase_summary"] = phase_summary(state, jobs)
     from wm_adapter.benchmarks.base import atomic_json
     atomic_json(state_path, state)
@@ -604,13 +753,19 @@ def _run(suite: Any, jobs: list[JobSpec], *, self_test: bool) -> None:
         if self_test and str(task_key) not in {str(value) for value in suite.self_test.task_keys}:
             continue
         job_id = f"preflight/{task_key}"
+        job = next(value for value in jobs if value.job_id == job_id)
+        if _reuse_completed_preflight(
+            suite, state, job, self_test=self_test
+        ):
+            state["phase_summary"] = phase_summary(state, jobs)
+            atomic_json(state_path, state)
+            continue
         preflight_started = time.time()
         state["jobs"][job_id].update(
             status="running", start_time=preflight_started
         )
         state["phase_summary"] = phase_summary(state, jobs)
         atomic_json(state_path, state)
-        job = next(value for value in jobs if value.job_id == job_id)
         report = _run_isolated_preflight(
             suite, job, str(config_path), self_test=self_test
         )
