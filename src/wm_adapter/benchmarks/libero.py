@@ -531,6 +531,15 @@ class LiberoBenchmark(BenchmarkAdapter):
 
     def _arm_controller(self, environment: Any) -> tuple[Any, str]:
         candidates: list[tuple[str, Any]] = []
+        seen_controllers: set[int] = set()
+
+        def append_candidate(path: str, controller: Any) -> None:
+            identity = id(controller)
+            if identity in seen_controllers:
+                return
+            seen_controllers.add(identity)
+            candidates.append((path, controller))
+
         for wrapped_index, candidate in enumerate(
             self._unwrapped_environments(environment)
         ):
@@ -543,11 +552,14 @@ class LiberoBenchmark(BenchmarkAdapter):
                     if controller is None:
                         continue
                     path = f"env[{wrapped_index}].robots[{robot_index}].{attribute}"
-                    candidates.append((path, controller))
+                    append_candidate(path, controller)
                     parts = getattr(controller, "part_controllers", None)
                     if isinstance(parts, dict):
                         for name in sorted(parts):
-                            candidates.append((f"{path}.part_controllers[{name!r}]", parts[name]))
+                            append_candidate(
+                                f"{path}.part_controllers[{name!r}]",
+                                parts[name],
+                            )
         viable: list[tuple[str, Any]] = []
         for path, controller in candidates:
             required = ("input_min", "input_max", "output_min", "output_max")
