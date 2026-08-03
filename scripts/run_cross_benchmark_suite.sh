@@ -10,8 +10,20 @@ if [[ ! -f "$CONDA_SH" ]]; then
     exit 1
 fi
 source "$CONDA_SH"
+if [[ -n "${WM_ADAPTER_CONDA_ENV:-}" ]]; then
+    TARGET_CONDA_ENV="$WM_ADAPTER_CONDA_ENV"
+elif [[ -n "${CONDA_DEFAULT_ENV:-}" && "${CONDA_DEFAULT_ENV}" != "base" ]]; then
+    TARGET_CONDA_ENV="$CONDA_DEFAULT_ENV"
+else
+    TARGET_CONDA_ENV="wm-a100"
+fi
 set +u
-conda activate "${CONDA_ENV:-wm-a100}"
+if [[ "${CONDA_DEFAULT_ENV:-}" != "$TARGET_CONDA_ENV" ]]; then
+    if ! conda activate "$TARGET_CONDA_ENV"; then
+        echo "Could not activate cross-benchmark Conda environment: $TARGET_CONDA_ENV" >&2
+        exit 1
+    fi
+fi
 set -u
 if [[ ! -f ./env_jepa.sh ]]; then
     echo "Required JEPA-WM environment file not found: $ROOT/env_jepa.sh" >&2
