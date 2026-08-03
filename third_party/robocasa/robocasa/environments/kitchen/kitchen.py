@@ -520,6 +520,12 @@ class Kitchen(ManipulationEnv, metaclass=KitchenEnvMeta):
                 f"object_cfgs={self.object_cfgs!r}"
             )
         self.object_placements = object_placements
+        if self.external_xml_dummy:
+            robot_model.set_base_xpos(robot_base_pos)
+            robot_model.set_base_ori(robot_base_ori)
+            self.robot_rot = robot_base_ori
+            return
+
         delta_list = [-0.1, 0.1, 0.2, -0.2, -0.3, 0.3, -0.4, 0.4]
         existing = self._ep_meta.get("delta_num", [])
 
