@@ -329,6 +329,23 @@ class LiberoBenchmark(BenchmarkAdapter):
         bddl = Path(task_suite.get_task_bddl_file_path(task_id)).resolve()
         return task_suite, task, bddl, git_commit(repo)
 
+    @staticmethod
+    def _official_init_states(task: Any) -> Any:
+        from libero.libero import get_libero_path
+
+        init_states_path = (
+            Path(get_libero_path("init_states"))
+            / str(task.problem_folder)
+            / str(task.init_states_file)
+        ).resolve()
+        if not init_states_path.is_file():
+            raise FileNotFoundError(
+                f"Official LIBERO init-state file does not exist: {init_states_path}"
+            )
+        # Official LIBERO init states contain NumPy objects rather than model
+        # weights. PyTorch 2.6 requires the trusted-data mode to be explicit.
+        return torch.load(init_states_path, weights_only=False)
+
     def _dataset_path(self, task: Any) -> Path:
         suite_name = str(self.cfg.benchmark.suite)
         suite_override_name = (
@@ -774,7 +791,7 @@ class LiberoBenchmark(BenchmarkAdapter):
             inspected = self._inspect_dataset(dataset)
             if not bddl.is_file():
                 raise FileNotFoundError(f"LIBERO BDDL file does not exist: {bddl}")
-            init_states = task_suite.get_task_init_states(int(self.cfg.benchmark.task_id))
+            init_states = self._official_init_states(task)
             successful = list(inspected["successful_demonstrations"])
             train_indices, evaluation_indices = _validated_split_indices(
                 len(successful),
