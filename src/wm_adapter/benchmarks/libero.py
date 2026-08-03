@@ -654,6 +654,17 @@ class LiberoBenchmark(BenchmarkAdapter):
         input_type = getattr(controller, "input_type", None)
         input_reference_frame = getattr(controller, "input_ref_frame", None)
         controls_orientation = getattr(controller, "use_ori", None)
+        controller_module = type(controller).__module__
+        legacy_osc = (
+            controller_module == "robosuite.controllers.osc"
+            and type(controller).__name__ == "OperationalSpaceController"
+        )
+        if input_type is None and legacy_osc:
+            input_type = "delta" if getattr(controller, "use_delta", None) is True else "absolute"
+        if input_reference_frame is None and legacy_osc and input_type == "delta":
+            # robosuite 1.4 OSC applies scaled position deltas to ee_pos and
+            # axis-angle deltas to ee_ori_mat in simulator world coordinates.
+            input_reference_frame = "world"
         if input_type != "delta" or controls_orientation is not True:
             raise RuntimeError(
                 "LIBERO controller is not a verified 6-D delta OSC_POSE contract: "
@@ -716,6 +727,7 @@ class LiberoBenchmark(BenchmarkAdapter):
         )
         source = (
             f"{action_spec_source}; {controller_path}; {frequency_source}; "
+            f"controller_module={controller_module}; "
             "positive/negative gripper response verified from a common simulator state"
         )
         transform = ActionTransform(

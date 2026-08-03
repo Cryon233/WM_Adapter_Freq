@@ -18,6 +18,7 @@ from wm_adapter.experiments.cross_benchmark import (
     PHASES,
     JobSpec,
     archive_incomplete,
+    benchmark_subprocess_environment,
     load_suite_config,
     load_task_config,
     phase_summary,
@@ -46,6 +47,11 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--config", default=DEFAULT_SUITE_CONFIG)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--preflight-config", help=argparse.SUPPRESS)
+    parser.add_argument("--preflight-output", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--preflight-override", action="append", default=[], help=argparse.SUPPRESS
+    )
     return parser.parse_args()
 
 
@@ -109,6 +115,20 @@ def _resource_report(task_config: Any, *, strict: bool, deep: bool) -> dict[str,
         if actual != expected:
             errors.append(f"{name} commit mismatch: expected={expected}, actual={actual}")
     resources["upstream_commits"] = commits
+    if strict and str(task_config.benchmark.name) == "libero":
+        import robosuite
+
+        robosuite_version = str(getattr(robosuite, "__version__", "unknown"))
+        robosuite_path = Path(robosuite.__file__).resolve()
+        resources["libero_robosuite"] = {
+            "version": robosuite_version,
+            "path": str(robosuite_path),
+        }
+        if robosuite_version != "1.4.0":
+            errors.append(
+                "LIBERO must run with isolated robosuite 1.4.0: "
+                f"loaded version={robosuite_version}, path={robosuite_path}"
+            )
     benchmark = build_benchmark(task_config)
     task = benchmark.resolve_task(strict=False if not strict else True)
     if strict:
@@ -147,6 +167,80 @@ def _resource_report(task_config: Any, *, strict: bool, deep: bool) -> dict[str,
         report["task"] = task_manifest
         report["evaluation_manifest"] = evaluation
     return report
+
+
+def _run_preflight_child(args: argparse.Namespace) -> None:
+    if not args.preflight_output:
+        raise ValueError("--preflight-output is required with --preflight-config")
+    task_config = load_task_config(
+        args.preflight_config,
+        overrides=args.preflight_override,
+    )
+    report = _resource_report(task_config, strict=True, deep=True)
+    from wm_adapter.benchmarks.base import atomic_json
+
+    atomic_json(args.preflight_output, report)
+
+
+def _preflight_overrides(suite: Any, task_key: str, *, self_test: bool) -> list[str]:
+    if not self_test:
+        return []
+    return [
+        "paths.task_manifest="
+        f"{resolve_path(str(suite.manifest_root)) / 'tasks' / f'{task_key}.json'}",
+        "paths.evaluation_manifest="
+        f"{resolve_path(str(suite.manifest_root)) / 'evaluation' / f'{task_key}.json'}",
+        f"evaluation.num_episodes={int(suite.self_test.episodes)}",
+        f"data.num_train_windows={int(suite.self_test.windows)}",
+    ]
+
+
+def _run_isolated_preflight(
+    suite: Any,
+    job: JobSpec,
+    config_path: str,
+    *,
+    self_test: bool,
+) -> dict[str, Any]:
+    report_path = resolve_path(job.log_path).with_suffix(".report.json")
+    report_path.unlink(missing_ok=True)
+    command = [
+        sys.executable,
+        "scripts/run_cross_benchmark_suite.py",
+        "--preflight-config",
+        str(config_path),
+        "--preflight-output",
+        str(report_path),
+    ]
+    for value in _preflight_overrides(suite, job.task, self_test=self_test):
+        command.extend(("--preflight-override", value))
+    log_path = resolve_path(job.log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as log:
+        completed = subprocess.run(
+            command,
+            cwd=project_root(),
+            env=benchmark_subprocess_environment(job.benchmark),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+    if completed.returncode != 0:
+        report_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            "Isolated task preflight failed: "
+            f"task={job.task}, benchmark={job.benchmark}, "
+            f"return_code={completed.returncode}, log={log_path}"
+        )
+    if not report_path.is_file():
+        raise RuntimeError(
+            f"Isolated task preflight produced no report: {report_path}"
+        )
+    try:
+        return json.loads(report_path.read_text(encoding="utf-8"))
+    finally:
+        report_path.unlink(missing_ok=True)
 
 
 def _dry_run(suite: Any, jobs: list[JobSpec]) -> None:
@@ -516,18 +610,10 @@ def _run(suite: Any, jobs: list[JobSpec], *, self_test: bool) -> None:
         )
         state["phase_summary"] = phase_summary(state, jobs)
         atomic_json(state_path, state)
-        task_config = load_task_config(str(config_path))
-        if self_test:
-            task_config.paths.task_manifest = (
-                resolve_path(str(suite.manifest_root)) / "tasks" / f"{task_key}.json"
-            )
-            task_config.paths.evaluation_manifest = (
-                resolve_path(str(suite.manifest_root)) / "evaluation" / f"{task_key}.json"
-            )
-            task_config.evaluation.num_episodes = int(suite.self_test.episodes)
-            task_config.data.num_train_windows = int(suite.self_test.windows)
-        report = _resource_report(task_config, strict=True, deep=True)
         job = next(value for value in jobs if value.job_id == job_id)
+        report = _run_isolated_preflight(
+            suite, job, str(config_path), self_test=self_test
+        )
         entry = job.state_fields()
         preflight_ended = time.time()
         entry.update(
@@ -596,6 +682,9 @@ def _run(suite: Any, jobs: list[JobSpec], *, self_test: bool) -> None:
 
 def main() -> None:
     args = _arguments()
+    if args.preflight_config:
+        _run_preflight_child(args)
+        return
     suite = load_suite_config(args.config)
     if args.self_test:
         suite = _self_test_suite(suite)

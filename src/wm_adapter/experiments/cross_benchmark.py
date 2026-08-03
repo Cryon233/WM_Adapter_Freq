@@ -89,6 +89,45 @@ def load_task_config(path: str | Path, overrides: Iterable[str] = ()) -> DictCon
     return merged
 
 
+def benchmark_subprocess_environment(
+    benchmark: str,
+    *,
+    gpu: int | None = None,
+) -> dict[str, str]:
+    """Build an isolated subprocess environment for one benchmark.
+
+    The pinned LIBERO checkout requires robosuite 1.4, while the pinned
+    RoboCasa checkout uses its newer compositional-robot fork.  They cannot be
+    imported safely in the same interpreter, so only LIBERO child processes
+    receive the separately installed official compatibility tree.
+    """
+
+    environment = os.environ.copy()
+    if gpu is not None:
+        environment["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    if benchmark != "libero":
+        return environment
+    configured = environment.get("LIBERO_ROBOSUITE_ROOT", "").strip()
+    dependency_root = resolve_path(
+        configured or project_root() / "storage" / "dependencies" / "robosuite_1_4"
+    )
+    package = dependency_root / "robosuite" / "__init__.py"
+    if not package.is_file():
+        raise FileNotFoundError(
+            "LIBERO requires an isolated robosuite 1.4 installation; "
+            f"expected package at {package}. Set LIBERO_ROBOSUITE_ROOT to the "
+            "directory containing the official robosuite 1.4 package."
+        )
+    existing = environment.get("PYTHONPATH", "")
+    environment["PYTHONPATH"] = (
+        str(dependency_root)
+        if not existing
+        else f"{dependency_root}{os.pathsep}{existing}"
+    )
+    environment["LIBERO_ROBOSUITE_ROOT"] = str(dependency_root)
+    return environment
+
+
 def archive_incomplete(path: str | Path) -> Path:
     source = resolve_path(path)
     digest = sha256_file(source)[:12]
@@ -528,8 +567,7 @@ def run_gpu_phase(
                 log_path = resolve_path(job.log_path)
                 log_path.parent.mkdir(parents=True, exist_ok=True)
                 log = log_path.open("a", encoding="utf-8")
-                environment = os.environ.copy()
-                environment["CUDA_VISIBLE_DEVICES"] = str(gpu)
+                environment = benchmark_subprocess_environment(job.benchmark, gpu=gpu)
                 process = subprocess.Popen(
                     list(job.command),
                     cwd=project_root(),
