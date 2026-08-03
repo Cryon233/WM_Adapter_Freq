@@ -105,6 +105,8 @@ def benchmark_subprocess_environment(
     environment = os.environ.copy()
     if gpu is not None:
         environment["CUDA_VISIBLE_DEVICES"] = str(gpu)
+        if benchmark == "robocasa":
+            environment["MUJOCO_EGL_DEVICE_ID"] = str(gpu)
     if benchmark != "libero":
         return environment
     configured = environment.get("LIBERO_ROBOSUITE_ROOT", "").strip()

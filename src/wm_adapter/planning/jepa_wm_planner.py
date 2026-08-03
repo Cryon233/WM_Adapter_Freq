@@ -310,6 +310,18 @@ def run_robocasa_planning(
     official_cfg.logging.tqdm_silent = bool(experiment_config.evaluation.tqdm_silent)
     official_cfg.planner.decode_each_iteration = False
     official_cfg.planner.candidate_chunk_size = int(experiment_config.planning.candidate_chunk_size)
+    dataset_frameskip = int(official_cfg.model_kwargs.data.custom.frameskip)
+    configured_goal_span = experiment_config.evaluation.get("goal_span_steps")
+    goal_span_steps: int | None = None
+    if configured_goal_span is not None:
+        goal_span_steps = int(configured_goal_span)
+        if goal_span_steps <= 0 or goal_span_steps % dataset_frameskip != 0:
+            raise ValueError(
+                "RoboCasa evaluation goal span must be a positive multiple of the "
+                f"dataset frameskip: goal_span_steps={goal_span_steps}, "
+                f"frameskip={dataset_frameskip}"
+            )
+        official_cfg.task_specification.goal_H = goal_span_steps // dataset_frameskip
     resolved_task_name = str(experiment_config.benchmark.get("task_name", ""))
     if resolved_task_name and resolved_task_name not in {"articulated", "auto_articulated"}:
         official_cfg.task_specification.task = f"robocasa-{resolved_task_name}"
@@ -383,6 +395,26 @@ def run_robocasa_planning(
             raise RuntimeError(
                 f"RoboCasa evaluation manifest has {len(manifest_instances)} instances; "
                 f"{total_episodes} are required: {manifest_path}"
+            )
+        invalid_spans = (
+            [
+                {
+                    "instance_id": str(instance.get("instance_id", "")),
+                    "start": int(instance["segment_start"]),
+                    "end": int(instance["segment_end"]),
+                }
+                for instance in manifest_instances
+                if int(instance["segment_end"]) - int(instance["segment_start"])
+                != goal_span_steps
+            ]
+            if goal_span_steps is not None
+            else []
+        )
+        if invalid_spans:
+            raise RuntimeError(
+                "RoboCasa evaluation manifest segment span mismatch: "
+                f"expected={goal_span_steps}, invalid={invalid_spans}, "
+                f"path={manifest_path}"
             )
         cem_seed_mode = str(manifest.get("cem_seed_mode", "per_instance"))
         if cem_seed_mode not in {"per_instance", "continuous_generator_stream"}:
