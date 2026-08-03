@@ -420,6 +420,13 @@ def run_robocasa_planning(
                 f"RoboCasa evaluation manifest has {len(manifest_instances)} instances; "
                 f"{total_episodes} are required: {manifest_path}"
             )
+        # The pinned Place evaluator samples the complete contiguous
+        # ``subtask=place`` slice.  Compatibility manifests preserve that exact
+        # official sampling stream; fixed-span validation applies to every
+        # other v2 manifest.
+        variable_official_place_segment = bool(
+            manifest.get("legacy_place_reuse_compatible", False)
+        ) and str(experiment_config.benchmark.task_key) == "robocasa_place"
         invalid_spans = (
             [
                 {
@@ -431,7 +438,7 @@ def run_robocasa_planning(
                 if int(instance["segment_end"]) - int(instance["segment_start"])
                 != goal_span_steps
             ]
-            if goal_span_steps is not None
+            if goal_span_steps is not None and not variable_official_place_segment
             else []
         )
         if invalid_spans:
