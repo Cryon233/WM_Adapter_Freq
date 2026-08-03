@@ -1480,6 +1480,11 @@ class Kitchen(ManipulationEnv, metaclass=KitchenEnvMeta):
         """
         super().update_state()
 
+        # Dataset XML replay uses fixture names from the recorded simulator,
+        # not the procedurally-created dummy task model.
+        if getattr(self, "_external_model_xml_replay", False):
+            return
+
         for fixtr in self.fixtures.values():
             fixtr.update_state(self)
 

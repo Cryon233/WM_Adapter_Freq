@@ -78,10 +78,11 @@ class ManipulateDrawer(Kitchen):
         Reset the environment internal state for the drawer tasks.
         This includes setting the drawer state based on the behavior
         """
-        if self.behavior == "open":
-            self.drawer.set_door_state(min=0.0, max=0.0, env=self, rng=self.rng)
-        elif self.behavior == "close":
-            self.drawer.set_door_state(min=0.90, max=1.0, env=self, rng=self.rng)
+        if not getattr(self, "_external_model_xml_replay", False):
+            if self.behavior == "open":
+                self.drawer.set_door_state(min=0.0, max=0.0, env=self, rng=self.rng)
+            elif self.behavior == "close":
+                self.drawer.set_door_state(min=0.90, max=1.0, env=self, rng=self.rng)
         # set the door state then place the objects otherwise objects initialized in opened drawer will fall down before the drawer is opened
         super()._reset_internal()
 
@@ -166,7 +167,38 @@ class ManipulateDrawer(Kitchen):
         Returns:
             bool: True if the task is successful, False otherwise.
         """
-        door_state = self.drawer.get_door_state(env=self)
+        if getattr(self, "_external_model_xml_replay", False):
+            fixture_refs = self._ep_meta.get("fixture_refs", {})
+            drawer_name = fixture_refs.get("drawer")
+            if not drawer_name:
+                raise RuntimeError(
+                    "External RoboCasa drawer replay is missing fixture_refs.drawer"
+                )
+            joint_name = f"{drawer_name}_slidejoint"
+            try:
+                joint_id = self.sim.model.joint_name2id(joint_name)
+            except ValueError as error:
+                raise RuntimeError(
+                    "External RoboCasa drawer replay cannot find recorded drawer "
+                    f"joint: {joint_name}"
+                ) from error
+            joint_range = np.asarray(self.sim.model.jnt_range[joint_id], dtype=np.float64)
+            if joint_range.shape != (2,) or not (
+                np.isfinite(joint_range).all()
+                and joint_range[0] < 0.0
+                and np.isclose(joint_range[1], 0.0)
+            ):
+                raise RuntimeError(
+                    "External RoboCasa drawer replay requires a negative slide-joint "
+                    f"range ending at zero: joint={joint_name}, "
+                    f"range={joint_range.tolist()}"
+                )
+            joint_qpos = float(self.sim.data.get_joint_qpos(joint_name))
+            door_state = {
+                "door": (-joint_qpos) / (-float(joint_range[0])),
+            }
+        else:
+            door_state = self.drawer.get_door_state(env=self)
 
         success = True
         for joint_p in door_state.values():

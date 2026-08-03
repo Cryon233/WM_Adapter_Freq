@@ -326,6 +326,7 @@ class RoboCasaWrapper(gym.Wrapper):
                 "Loading external RoboCasa model XML with stale dummy task-model "
                 "ID mappings disabled"
             )
+            self.env._external_model_xml_replay = True
             self.env._skip_model_id_mappings_on_external_xml_reset = True
             try:
                 self.env.reset_from_xml_string(xml)
@@ -334,6 +335,7 @@ class RoboCasaWrapper(gym.Wrapper):
             self.env.sim.reset()
             logger.info("Finished resetting from provided model XML")
         else:
+            self.env._external_model_xml_replay = False
             self.reset()
 
         flattened_init_state = np.asarray(init_state).reshape(-1)
