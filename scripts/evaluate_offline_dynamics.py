@@ -49,12 +49,28 @@ def _backend(cfg: Any) -> JEPAWMDroidBackend:
 def _load_method(
     cfg: Any,
     backend: JEPAWMDroidBackend,
-) -> tuple[PEFTMethod, str | None, dict[str, Any]]:
+    resolved_task: Any,
+) -> tuple[PEFTMethod, str | None, dict[str, Any], bool]:
     method = build_method(str(cfg.method), backend, cfg.method_config).to(backend.device)
     if method.method_name == "base":
-        return method, None, {}
+        return method, None, {}, False
     checkpoint_path = resolve_path(cfg.paths.method_checkpoint)
     checkpoint = load_method_checkpoint(checkpoint_path)
+    data_metadata = dict(checkpoint.get("data_metadata", {}))
+    actual_identity = (
+        str(data_metadata.get("benchmark", "")),
+        str(data_metadata.get("task_key", "")),
+    )
+    standard_checkpoint = resolve_path(
+        "checkpoints/cross_benchmark_v1/"
+        f"{resolved_task.benchmark}/{resolved_task.task_key}/{method.method_name}_final.pt"
+    )
+    legacy_place = (
+        resolved_task.benchmark == "robocasa"
+        and resolved_task.task_key == "robocasa_place"
+        and checkpoint_path != standard_checkpoint
+        and actual_identity == ("", "")
+    )
     expected_appearance = ComposedPhotometricShift.metadata(
         float(cfg.appearance.get("training_severity", cfg.appearance.severity)),
         int(cfg.appearance.training_seed),
@@ -82,19 +98,24 @@ def _load_method(
         "canonical_weight": float(cfg.training.get("canonical_weight", 1.0)),
         "dynamics_weight": float(cfg.training.get("dynamics_weight", 1.0)),
     }
+    actual_training = {
+        key: training_config.get(
+            key,
+            1.0 if legacy_place and key in {"canonical_weight", "dynamics_weight"} else -1,
+        )
+        for key in expected_training
+    }
     training_mismatch = {
         key: {"expected": value, "actual": training_config.get(key)}
         for key, value in expected_training.items()
-        if float(training_config.get(key, -1)) != float(value)
+        if float(actual_training[key]) != float(value)
     }
     if training_mismatch:
         raise RuntimeError(
             f"Offline checkpoint training-contract mismatch: {training_mismatch}"
         )
     method.load_method_checkpoint(checkpoint["peft_state_dict"])
-    return method.eval(), sha256_file(checkpoint_path), dict(
-        checkpoint.get("data_metadata", {})
-    )
+    return method.eval(), sha256_file(checkpoint_path), data_metadata, legacy_place
 
 
 def _sample_mse(predicted: Tensor, target: Tensor) -> Tensor:
@@ -169,8 +190,13 @@ def main() -> None:
     backend = _backend(cfg)
     benchmark = build_benchmark(cfg)
     resolved_task = benchmark.resolve_task(strict=True)
-    method, method_checkpoint_sha256, checkpoint_data_metadata = _load_method(
-        cfg, backend
+    (
+        method,
+        method_checkpoint_sha256,
+        checkpoint_data_metadata,
+        legacy_place,
+    ) = _load_method(
+        cfg, backend, resolved_task
     )
     if method.method_name != "base":
         actual_identity = (
@@ -178,17 +204,6 @@ def main() -> None:
             str(checkpoint_data_metadata.get("task_key", "")),
         )
         expected_identity = (resolved_task.benchmark, resolved_task.task_key)
-        checkpoint_path = resolve_path(cfg.paths.method_checkpoint)
-        standard_checkpoint = resolve_path(
-            "checkpoints/cross_benchmark_v1/"
-            f"{resolved_task.benchmark}/{resolved_task.task_key}/{method.method_name}_final.pt"
-        )
-        legacy_place = (
-            resolved_task.benchmark == "robocasa"
-            and resolved_task.task_key == "robocasa_place"
-            and checkpoint_path != standard_checkpoint
-            and actual_identity == ("", "")
-        )
         if actual_identity != expected_identity and not legacy_place:
             raise RuntimeError(
                 "Offline checkpoint benchmark/task mismatch: "

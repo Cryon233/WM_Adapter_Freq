@@ -73,27 +73,6 @@ def main() -> None:
             raise RuntimeError(f"Method checkpoint upstream commit mismatch: {checkpoint_path}")
         if checkpoint["appearance_metadata"] != training_appearance:
             raise RuntimeError(f"Method checkpoint training appearance mismatch: {checkpoint_path}")
-        checkpoint_training = dict(checkpoint.get("training_config", {}))
-        expected_training = {
-            "seed": int(cfg.training.seed),
-            "canonical_weight": float(cfg.training.get("canonical_weight", 1.0)),
-            "dynamics_weight": float(cfg.training.get("dynamics_weight", 1.0)),
-        }
-        training_mismatch = {
-            key: {"expected": value, "actual": checkpoint_training.get(key)}
-            for key, value in expected_training.items()
-            if float(checkpoint_training.get(key, -1)) != float(value)
-        }
-        if training_mismatch:
-            raise RuntimeError(
-                f"Method checkpoint training-contract mismatch: {training_mismatch}"
-            )
-        method.load_method_checkpoint(checkpoint["peft_state_dict"])
-        if int(checkpoint["trainable_parameter_count"]) != method.parameter_count():
-            raise RuntimeError(
-                f"Method parameter count mismatch: checkpoint={checkpoint['trainable_parameter_count']}, "
-                f"model={method.parameter_count()}"
-            )
         data_metadata = dict(checkpoint.get("data_metadata", {}))
         actual_identity = (
             str(data_metadata.get("benchmark", "")),
@@ -110,6 +89,36 @@ def main() -> None:
             and checkpoint_path != standard_checkpoint
             and actual_identity == ("", "")
         )
+        checkpoint_training = dict(checkpoint.get("training_config", {}))
+        expected_training = {
+            "seed": int(cfg.training.seed),
+            "canonical_weight": float(cfg.training.get("canonical_weight", 1.0)),
+            "dynamics_weight": float(cfg.training.get("dynamics_weight", 1.0)),
+        }
+        actual_training = {
+            key: checkpoint_training.get(
+                key,
+                1.0
+                if legacy_place and key in {"canonical_weight", "dynamics_weight"}
+                else -1,
+            )
+            for key in expected_training
+        }
+        training_mismatch = {
+            key: {"expected": value, "actual": checkpoint_training.get(key)}
+            for key, value in expected_training.items()
+            if float(actual_training[key]) != float(value)
+        }
+        if training_mismatch:
+            raise RuntimeError(
+                f"Method checkpoint training-contract mismatch: {training_mismatch}"
+            )
+        method.load_method_checkpoint(checkpoint["peft_state_dict"])
+        if int(checkpoint["trainable_parameter_count"]) != method.parameter_count():
+            raise RuntimeError(
+                f"Method parameter count mismatch: checkpoint={checkpoint['trainable_parameter_count']}, "
+                f"model={method.parameter_count()}"
+            )
         if actual_identity != expected_identity and not legacy_place:
             raise RuntimeError(
                 "Method checkpoint benchmark/task mismatch: "
