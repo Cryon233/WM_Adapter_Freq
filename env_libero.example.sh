@@ -1,6 +1,9 @@
 export LIBERO_ROOT="/absolute/path/to/LIBERO"
 export LIBERO_DATA_ROOT="/absolute/path/to/libero/datasets"
 export LIBERO_CONFIG_PATH="/absolute/path/to/libero/config"
+# LIBERO is pinned to robosuite 1.4.0, independently of the newer RoboCasa
+# fork. This directory must contain robosuite/__init__.py and its dependencies.
+export LIBERO_ROBOSUITE_ROOT="/absolute/path/to/isolated/robosuite_1_4"
 # Optional suite-specific overrides:
 export LIBERO_SPATIAL_DATA_ROOT="/absolute/path/to/libero_spatial"
 export LIBERO_GOAL_DATA_ROOT="/absolute/path/to/libero_goal"
