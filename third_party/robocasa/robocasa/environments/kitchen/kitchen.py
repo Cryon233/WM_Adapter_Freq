@@ -242,6 +242,7 @@ class Kitchen(ManipulationEnv, metaclass=KitchenEnvMeta):
         use_distractors=False,
         translucent_robot=False,
         randomize_cameras=False,
+        external_xml_dummy=False,
         mode=0,  # mode 0: Eval/MG Mode1:Teleop
     ):
         self.init_robot_base_pos = init_robot_base_pos
@@ -276,6 +277,7 @@ class Kitchen(ManipulationEnv, metaclass=KitchenEnvMeta):
         self.use_distractors = use_distractors
         self.translucent_robot = translucent_robot
         self.randomize_cameras = randomize_cameras
+        self.external_xml_dummy = bool(external_xml_dummy)
 
         if isinstance(robots, str):
             robots = [robots]
@@ -661,7 +663,11 @@ class Kitchen(ManipulationEnv, metaclass=KitchenEnvMeta):
             microwavable=cfg.get("microwavable", None),
             cookable=cfg.get("cookable", None),
             freezable=cfg.get("freezable", None),
-            max_size=cfg.get("max_size", (None, None, None)),
+            max_size=(
+                None
+                if self.external_xml_dummy
+                else cfg.get("max_size", (None, None, None))
+            ),
             object_scale=cfg.get("object_scale", None),
         )
         info = object_info

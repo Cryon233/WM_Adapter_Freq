@@ -401,11 +401,14 @@ def make_env(cfg):
     is_droid = cfg.task_specification.env.get("rescale_act_droid_to_rcasa", False)
     default_gripper = "Robotiq85Gripper" if is_droid else "default"
     gripper_types = cfg.task_specification.env.get("gripper_types", default_gripper)
+    external_xml_dummy = cfg.task_specification.get("goal_source") == "dset"
     logger.info(
-        "Creating RoboCasa environment with robot=%s, gripper_types=%s, is_droid=%s",
+        "Creating RoboCasa environment with robot=%s, gripper_types=%s, "
+        "is_droid=%s, external_xml_dummy=%s",
         robot,
         gripper_types,
         is_droid,
+        external_xml_dummy,
     )
     # Dummy env that is later modified in RobocasaWrapper.prepare()
     # logger.info(f"Creating dummy RoboCasa PnPSinkToCounter..")
@@ -418,6 +421,7 @@ def make_env(cfg):
         camera_heights=cfg.task_specification.img_size,
         seed=cfg.meta.seed,
         render_onscreen=False,
+        external_xml_dummy=external_xml_dummy,
     )
     env = RoboCasaWrapper(
         env, cfg, env_name, camera_name=cfg.task_specification.env.get("camera_name", "robot0_agentview_left")
