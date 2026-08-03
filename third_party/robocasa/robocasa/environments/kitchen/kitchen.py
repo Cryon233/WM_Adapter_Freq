@@ -1497,6 +1497,9 @@ class Kitchen(ManipulationEnv, metaclass=KitchenEnvMeta):
                 component should be visualized. Should have "grippers" keyword as well as any other relevant
                 options specified.
         """
+        if getattr(self, "_external_model_xml_replay", False):
+            return
+
         # Run superclass method first
         super().visualize(vis_settings=vis_settings)
 
