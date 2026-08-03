@@ -11,7 +11,10 @@ from wm_adapter.appearance.composed_photometric import ComposedPhotometricShift
 from wm_adapter.backends.jepa_wm_droid import JEPAWMDroidBackend
 from wm_adapter.benchmarks.factory import build_benchmark
 from wm_adapter.data.feature_cache import CACHE_SCHEMA_VERSION
-from wm_adapter.data.feature_cache_v2 import CACHE_SCHEMA_VERSION_V2
+from wm_adapter.data.feature_cache_v2 import (
+    CACHE_SCHEMA_VERSION_V2,
+    cache_file_sha256_from_verified_state_v2,
+)
 from wm_adapter.experiments.cross_benchmark import (
     normalize_metadata_contract,
     training_contract_mismatches_v2,
@@ -22,6 +25,7 @@ from wm_adapter.planning.jepa_wm_planner import (
     EVALUATION_PROTOCOL_VERSION,
     save_planning_results,
 )
+from wm_adapter.training.trainer_v2 import CHECKPOINT_SCHEMA_V2
 from wm_adapter.utils.checkpoints import load_method_checkpoint, sha256_file
 from wm_adapter.utils.reproducibility import load_experiment_config, resolve_path, seed_everything
 
@@ -63,7 +67,12 @@ def main() -> None:
     if method_name != "base":
         checkpoint_path = resolve_path(cfg.paths.method_checkpoint)
         checkpoint = load_method_checkpoint(checkpoint_path)
-        checkpoint_v2 = checkpoint.get("schema_version") == "wm_adapter_checkpoint_v2"
+        if checkpoint.get("schema_version") == "wm_adapter_checkpoint_v2":
+            raise RuntimeError(
+                "Planning rejects obsolete v2 checkpoints without the cache-file "
+                f"integrity contract: {checkpoint_path}"
+            )
+        checkpoint_v2 = checkpoint.get("schema_version") == CHECKPOINT_SCHEMA_V2
         if checkpoint["method_name"] != method_name:
             raise RuntimeError(
                 f"Method checkpoint is for {checkpoint['method_name']!r}, requested {method_name!r}: {checkpoint_path}"
@@ -190,6 +199,16 @@ def main() -> None:
     with h5py.File(configured_cache, "r", libver="latest", swmr=True) as cache:
         cache_schema = str(cache.attrs.get("schema_version", ""))
         configured_cache_fingerprint = str(cache.attrs["cache_fingerprint"])
+    cache_file_sha256 = (
+        cache_file_sha256_from_verified_state_v2(
+            configured_cache,
+            expected_sha256=cfg.cache.get("expected_file_sha256"),
+            expected_size=cfg.cache.get("expected_file_size"),
+            expected_mtime_ns=cfg.cache.get("expected_file_mtime_ns"),
+        )
+        if cache_schema == CACHE_SCHEMA_VERSION_V2
+        else sha256_file(configured_cache)
+    )
     expected_cache_schema = (
         CACHE_SCHEMA_VERSION_V2
         if str(cfg.training.get("loss_name", "")) == "unified_trajectory_mse"
@@ -206,6 +225,23 @@ def main() -> None:
             "Planning method checkpoint and feature cache fingerprints differ: "
             f"checkpoint={cache_fingerprint}, cache={configured_cache_fingerprint}"
         )
+    if method_name != "base" and checkpoint_v2:
+        expected_cache_file_sha256 = str(checkpoint["cache_file_sha256"])
+        if expected_cache_file_sha256 != cache_file_sha256:
+            raise RuntimeError(
+                "Planning method checkpoint and feature cache file fingerprints differ: "
+                f"checkpoint={expected_cache_file_sha256}, "
+                f"cache={cache_file_sha256}, path={configured_cache}"
+            )
+        metadata_cache_file_sha256 = str(
+            checkpoint.get("data_metadata", {}).get("cache_file_sha256", "")
+        )
+        if metadata_cache_file_sha256 != cache_file_sha256:
+            raise RuntimeError(
+                "Planning checkpoint data metadata/cache file fingerprint mismatch: "
+                f"checkpoint={metadata_cache_file_sha256}, "
+                f"cache={cache_file_sha256}, path={configured_cache}"
+            )
     cache_fingerprint = configured_cache_fingerprint
     backend.configure_planning_inference(
         inference_precision=str(cfg.planning.inference_precision),
@@ -314,10 +350,11 @@ def main() -> None:
         "dinov3_checkpoint_sha256": backend.dinov3_checkpoint_sha256,
         "method_checkpoint_sha256": checkpoint_fingerprint,
         "cache_fingerprint": cache_fingerprint,
+        "cache_file_sha256": cache_file_sha256,
         "cache_schema_version": cache_schema,
         "checkpoint_schema_version": (
             "base" if method_name == "base" else
-            "wm_adapter_checkpoint_v2"
+            CHECKPOINT_SCHEMA_V2
             if str(cfg.training.get("loss_name", "")) == "unified_trajectory_mse"
             else "wm_adapter_checkpoint_v1"
         ),

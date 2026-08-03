@@ -20,11 +20,16 @@ from wm_adapter.appearance.composed_photometric import ComposedPhotometricShift
 from wm_adapter.backends.jepa_wm_droid import JEPAWMDroidBackend
 from wm_adapter.backends.frozen_projection import frozen_base_projection
 from wm_adapter.benchmarks.factory import build_benchmark
+from wm_adapter.data.feature_cache_v2 import (
+    CACHE_SCHEMA_VERSION_V2,
+    cache_file_sha256_from_verified_state_v2,
+)
 from wm_adapter.experiments.cross_benchmark import (
     normalize_metadata_contract,
     training_contract_mismatches_v2,
     training_contract_v2,
 )
+from wm_adapter.training.trainer_v2 import CHECKPOINT_SCHEMA_V2
 from wm_adapter.utils.checkpoints import load_method_checkpoint, sha256_file
 from wm_adapter.utils.reproducibility import (
     load_experiment_config,
@@ -62,7 +67,12 @@ def _load_method(
         return method, None, {}, False
     checkpoint_path = resolve_path(cfg.paths.method_checkpoint)
     checkpoint = load_method_checkpoint(checkpoint_path)
-    checkpoint_v2 = checkpoint.get("schema_version") == "wm_adapter_checkpoint_v2"
+    if checkpoint.get("schema_version") == "wm_adapter_checkpoint_v2":
+        raise RuntimeError(
+            "Offline evaluation rejects obsolete v2 checkpoints without the "
+            f"cache-file integrity contract: {checkpoint_path}"
+        )
+    checkpoint_v2 = checkpoint.get("schema_version") == CHECKPOINT_SCHEMA_V2
     data_metadata = dict(checkpoint.get("data_metadata", {}))
     actual_identity = (
         str(data_metadata.get("benchmark", "")),
@@ -313,6 +323,27 @@ def main() -> None:
     with h5py.File(configured_cache, "r", libver="latest", swmr=True) as cache_handle:
         cache_schema_version = str(cache_handle.attrs.get("schema_version", ""))
         cache_fingerprint = str(cache_handle.attrs.get("cache_fingerprint", ""))
+    cache_file_sha256 = (
+        cache_file_sha256_from_verified_state_v2(
+            configured_cache,
+            expected_sha256=cfg.cache.get("expected_file_sha256"),
+            expected_size=cfg.cache.get("expected_file_size"),
+            expected_mtime_ns=cfg.cache.get("expected_file_mtime_ns"),
+        )
+        if cache_schema_version == CACHE_SCHEMA_VERSION_V2
+        else sha256_file(configured_cache)
+    )
+    if (
+        method.method_name != "base"
+        and not legacy_place
+        and checkpoint_data_metadata.get("cache_file_sha256")
+        != cache_file_sha256
+    ):
+        raise RuntimeError(
+            "Offline checkpoint/cache file fingerprint mismatch: "
+            f"checkpoint={checkpoint_data_metadata.get('cache_file_sha256')}, "
+            f"cache={cache_file_sha256}, path={configured_cache}"
+        )
     precision = str(cfg.planning.inference_precision)
     autocast = (
         lambda: torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -495,12 +526,13 @@ def main() -> None:
         "checkpoint_schema_version": (
             "base"
             if method.method_name == "base"
-            else "wm_adapter_checkpoint_v2"
+            else CHECKPOINT_SCHEMA_V2
             if str(cfg.training.get("loss_name", "")) == "unified_trajectory_mse"
             else "wm_adapter_checkpoint_v1"
         ),
         "cache_schema_version": cache_schema_version,
         "cache_fingerprint": cache_fingerprint,
+        "cache_file_sha256": cache_file_sha256,
         "base_checkpoint_sha256": backend.base_checkpoint_sha256,
         "dinov3_checkpoint_sha256": backend.dinov3_checkpoint_sha256,
         "upstream_commits": backend.upstream_commits,

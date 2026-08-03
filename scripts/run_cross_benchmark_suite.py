@@ -374,6 +374,21 @@ def _wire_job(job: JobSpec, state: dict[str, Any]) -> JobSpec:
         cache_id = f"cache/{job.task}"
         if cache_id in state["jobs"]:
             command.append(f"paths.feature_cache={_effective_artifact(state, cache_id)}")
+            cache_validation = state["jobs"][cache_id].get("artifact_validation")
+            if (
+                isinstance(cache_validation, dict)
+                and cache_validation.get("content_verified") is True
+            ):
+                command.extend(
+                    (
+                        "+cache.expected_file_sha256="
+                        f"{cache_validation['cache_file_sha256']}",
+                        "+cache.expected_file_size="
+                        f"{cache_validation['cache_file_size']}",
+                        "+cache.expected_file_mtime_ns="
+                        f"{cache_validation['cache_file_mtime_ns']}",
+                    )
+                )
     dependency = _dependency_job(job)
     if (
         job.kind != "checkpoint"
@@ -548,6 +563,7 @@ def _reset_failed_state_for_resume(
         "failed_at_unix",
         "completed_at_unix",
         "stopped_at_unix",
+        "stop_reason",
     ):
         state.pop(key, None)
     state["status"] = "preflight"
@@ -558,6 +574,28 @@ def _reset_failed_state_for_resume(
 def _cache_info(state: dict[str, Any], task: str) -> dict[str, Any]:
     entry = state["jobs"][f"cache/{task}"]
     return dict(entry["artifact_validation"])
+
+
+def _can_reuse_cache_content_verification(
+    previous: dict[str, Any] | None,
+    current: dict[str, Any],
+    *,
+    standard_source: bool,
+) -> bool:
+    return bool(
+        standard_source
+        and isinstance(previous, dict)
+        and previous.get("content_verified") is True
+        and (
+            current.get("cache_file_sha256") is None
+            or previous.get("cache_file_sha256")
+            == current.get("cache_file_sha256")
+        )
+        and int(previous.get("cache_file_size", -1))
+        == int(current.get("cache_file_size", -2))
+        and int(previous.get("cache_file_mtime_ns", -1))
+        == int(current.get("cache_file_mtime_ns", -2))
+    )
 
 
 def _validate_job(
@@ -624,7 +662,17 @@ def _validate_job(
         }
         if is_v2:
             resources = state["jobs"][f"preflight/{job.task}"]["artifact_validation"]["report"]["resources"]
-            return validate_cache_v2(
+            task_config = load_task_config(str(suite.tasks[job.task]))
+            verify_content = bool(
+                task_config.cache.get("verify_content_on_reuse", True)
+            )
+            chunk_windows = int(
+                task_config.cache.get("content_verification_chunk_windows", 8)
+            )
+            previous = state.get("jobs", {}).get(job.job_id, {}).get(
+                "artifact_validation"
+            )
+            quick = validate_cache_v2(
                 path, int(job.required_count or 0), benchmark=job.benchmark,
                 task=job.task,
                 expected_task_manifest_sha256=str(task_manifest["task_manifest_sha256"]),
@@ -647,7 +695,50 @@ def _validate_job(
                 expected_camera_contract=camera_contract,
                 expected_base_checkpoint_sha256=str(resources["jepa_checkpoint_sha256"]),
                 expected_dinov3_checkpoint_sha256=str(resources["dinov3_checkpoint_sha256"]),
+                include_file_sha256=not verify_content,
             )
+            standard_source = resolve_path(path) == resolve_path(job.artifact_path)
+            unchanged_verified = _can_reuse_cache_content_verification(
+                previous,
+                quick,
+                standard_source=standard_source,
+            )
+            if verify_content and not unchanged_verified:
+                return validate_cache_v2(
+                    path, int(job.required_count or 0), benchmark=job.benchmark,
+                    task=job.task,
+                    expected_task_manifest_sha256=str(task_manifest["task_manifest_sha256"]),
+                    expected_dataset_sha256=str(task_manifest["dataset_sha256"]),
+                    expected_camera_key=str(task_manifest["camera_key"]),
+                    expected_task_upstream_commits=dict(
+                        task_manifest.get("upstream_commits", {})
+                    ),
+                    expected_dataset_format=task_manifest.get("dataset_format"),
+                    expected_dataset_source_identifier=task_manifest.get(
+                        "dataset_source_identifier"
+                    ),
+                    expected_dataset_revision=task_manifest.get("dataset_revision"),
+                    expected_robot=task_manifest.get("robot"),
+                    expected_gripper=task_manifest.get("gripper"),
+                    expected_controller_contract=task_manifest.get("controller_contract"),
+                    expected_action_transform=task_manifest.get("action_transform"),
+                    expected_camera_contract=camera_contract,
+                    expected_base_checkpoint_sha256=str(resources["jepa_checkpoint_sha256"]),
+                    expected_dinov3_checkpoint_sha256=str(resources["dinov3_checkpoint_sha256"]),
+                    deep_verify=True,
+                    content_verification_chunk_windows=chunk_windows,
+                )
+            if unchanged_verified:
+                for key in (
+                    "sha256",
+                    "cache_file_sha256",
+                    "content_verified",
+                    "content_verified_at_unix",
+                    "recomputed_array_content_sha256",
+                    "recomputed_content_sha256",
+                ):
+                    quick[key] = previous[key]
+            return quick
         return validate_cache(
             path, int(job.required_count or 0), benchmark=job.benchmark,
             task=job.task, allow_legacy_place=allow_legacy,
@@ -711,7 +802,10 @@ def _validate_job(
                 )
             expected_training = training_contract_v2(training_values)
             return validate_checkpoint_v2(
-                path, str(job.method), str(cache["cache_fingerprint"]),
+                path,
+                str(job.method),
+                str(cache["cache_fingerprint"]),
+                str(cache["cache_file_sha256"]),
                 benchmark=job.benchmark, task=job.task,
                 expected_method_config=method_config,
                 expected_training_contract=expected_training,
@@ -726,6 +820,7 @@ def _validate_job(
                     "task_upstream_commits": dict(
                         task_manifest.get("upstream_commits", {})
                     ),
+                    "cache_file_sha256": str(cache["cache_file_sha256"]),
                     "dataset_format": task_manifest.get("dataset_format"),
                     "dataset_source_identifier": task_manifest.get(
                         "dataset_source_identifier"
@@ -762,6 +857,7 @@ def _validate_job(
                 path, int(job.required_count or 0), benchmark=job.benchmark,
                 task=job.task, method=str(job.method),
                 expected_cache_fingerprint=str(cache["cache_fingerprint"]),
+                expected_cache_file_sha256=str(cache["cache_file_sha256"]),
                 expected_checkpoint_sha256=(
                     str(checkpoint["sha256"]) if checkpoint is not None else None
                 ),
@@ -810,6 +906,9 @@ def _validate_job(
             allow_legacy_place=allow_legacy,
             expected_task_manifest_sha256=str(task_manifest["task_manifest_sha256"]),
             expected_cache_fingerprint=str(cache["cache_fingerprint"]),
+            expected_cache_file_sha256=(
+                str(cache["cache_file_sha256"]) if is_v2 else None
+            ),
             expected_checkpoint_sha256=(
                 str(checkpoint["sha256"]) if checkpoint is not None else None
             ),

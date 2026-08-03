@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import signal
 import sys
 import tempfile
 import unittest
@@ -45,15 +47,22 @@ from wm_adapter.data.feature_cache_v2 import (
     CACHE_SCHEMA_VERSION_V2,
     FeatureCacheV2Dataset,
     FeatureCacheV2Writer,
+    verify_cache_content_v2,
 )
 from wm_adapter.backends.jepa_wm_droid import JEPAWMDroidBackend
 from wm_adapter.adapters.lora import LastBlockAttentionLoRA
 from wm_adapter.backends.frozen_projection import frozen_base_projection
+from wm_adapter.experiments import suite_control
+from wm_adapter.training.trainer_v2 import CHECKPOINT_SCHEMA_V2
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from monitor_all_paper_experiments import parse_training
+import launch_cross_benchmark_suite as launcher_module
 from launch_cross_benchmark_suite import _args as launcher_args
-from monitor_cross_benchmark_suite import _mark_stopped
+import monitor_cross_benchmark_suite as monitor_module
+from monitor_cross_benchmark_suite import _handle_control_key, _runner_pid_path
+from run_cross_benchmark_suite import _can_reuse_cache_content_verification
+from validate_libero_action_replay import _replay_contract
 
 
 def _training(*, steps: int = 2000, seed: int = 42) -> dict[str, object]:
@@ -106,17 +115,17 @@ def _cache_metadata() -> dict[str, object]:
     }
 
 
-def _cache_batch(value: float) -> dict[str, object]:
+def _cache_batch(value: float, count: int = 1) -> dict[str, object]:
     return {
-        "clean_context_middle_tokens": torch.full((1, 3, 6, 8), value),
-        "ood_context_middle_tokens": torch.full((1, 3, 6, 8), value + 1),
-        "clean_target_latents": torch.full((1, 6, 4, 8), value + 2),
-        "rollout_actions": torch.full((1, 3, 7), value + 3),
-        "episode_id": torch.tensor([1]),
-        "window_id": torch.tensor([2]),
-        "source_trajectory_id": ["demo_1"],
-        "appearance_seed": torch.tensor([2026]),
-        "appearance_severity": torch.tensor([1.0]),
+        "clean_context_middle_tokens": torch.full((count, 3, 6, 8), value),
+        "ood_context_middle_tokens": torch.full((count, 3, 6, 8), value + 1),
+        "clean_target_latents": torch.full((count, 6, 4, 8), value + 2),
+        "rollout_actions": torch.full((count, 3, 7), value + 3),
+        "episode_id": torch.full((count,), 1),
+        "window_id": torch.full((count,), 2),
+        "source_trajectory_id": ["demo_1"] * count,
+        "appearance_seed": torch.full((count,), 2026),
+        "appearance_severity": torch.full((count,), 1.0),
     }
 
 
@@ -339,7 +348,7 @@ class CrossBenchmarkContractTest(unittest.TestCase):
                 self.assertEqual(
                     float(dataset[0]["rollout_actions"].mean()), value + 3
                 )
-                validate_cache_v2(
+                validation = validate_cache_v2(
                     path,
                     1,
                     benchmark="libero",
@@ -363,8 +372,75 @@ class CrossBenchmarkContractTest(unittest.TestCase):
                     },
                     expected_base_checkpoint_sha256="base",
                     expected_dinov3_checkpoint_sha256="dino",
+                    deep_verify=True,
+                    content_verification_chunk_windows=1,
+                )
+                self.assertTrue(validation["content_verified"])
+                self.assertEqual(
+                    validation["content_sha256"],
+                    validation["recomputed_content_sha256"],
                 )
             self.assertNotEqual(*fingerprints)
+
+            single = Path(directory) / "single-append.h5"
+            writer = FeatureCacheV2Writer(single, _cache_metadata())
+            writer.append(_cache_batch(4.0, 2))
+            single_fingerprint = writer.finalize()
+            multiple = Path(directory) / "multiple-append.h5"
+            writer = FeatureCacheV2Writer(multiple, _cache_metadata())
+            writer.append(_cache_batch(4.0))
+            writer.append(_cache_batch(4.0))
+            multiple_fingerprint = writer.finalize()
+            self.assertEqual(single_fingerprint, multiple_fingerprint)
+            progress: list[tuple[str, int, int]] = []
+            verified_one = verify_cache_content_v2(
+                multiple,
+                chunk_windows=1,
+                progress=lambda key, completed, total: progress.append(
+                    (key, completed, total)
+                ),
+            )
+            verified_two = verify_cache_content_v2(multiple, chunk_windows=2)
+            self.assertEqual(
+                verified_one["recomputed_content_sha256"],
+                verified_two["recomputed_content_sha256"],
+            )
+            self.assertIn(("rollout_actions", 1, 2), progress)
+
+            for name, mutate in (
+                (
+                    "numeric",
+                    lambda handle: handle["rollout_actions"].__setitem__(
+                        (0, 0, 0), 99.0
+                    ),
+                ),
+                (
+                    "trajectory",
+                    lambda handle: handle["source_trajectory_id"].__setitem__(
+                        0, "changed_demo"
+                    ),
+                ),
+                (
+                    "attribute",
+                    lambda handle: handle.attrs.__setitem__(
+                        "array_content_sha256",
+                        json.dumps(
+                            {
+                                **json.loads(handle.attrs["array_content_sha256"]),
+                                "episode_id": "0" * 64,
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    ),
+                ),
+            ):
+                tampered = Path(directory) / f"tampered-{name}.h5"
+                shutil.copy2(single, tampered)
+                with h5py.File(tampered, "r+") as handle:
+                    mutate(handle)
+                with self.assertRaisesRegex(RuntimeError, "content hash mismatch"):
+                    verify_cache_content_v2(tampered, chunk_windows=1)
 
             optional_metadata = _cache_metadata()
             optional_metadata["dataset_revision"] = None
@@ -440,7 +516,50 @@ class CrossBenchmarkContractTest(unittest.TestCase):
             writer.file.close()
             with self.assertRaisesRegex(RuntimeError, "not finalized"):
                 FeatureCacheV2Dataset(temporary)
+            with self.assertRaisesRegex(RuntimeError, "not finalized"):
+                verify_cache_content_v2(temporary)
             temporary.unlink()
+
+            v1_path = Path(directory) / "deep-v1.h5"
+            with h5py.File(v1_path, "w") as handle:
+                handle.attrs["schema_version"] = "jepa_wm_feature_cache_v1"
+                handle.attrs["finalized"] = True
+            with self.assertRaisesRegex(RuntimeError, "schema mismatch"):
+                verify_cache_content_v2(v1_path)
+
+            previous = {
+                **verified_one,
+                "cache_file_size": multiple.stat().st_size,
+                "cache_file_mtime_ns": multiple.stat().st_mtime_ns,
+            }
+            current = {
+                "cache_file_sha256": verified_one["cache_file_sha256"],
+                "cache_file_size": multiple.stat().st_size,
+                "cache_file_mtime_ns": multiple.stat().st_mtime_ns,
+            }
+            self.assertTrue(
+                _can_reuse_cache_content_verification(
+                    previous, current, standard_source=True
+                )
+            )
+            current_without_file_scan = {
+                key: value
+                for key, value in current.items()
+                if key != "cache_file_sha256"
+            }
+            self.assertTrue(
+                _can_reuse_cache_content_verification(
+                    previous,
+                    current_without_file_scan,
+                    standard_source=True,
+                )
+            )
+            changed = dict(current, cache_file_mtime_ns=current["cache_file_mtime_ns"] + 1)
+            self.assertFalse(
+                _can_reuse_cache_content_verification(
+                    previous, changed, standard_source=True
+                )
+            )
 
     def test_structured_step_progress_parser(self) -> None:
         text = (
@@ -466,12 +585,13 @@ class CrossBenchmarkContractTest(unittest.TestCase):
             path = Path(directory) / "hfra.pt"
             training_contract = training_contract_v2(_training())
             payload = {
-                    "schema_version": "wm_adapter_checkpoint_v2",
+                    "schema_version": CHECKPOINT_SCHEMA_V2,
                     "method_name": "hfra",
                     "method_config": {"rank": 4},
                     "peft_state_dict": {},
                     "trainable_parameter_count": 17024,
                     "cache_fingerprint": "cache",
+                    "cache_file_sha256": "cache-file",
                     "base_checkpoint_sha256": "base",
                     "dinov3_checkpoint_sha256": "dino",
                     "upstream_commits": {},
@@ -494,6 +614,7 @@ class CrossBenchmarkContractTest(unittest.TestCase):
                         "robot": "robot",
                         "gripper": "gripper",
                         "controller_contract": {"type": "OSC_POSE"},
+                        "cache_file_sha256": "cache-file",
                         **camera,
                     },
                 }
@@ -502,6 +623,7 @@ class CrossBenchmarkContractTest(unittest.TestCase):
                 path,
                 "hfra",
                 "cache",
+                "cache-file",
                 benchmark="libero",
                 task="libero_goal_0",
                 expected_method_config={"name": "hfra", "rank": 4},
@@ -519,6 +641,7 @@ class CrossBenchmarkContractTest(unittest.TestCase):
                     "robot": "robot",
                     "gripper": "gripper",
                     "controller_contract": json.dumps({"type": "OSC_POSE"}),
+                    "cache_file_sha256": "cache-file",
                 },
             )
             payload["optimizer_config"] = dict(payload["optimizer_config"])
@@ -529,6 +652,7 @@ class CrossBenchmarkContractTest(unittest.TestCase):
                     path,
                     "hfra",
                     "cache",
+                    "cache-file",
                     benchmark="libero",
                     task="libero_goal_0",
                     expected_method_config={"name": "hfra", "rank": 4},
@@ -548,6 +672,7 @@ class CrossBenchmarkContractTest(unittest.TestCase):
                         "controller_contract": json.dumps(
                             {"type": "OSC_POSE"}
                         ),
+                        "cache_file_sha256": "cache-file",
                     },
                 )
         root = Path(__file__).resolve().parents[1]
@@ -605,15 +730,168 @@ class CrossBenchmarkContractTest(unittest.TestCase):
         self.assertTrue(parsed.self_test and parsed.dry_run)
         suite = Path(__file__).resolve().parents[1] / "configs/experiment/cross_benchmark_v2.yaml"
         with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
             state_path = Path(directory) / "state.json"
             state_path.write_text(
-                json.dumps({"suite": "cross_benchmark_v2", "status": "running", "jobs": {"job": {"status": "running"}}}),
+                json.dumps(
+                    {
+                        "suite": "cross_benchmark_v2",
+                        "suite_config_path": str(suite.resolve()),
+                        "status": "running",
+                        "jobs": {
+                            "running": {"status": "running", "start_time": 1.0},
+                            "completed": {"status": "completed"},
+                        },
+                    }
+                ),
                 encoding="utf-8",
             )
-            _mark_stopped(state_path, suite)
+            pid_path = root / "formal.pid"
+            pid_path.write_text("424242\n", encoding="utf-8")
+            with patch.object(suite_control, "_process_alive", return_value=False):
+                suite_control.terminate_suite(
+                    pid_path=pid_path,
+                    state_path=state_path,
+                    suite_config_path=suite,
+                    reason="contract test",
+                    self_test=False,
+                )
+            self.assertFalse(pid_path.exists())
             stopped = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertEqual(stopped["status"], "stopped")
-            self.assertEqual(stopped["jobs"]["job"]["status"], "stopped")
+            self.assertEqual(stopped["jobs"]["running"]["status"], "stopped")
+            self.assertEqual(stopped["jobs"]["completed"]["status"], "completed")
+
+            pid_path.write_text("424243\n", encoding="utf-8")
+            with patch.object(suite_control, "_process_alive", return_value=True), patch.object(
+                suite_control, "_read_command", return_value=["python", "other.py"]
+            ):
+                with self.assertRaisesRegex(RuntimeError, "not the cross-benchmark runner"):
+                    suite_control.terminate_suite(
+                        pid_path=pid_path,
+                        state_path=state_path,
+                        suite_config_path=suite,
+                        reason="contract test",
+                        self_test=False,
+                    )
+            self.assertTrue(pid_path.exists())
+
+            runner_command = [
+                "python",
+                "scripts/run_cross_benchmark_suite.py",
+                "--config",
+                str(suite),
+            ]
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "suite_config_path": str(suite.resolve()),
+                        "status": "running",
+                        "self_test": False,
+                        "jobs": {"running": {"status": "running"}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(suite_control, "_process_alive", return_value=True), patch.object(
+                suite_control, "_read_command", return_value=runner_command
+            ), patch.object(suite_control.os, "getpgid", return_value=7001), patch.object(
+                suite_control.os, "killpg"
+            ) as killpg, patch.object(
+                suite_control, "_wait_for_group", return_value=True
+            ):
+                result = suite_control.terminate_suite(
+                    pid_path=pid_path,
+                    state_path=state_path,
+                    suite_config_path=suite,
+                    reason="contract test",
+                    self_test=False,
+                )
+            self.assertEqual(result.signal_used, "SIGTERM")
+            killpg.assert_called_once_with(7001, signal.SIGTERM)
+
+            pid_path.write_text("424244\n", encoding="utf-8")
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "suite_config_path": str(suite.resolve()),
+                        "status": "running",
+                        "self_test": False,
+                        "jobs": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(suite_control, "_process_alive", return_value=True), patch.object(
+                suite_control, "_read_command", return_value=runner_command
+            ), patch.object(suite_control.os, "getpgid", return_value=7002), patch.object(
+                suite_control.os, "killpg"
+            ) as killpg, patch.object(
+                suite_control, "_wait_for_group", side_effect=[False, True]
+            ):
+                result = suite_control.terminate_suite(
+                    pid_path=pid_path,
+                    state_path=state_path,
+                    suite_config_path=suite,
+                    reason="contract test",
+                    self_test=False,
+                )
+            self.assertEqual(result.signal_used, "SIGKILL")
+            self.assertEqual(
+                killpg.call_args_list,
+                [
+                    unittest.mock.call(7002, signal.SIGTERM),
+                    unittest.mock.call(7002, signal.SIGKILL),
+                ],
+            )
+
+            pid_path.write_text("424245\n", encoding="utf-8")
+            with patch.object(suite_control, "_process_alive", return_value=True), patch.object(
+                suite_control,
+                "_read_command",
+                return_value=runner_command + ["--self-test"],
+            ):
+                with self.assertRaisesRegex(RuntimeError, "other suite lifecycle"):
+                    suite_control.terminate_suite(
+                        pid_path=pid_path,
+                        state_path=state_path,
+                        suite_config_path=suite,
+                        reason="contract test",
+                        self_test=False,
+                    )
+
+            self_test_pid = root / "self-test.pid"
+            self_test_pid.write_text("424246\n", encoding="utf-8")
+            pid_path.write_text("424247\n", encoding="utf-8")
+            with patch.object(suite_control, "_process_alive", return_value=False):
+                suite_control.terminate_suite(
+                    pid_path=pid_path,
+                    state_path=state_path,
+                    suite_config_path=suite,
+                    reason="formal only",
+                    self_test=False,
+                )
+            self.assertTrue(self_test_pid.exists())
+
+        self.assertIs(launcher_module.terminate_suite, suite_control.terminate_suite)
+        self.assertIs(monitor_module.terminate_suite, suite_control.terminate_suite)
+        suite_cfg = load_suite_config(suite)
+        self_test_pid_path, is_self_test = _runner_pid_path(
+            suite,
+            Path(str(suite_cfg.self_test.roots.state_path)),
+            {},
+        )
+        self.assertTrue(is_self_test)
+        self.assertEqual(
+            self_test_pid_path,
+            Path(str(suite_cfg.self_test.roots.pid_path)).resolve(),
+        )
+        with patch.object(monitor_module, "_terminate_suite", return_value="stopped") as stop:
+            self.assertEqual(_handle_control_key(ord("q"), Path("state"), suite)[0], "detach")
+            stop.assert_not_called()
+            action, message = _handle_control_key(ord("X"), Path("state"), suite)
+            self.assertEqual((action, message), ("terminate", "stopped"))
+            stop.assert_called_once()
 
     def test_split_capacity_uses_requested_count(self) -> None:
         train, heldout = _validated_split_indices(50, 0.6, 42, 20)
@@ -662,6 +940,23 @@ class CrossBenchmarkContractTest(unittest.TestCase):
                 action,
             )
         )
+
+    def test_libero_replay_contract_reports_the_actual_failure_direction(self) -> None:
+        passed = _replay_contract(1.0e-4, 1.04e-4, 1.0e-3)
+        self.assertEqual(passed["sequence_replay_contract"], "passed")
+        self.assertEqual(passed["repeat_action_contract"], "passed")
+        failed = _replay_contract(1.0e-4, 5.0e-4, 1.0e-3)
+        self.assertEqual(failed["repeat_action_contract"], "failed")
+        self.assertIn("diverges", " ".join(failed["failure_reasons"]))
+        sequence_failed = _replay_contract(2.0e-3, 2.0e-3, 1.0e-3)
+        self.assertEqual(sequence_failed["sequence_replay_contract"], "failed")
+        for invalid in (float("nan"), float("inf")):
+            result = _replay_contract(invalid, invalid, 1.0e-3)
+            self.assertEqual(result["sequence_replay_contract"], "failed")
+            self.assertEqual(result["repeat_action_contract"], "failed")
+            self.assertIsNone(result["repeat_to_sequence_error_ratio"])
+        zero = _replay_contract(0.0, 0.0, 1.0e-3)
+        self.assertEqual(zero["repeat_to_sequence_error_ratio"], 1.0)
 
     def test_manifest_hash_and_strict_libero_contract(self) -> None:
         transform = _transform(scale=0.05).as_dict()

@@ -10,7 +10,10 @@ from wm_adapter.adapters.factory import build_method
 from wm_adapter.appearance.composed_photometric import ComposedPhotometricShift
 from wm_adapter.backends.jepa_wm_droid import JEPAWMDroidBackend
 from wm_adapter.data.feature_cache import FeatureCacheDataset
-from wm_adapter.data.feature_cache_v2 import FeatureCacheV2Dataset
+from wm_adapter.data.feature_cache_v2 import (
+    FeatureCacheV2Dataset,
+    cache_file_sha256_from_verified_state_v2,
+)
 from wm_adapter.training.trainer import AdapterTrainer, TrainingConfig
 from wm_adapter.training.trainer_v2 import (
     TrajectoryAdapterTrainer,
@@ -36,7 +39,23 @@ def _train_v2(cfg: Any, backend: JEPAWMDroidBackend, method: Any) -> None:
         resolve_path(cfg.paths.feature_cache),
         expected_base_checkpoint_sha256=backend.base_checkpoint_sha256,
         expected_dinov3_checkpoint_sha256=backend.dinov3_checkpoint_sha256,
+        verify_content=bool(cfg.cache.get("verify_content_on_reuse", True)),
+        content_verification_chunk_windows=int(
+            cfg.cache.get("content_verification_chunk_windows", 8)
+        ),
     )
+    expected_cache_file_sha256 = cache_file_sha256_from_verified_state_v2(
+        dataset.path,
+        expected_sha256=cfg.cache.get("expected_file_sha256"),
+        expected_size=cfg.cache.get("expected_file_size"),
+        expected_mtime_ns=cfg.cache.get("expected_file_mtime_ns"),
+    )
+    if str(dataset.metadata["cache_file_sha256"]) != expected_cache_file_sha256:
+        raise RuntimeError(
+            "Training cache file SHA256 differs from the suite deep-verification "
+            f"record: expected={expected_cache_file_sha256}, "
+            f"actual={dataset.metadata['cache_file_sha256']}, path={dataset.path}"
+        )
     generator = torch.Generator(device="cpu").manual_seed(int(cfg.training.seed))
     microbatch = int(cfg.training.microbatch_windows)
     views = int(cfg.training.views_per_window)

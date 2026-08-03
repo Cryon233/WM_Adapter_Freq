@@ -23,6 +23,7 @@ from wm_adapter.data.feature_cache_v2 import (
     CACHE_SCHEMA_VERSION_V2,
     V2_ARRAY_KEYS,
     cache_fingerprint_v2,
+    verify_cache_content_v2,
 )
 from wm_adapter.training.trainer_v2 import CHECKPOINT_SCHEMA_V2
 from wm_adapter.utils.checkpoints import load_method_checkpoint, sha256_file
@@ -319,6 +320,9 @@ def validate_cache_v2(
     expected_camera_contract: dict[str, Any],
     expected_base_checkpoint_sha256: str,
     expected_dinov3_checkpoint_sha256: str,
+    deep_verify: bool = False,
+    content_verification_chunk_windows: int = 8,
+    include_file_sha256: bool = False,
 ) -> dict[str, Any]:
     resolved = resolve_path(path)
     with h5py.File(resolved, "r", libver="latest", swmr=True) as handle:
@@ -439,9 +443,8 @@ def validate_cache_v2(
             }
         if mismatch:
             raise RuntimeError(f"V2 feature-cache contract mismatch at {resolved}: {mismatch}")
-        return {
+        validation = {
             "path": str(resolved),
-            "sha256": sha256_file(resolved),
             "cache_fingerprint": str(handle.attrs["cache_fingerprint"]),
             "available_windows": min(counts.values()),
             "used_windows": windows,
@@ -450,6 +453,22 @@ def validate_cache_v2(
             "late_site_index": late,
             "content_sha256": str(handle.attrs["content_sha256"]),
         }
+    stat = resolved.stat()
+    validation.update(
+        cache_file_size=int(stat.st_size),
+        cache_file_mtime_ns=int(stat.st_mtime_ns),
+    )
+    if include_file_sha256:
+        validation["cache_file_sha256"] = sha256_file(resolved)
+        validation["sha256"] = validation["cache_file_sha256"]
+    if deep_verify:
+        validation.update(
+            verify_cache_content_v2(
+                resolved, chunk_windows=content_verification_chunk_windows
+            )
+        )
+        validation["sha256"] = validation["cache_file_sha256"]
+    return validation
 
 
 def training_contract_v2(training: dict[str, Any]) -> dict[str, Any]:
@@ -650,6 +669,7 @@ def validate_checkpoint_v2(
     path: str | Path,
     method: str,
     cache_fingerprint: str,
+    cache_file_sha256: str,
     *,
     benchmark: str,
     task: str,
@@ -665,6 +685,7 @@ def validate_checkpoint_v2(
         "schema_version": CHECKPOINT_SCHEMA_V2,
         "method_name": method,
         "cache_fingerprint": cache_fingerprint,
+        "cache_file_sha256": cache_file_sha256,
         **{
             key: expected_training_contract[key]
             for key in (
@@ -718,6 +739,7 @@ def validate_checkpoint_v2(
         "sha256": sha256_file(resolved),
         "parameter_count": parameter_count,
         "cache_fingerprint": cache_fingerprint,
+        "cache_file_sha256": cache_file_sha256,
         "completed_optimizer_steps": expected_training_contract[
             "completed_optimizer_steps"
         ],
@@ -764,6 +786,7 @@ def validate_offline_v2(
     task: str,
     method: str,
     expected_cache_fingerprint: str,
+    expected_cache_file_sha256: str,
     expected_checkpoint_sha256: str | None,
     expected_action_transform: dict[str, Any] | None,
     expected_task_manifest_sha256: str,
@@ -782,6 +805,7 @@ def validate_offline_v2(
         "goal_encoder": "frozen_base",
         "loss_name": "unified_trajectory_mse",
         "cache_fingerprint": expected_cache_fingerprint,
+        "cache_file_sha256": expected_cache_file_sha256,
         "method_checkpoint_sha256": expected_checkpoint_sha256,
         "action_transform": expected_action_transform,
         "task_manifest_sha256": expected_task_manifest_sha256,
@@ -828,6 +852,7 @@ def validate_planning(
     allow_legacy_place: bool = False,
     expected_task_manifest_sha256: str | None = None,
     expected_cache_fingerprint: str | None = None,
+    expected_cache_file_sha256: str | None = None,
     expected_checkpoint_sha256: str | None = None,
     expected_action_convention: dict[str, Any] | None = None,
     expected_action_transform: dict[str, Any] | None = None,
@@ -902,6 +927,14 @@ def validate_planning(
             allow_legacy_place and task == "robocasa_place" and actual_cache is None
         ):
             raise RuntimeError(f"Planning cache fingerprint mismatch: {resolved}")
+    if expected_cache_file_sha256 is not None:
+        actual_cache_file = payload.get("cache_file_sha256")
+        if actual_cache_file != expected_cache_file_sha256 and not (
+            allow_legacy_place
+            and task == "robocasa_place"
+            and actual_cache_file is None
+        ):
+            raise RuntimeError(f"Planning cache-file fingerprint mismatch: {resolved}")
     if expected_checkpoint_sha256 is not None and payload.get("method_checkpoint_sha256") != expected_checkpoint_sha256:
         raise RuntimeError(f"Planning checkpoint fingerprint mismatch: {resolved}")
     if expected_action_convention is not None and payload.get("action_convention") != expected_action_convention:

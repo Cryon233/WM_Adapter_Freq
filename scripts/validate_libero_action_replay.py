@@ -115,6 +115,66 @@ def _aggregate(rows: list[dict[str, float]]) -> dict[str, float]:
     }
 
 
+def _replay_contract(
+    sequence_state_error: float,
+    repeated_state_error: float,
+    sequence_limit: float,
+    *,
+    epsilon: float = 1.0e-8,
+) -> dict[str, Any]:
+    sequence_finite = bool(
+        np.isfinite(sequence_state_error) and sequence_state_error >= 0.0
+    )
+    repeated_finite = bool(
+        np.isfinite(repeated_state_error) and repeated_state_error >= 0.0
+    )
+    sequence_passed = bool(
+        sequence_finite and sequence_state_error <= sequence_limit
+    )
+    repeat_passed = bool(
+        sequence_finite
+        and repeated_finite
+        and repeated_state_error <= sequence_state_error * 1.05 + epsilon
+    )
+    if sequence_finite and repeated_finite and sequence_state_error > epsilon:
+        ratio: float | None = repeated_state_error / sequence_state_error
+    elif sequence_finite and repeated_finite and repeated_state_error <= epsilon:
+        ratio = 1.0
+    else:
+        ratio = None
+    failure_reasons: list[str] = []
+    if not sequence_passed:
+        failure_reasons.append(
+            "sequence replay state error is non-finite or exceeds the configured "
+            f"limit: error={sequence_state_error}, limit={sequence_limit}"
+        )
+    if not repeat_passed:
+        failure_reasons.append(
+            "repeated-action replay diverges from the recorded five-action sequence"
+        )
+    return {
+        "sequence_state_error": (
+            float(sequence_state_error) if sequence_finite else None
+        ),
+        "repeated_state_error": (
+            float(repeated_state_error) if repeated_finite else None
+        ),
+        "repeat_to_sequence_error_ratio": (
+            float(ratio) if ratio is not None and np.isfinite(ratio) else None
+        ),
+        "sequence_replay_contract": "passed" if sequence_passed else "failed",
+        "repeat_action_contract": "passed" if repeat_passed else "failed",
+        "contract_interpretation": (
+            "The current 7-D contract is accepted only when repeating the first "
+            "action five times approximates the state produced by the recorded "
+            "five-action sequence."
+        ),
+        "recommended_alternatives": ["frameskip=1", "35-D action-sequence encoder"],
+        "failure_reasons": failure_reasons,
+        "passed": sequence_passed and repeat_passed,
+    }
+
+
 def main() -> None:
     cfg = load_experiment_config()
     if str(cfg.benchmark.name) != "libero":
@@ -182,8 +242,9 @@ def main() -> None:
     sequence_state = sum(sequence[key] for key in stable_state_metrics)
     repeated_state = sum(repeated[key] for key in stable_state_metrics)
     sequence_limit = float(cfg.protocol_validation.get("sequence_state_mae_max", 1.0e-3))
-    sequence_passed = bool(np.isfinite(sequence_state) and sequence_state <= sequence_limit)
-    repeat_passed = bool(repeated_state <= sequence_state * 1.05 + 1.0e-8)
+    contract = _replay_contract(sequence_state, repeated_state, sequence_limit)
+    sequence_passed = contract["sequence_replay_contract"] == "passed"
+    repeat_passed = contract["repeat_action_contract"] == "passed"
     payload = {
         "schema_version": "libero_action_replay_contract_v1",
         "task": task.task_key,
@@ -203,24 +264,9 @@ def main() -> None:
             ),
         },
         "thresholds": {"sequence_state_mae_max": sequence_limit},
-        "sequence_replay_contract": "passed" if sequence_passed else "failed",
-        "repeat_action_contract": "passed" if repeat_passed else "failed",
+        **{key: value for key, value in contract.items() if key != "passed"},
         "action_transform": task.action_transform,
-        "status": "passed" if sequence_passed and repeat_passed else "failed",
-        "failure_reasons": [
-            reason
-            for condition, reason in (
-                (
-                    not sequence_passed,
-                    f"sequence state error {sequence_state} exceeds {sequence_limit}",
-                ),
-                (
-                    not repeat_passed,
-                    "repeated-action replay is not distinguishable from sequence replay",
-                ),
-            )
-            if condition
-        ],
+        "status": "passed" if contract["passed"] else "failed",
     }
     output = resolve_path(cfg.protocol_validation.output)
     atomic_json(output, payload)
@@ -233,6 +279,7 @@ def main() -> None:
         raise RuntimeError(
             f"LIBERO repeated-action contract failed for {task.task_key}: "
             f"sequence_state_error={sequence_state}, repeated_state_error={repeated_state}; "
+            "repeated-action replay diverges from the recorded five-action sequence; "
             "consider frameskip=1 or a 35-D action-sequence encoder"
         )
 

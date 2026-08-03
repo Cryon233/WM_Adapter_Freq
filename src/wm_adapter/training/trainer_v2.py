@@ -20,7 +20,7 @@ from wm_adapter.backends.jepa_wm_droid import JEPAWMDroidBackend
 from wm_adapter.utils.checkpoints import atomic_torch_save
 
 
-CHECKPOINT_SCHEMA_V2 = "wm_adapter_checkpoint_v2"
+CHECKPOINT_SCHEMA_V2 = "wm_adapter_checkpoint_v2.1"
 
 
 @dataclass(frozen=True)
@@ -223,6 +223,7 @@ class TrajectoryAdapterTrainer:
             "method_config": self.method.config_dict(),
             "trainable_parameter_count": self.method.parameter_count(),
             "cache_fingerprint": str(cache_metadata["cache_fingerprint"]),
+            "cache_file_sha256": str(cache_metadata["cache_file_sha256"]),
             "base_checkpoint_sha256": self.backend.base_checkpoint_sha256,
             "dinov3_checkpoint_sha256": self.backend.dinov3_checkpoint_sha256,
             "upstream_commits": self.backend.upstream_commits,

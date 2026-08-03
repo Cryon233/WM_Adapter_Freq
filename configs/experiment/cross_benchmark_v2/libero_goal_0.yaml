@@ -17,7 +17,7 @@ paths:
   evaluation_manifest: outputs/cross_benchmark_v2/manifests/evaluation/libero_goal_0.json
 data: {task_name: registry_task_0, camera_view: agentview, num_frames: 6, context_frames: 3, future_frames: 3, frameskip: 5, num_train_windows: 2000, episode_disjoint: true, train_fraction: 0.6, split_seed: 42, window_seed: 42, vertical_flip: true}
 appearance: {name: composed_photometric, pipeline_version: composed_photometric_v1, training_severity_min: 0.5, training_severity_max: 1.5, severity: 1.0, training_seed: 42, seed: 2026}
-cache: {schema_version: jepa_wm_feature_cache_v2.1, encoder_batch_size: 4, num_workers: 4}
+cache: {schema_version: jepa_wm_feature_cache_v2.1, encoder_batch_size: 4, num_workers: 4, verify_content_on_reuse: true, content_verification_chunk_windows: 8}
 training: {loss_name: unified_trajectory_mse, max_optimizer_steps: 2000, microbatch_windows: 2, views_per_window: 2, gradient_accumulation: 8, lr: 3.0e-4, betas: [0.9, 0.95], epsilon: 1.0e-8, weight_decay: 1.0e-4, warmup_steps: 100, scheduler: cosine, minimum_lr: 3.0e-5, gradient_clip_norm: 1.0, precision: bf16, num_workers: 4, seed: 42}
 planning: {task_slug: libero_goal_0, history_len: 3, candidate_chunk_size: 300, inference_precision: bf16, compile_predictor: true, allow_tf32: true, self_test: {iterations: 1, num_samples: 8, num_elites: 2, horizon: 1, max_episode_steps: 5}}
 offline: {num_frames: 6, num_windows: 200, seed: 42, shuffle_seed: 100045, negative_actions: 15, batch_size: 1, num_workers: 2, output_directory: outputs/cross_benchmark_v2/offline/main/libero/libero_goal_0/hfra}

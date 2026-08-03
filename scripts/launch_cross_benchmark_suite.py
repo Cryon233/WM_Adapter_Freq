@@ -4,14 +4,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import signal
 import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
 from wm_adapter.experiments.cross_benchmark import load_suite_config
+from wm_adapter.experiments.suite_control import terminate_suite
 from wm_adapter.utils.reproducibility import project_root, resolve_path
 
 
@@ -89,6 +88,20 @@ def main() -> None:
     suite = load_suite_config(args.config)
     suite_name = str(suite.suite_name)
     pid_path, state_path, runner_log = _paths(suite, args.self_test)
+    if args.stop:
+        result = terminate_suite(
+            pid_path=pid_path,
+            state_path=state_path,
+            suite_config_path=args.config,
+            reason=(
+                "self-test suite terminated explicitly from launcher --stop"
+                if args.self_test
+                else "formal suite terminated explicitly from launcher --stop"
+            ),
+            self_test=args.self_test,
+        )
+        print(result.message)
+        return
     pid = _read_pid(pid_path)
     running = _alive(pid)
     if pid is not None and not running:
@@ -112,20 +125,6 @@ def main() -> None:
         )
     if args.status:
         raise SystemExit(_monitor(state_path, args.config, once=True))
-    if args.stop:
-        if not running or pid is None:
-            print(f"{suite_name} runner is not active")
-            return
-        os.killpg(os.getpgid(pid), signal.SIGTERM)
-        for _ in range(50):
-            if not _alive(pid):
-                break
-            time.sleep(0.1)
-        if _alive(pid):
-            raise RuntimeError(f"Runner process group did not stop after SIGTERM: pid={pid}")
-        pid_path.unlink(missing_ok=True)
-        print(f"Stopped {suite_name} runner pid={pid}")
-        return
     if args.attach:
         if not running:
             print(f"{suite_name} runner is not active; showing the latest state")

@@ -4,8 +4,6 @@ from __future__ import annotations
 import argparse
 import curses
 import json
-import os
-import signal
 import time
 import textwrap
 from pathlib import Path
@@ -15,11 +13,11 @@ import monitor_all_paper_experiments as progress_core
 
 from wm_adapter.experiments.cross_benchmark import PHASES, load_suite_config
 from wm_adapter.experiments.cross_jobs import build_job_graph
+from wm_adapter.experiments.suite_control import terminate_suite
 from wm_adapter.utils.reproducibility import project_root, resolve_path
 
 
 DEFAULT_SUITE = project_root() / "configs/experiment/cross_benchmark_v2.yaml"
-RUNNER_COMMAND = "scripts/run_cross_benchmark_suite.py"
 
 
 def _state(path: Path, fallback_suite: str) -> dict[str, Any]:
@@ -229,127 +227,48 @@ def dashboard_lines(
     return _wrap_dashboard_lines(lines, width)
 
 
-def _read_runner_pid(path: Path) -> int | None:
-    try:
-        value = int(path.read_text(encoding="utf-8").strip())
-    except (FileNotFoundError, ValueError):
-        return None
-    return value if value > 1 else None
-
-
-def _process_identity(pid: int) -> tuple[str, int, int] | None:
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-    except (FileNotFoundError, PermissionError, ProcessLookupError):
-        return None
-    suffix = stat[stat.rfind(")") + 2 :].split()
-    if len(suffix) < 4:
-        raise RuntimeError(f"Cannot parse process identity from /proc/{pid}/stat")
-    return suffix[0], int(suffix[2]), int(suffix[3])
-
-
-def _process_group_alive(process_group: int) -> bool:
-    proc = Path("/proc")
-    if proc.is_dir():
-        for candidate in proc.iterdir():
-            if not candidate.name.isdigit():
-                continue
-            identity = _process_identity(int(candidate.name))
-            if identity is not None:
-                state, group, _ = identity
-                if group == process_group and state != "Z":
-                    return True
-        return False
-    try:
-        os.killpg(process_group, 0)
-    except ProcessLookupError:
-        return False
-    return True
-
-
-def _runner_pid_path(suite_path: Path, state: dict[str, Any]) -> Path:
+def _runner_pid_path(
+    suite_path: Path,
+    state_path: Path,
+    state: dict[str, Any],
+) -> tuple[Path, bool]:
     suite = load_suite_config(suite_path)
-    if bool(state.get("self_test", False)):
-        return resolve_path(str(suite.self_test.roots.pid_path))
-    return resolve_path(str(suite.pid_path))
-
-
-def _mark_stopped(state_path: Path, suite_path: Path) -> None:
-    suite = load_suite_config(suite_path)
-    state = _state(state_path, str(suite.suite_name))
-    stopped = time.time()
-    state.update(
-        status="stopped",
-        stopped_at_unix=stopped,
-        error="suite terminated explicitly from the Dashboard",
+    self_test_state = resolve_path(str(suite.self_test.roots.state_path))
+    formal_state = resolve_path(str(suite.state_path))
+    resolved_state = resolve_path(state_path)
+    if resolved_state == self_test_state:
+        self_test = True
+    elif resolved_state == formal_state:
+        self_test = False
+    else:
+        self_test = bool(state.get("self_test", False))
+    return (
+        resolve_path(
+            str(suite.self_test.roots.pid_path if self_test else suite.pid_path)
+        ),
+        self_test,
     )
-    for entry in state.get("jobs", {}).values():
-        if entry.get("status") == "running":
-            entry.update(
-                status="stopped",
-                end_time=stopped,
-                error="terminated explicitly from the Dashboard",
-            )
-    from wm_adapter.benchmarks.base import atomic_json
-
-    atomic_json(state_path, state)
 
 
 def _terminate_suite(state_path: Path, suite_path: Path) -> str:
     suite = load_suite_config(suite_path)
     state = _state(state_path, str(suite.suite_name))
-    pid_path = _runner_pid_path(suite_path, state)
-    pid = _read_runner_pid(pid_path)
-    if pid is None:
-        return f"No active runner PID was found at {pid_path}"
-    identity = _process_identity(pid)
-    if identity is None:
-        pid_path.unlink(missing_ok=True)
-        return f"Runner PID {pid} is no longer active; removed stale PID file"
-    process_state, process_group, session = identity
-    command_path = Path(f"/proc/{pid}/cmdline")
-    try:
-        command = command_path.read_bytes().replace(b"\0", b" ").decode(
-            "utf-8", errors="replace"
-        )
-    except FileNotFoundError:
-        pid_path.unlink(missing_ok=True)
-        return f"Runner PID {pid} is no longer active"
-    zombie_session_leader = (
-        process_state == "Z" and process_group == pid and session == pid
-    )
-    if RUNNER_COMMAND not in command and not zombie_session_leader:
-        raise RuntimeError(
-            "Refusing to terminate a PID that is not the cross-benchmark runner: "
-            f"pid={pid}, state={process_state}, command={command!r}, "
-            f"pid_file={pid_path}"
-        )
-    if not _process_group_alive(process_group):
-        pid_path.unlink(missing_ok=True)
-        return (
-            f"Runner PID {pid} is already inactive; removed stale PID file "
-            f"(state={process_state})"
-        )
-    try:
-        os.killpg(process_group, signal.SIGTERM)
-    except ProcessLookupError:
-        pid_path.unlink(missing_ok=True)
-        return f"Runner process group {process_group} exited before termination"
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline and _process_group_alive(process_group):
-        time.sleep(0.1)
-    if _process_group_alive(process_group):
-        os.killpg(process_group, signal.SIGKILL)
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline and _process_group_alive(process_group):
-            time.sleep(0.05)
-    if _process_group_alive(process_group):
-        raise RuntimeError(
-            f"Runner process group remains active after SIGKILL: pgid={process_group}"
-        )
-    pid_path.unlink(missing_ok=True)
-    _mark_stopped(state_path, suite_path)
-    return f"Terminated runner process group {process_group}"
+    pid_path, self_test = _runner_pid_path(suite_path, state_path, state)
+    return terminate_suite(
+        pid_path=pid_path,
+        state_path=state_path,
+        suite_config_path=suite_path,
+        reason="suite terminated explicitly from the Dashboard",
+        self_test=self_test,
+    ).message
+
+
+def _handle_control_key(key: int, state: Path, suite: Path) -> tuple[str, str | None]:
+    if key in {ord("q"), ord("Q"), 3}:
+        return "detach", None
+    if key == ord("X"):
+        return "terminate", _terminate_suite(state, suite)
+    return "continue", None
 
 
 def _add(screen: Any, row: int, line: str, width: int, attr: int = 0) -> None:
@@ -392,7 +311,7 @@ def _curses(screen: Any, state: Path, suite: Path, refresh: float) -> None:
             return
         if key == ord("X"):
             try:
-                message = _terminate_suite(state, suite)
+                _, message = _handle_control_key(key, state, suite)
             except Exception as error:
                 message = f"Termination refused: {type(error).__name__}: {error}"
                 _add(screen, height - 1, message, width, curses.A_REVERSE)
