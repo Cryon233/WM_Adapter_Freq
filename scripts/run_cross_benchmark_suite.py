@@ -502,11 +502,29 @@ def _reset_failed_state_for_resume(
     resumed_jobs: dict[str, dict[str, Any]] = {}
     for job in jobs:
         previous = previous_jobs.get(job.job_id)
-        if isinstance(previous, dict) and previous.get("status") in {
-            "completed",
-            "reused",
-        }:
-            resumed_jobs[job.job_id] = previous
+        validation = (
+            previous.get("artifact_validation")
+            if isinstance(previous, dict)
+            else None
+        )
+        has_preflight_report = (
+            job.kind == "task_manifest"
+            and isinstance(validation, dict)
+            and isinstance(validation.get("report"), dict)
+        )
+        if isinstance(previous, dict) and (
+            previous.get("status") in {"completed", "reused"}
+            or has_preflight_report
+        ):
+            resumed = dict(previous)
+            if has_preflight_report:
+                resumed.update(
+                    status="completed",
+                    gpu=None,
+                    pid=None,
+                    error=None,
+                )
+            resumed_jobs[job.job_id] = resumed
         else:
             resumed_jobs[job.job_id] = job.state_fields() | {"status": "pending"}
     state["jobs"] = resumed_jobs
