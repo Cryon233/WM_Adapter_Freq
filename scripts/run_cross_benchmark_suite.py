@@ -365,7 +365,11 @@ def _wire_job(job: JobSpec, state: dict[str, Any]) -> JobSpec:
         if cache_id in state["jobs"]:
             command.append(f"paths.feature_cache={_effective_artifact(state, cache_id)}")
     dependency = _dependency_job(job)
-    if dependency is not None and dependency in state["jobs"]:
+    if (
+        job.kind != "checkpoint"
+        and dependency is not None
+        and dependency in state["jobs"]
+    ):
         command.append(f"paths.method_checkpoint={_effective_artifact(state, dependency)}")
     return replace(job, command=tuple(command))
 
