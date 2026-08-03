@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import time
 from typing import Any
 
 import numpy as np
@@ -18,6 +19,10 @@ from wm_adapter.benchmarks.base import (
 )
 from wm_adapter.benchmarks.factory import build_benchmark
 from wm_adapter.data.feature_cache import FeatureCacheWriter
+from wm_adapter.data.feature_cache_v2 import (
+    CACHE_SCHEMA_VERSION_V2,
+    FeatureCacheV2Writer,
+)
 from wm_adapter.utils.reproducibility import load_experiment_config, resolve_path, seed_everything
 
 
@@ -137,8 +142,7 @@ def _assert_split_encoder_parity(
     return split_prefix, split
 
 
-def main() -> None:
-    cfg = load_experiment_config()
+def _build_v1(cfg: Any) -> None:
     if str(cfg.appearance.pipeline_version) != "composed_photometric_v1":
         raise ValueError(
             f"Unsupported appearance pipeline version: {cfg.appearance.pipeline_version}"
@@ -312,6 +316,193 @@ def main() -> None:
         raise
     print(f"Feature cache written: {output_path}")
     print(f"Cache fingerprint: {fingerprint}")
+
+
+def _source_trajectory_ids(source: Any, episode_ids: torch.Tensor) -> list[str]:
+    values: list[str] = []
+    for episode in episode_ids.tolist():
+        identity = source.trajectories[int(episode)]
+        if isinstance(identity, dict):
+            value = identity.get("demo_key", identity.get("episode_id", episode))
+        else:
+            value = getattr(identity, "demo_key", getattr(identity, "episode_id", episode))
+        values.append(str(value))
+    return values
+
+
+@torch.no_grad()
+def _encode_v2_batch(
+    backend: JEPAWMDroidBackend,
+    source: Any,
+    batch: dict[str, torch.Tensor],
+    middle_site: int,
+) -> dict[str, Any]:
+    clean = batch["clean_images"]
+    ood = batch["ood_images"]
+    if clean.shape[1] != 6 or ood.shape[1] != 6:
+        raise RuntimeError(
+            f"V2 cache requires six-frame sequences, clean={tuple(clean.shape)}, "
+            f"ood={tuple(ood.shape)}"
+        )
+    clean_middle = backend.encode_until_site(clean[:, :3], middle_site)
+    ood_middle = backend.encode_until_site(ood[:, :3], middle_site)
+    clean_target = backend.encode_images_frozen_base(clean)
+    actions = batch["actions"]
+    if tuple(actions.shape[1:]) != (6, 7):
+        raise RuntimeError(f"V2 cache actions must be [B,6,7], found {tuple(actions.shape)}")
+    return {
+        "clean_context_middle_tokens": clean_middle,
+        "ood_context_middle_tokens": ood_middle,
+        "clean_target_latents": clean_target,
+        "rollout_actions": actions[:, 2:5],
+        "episode_id": batch["episode_id"],
+        "window_id": batch["window_id"],
+        "source_trajectory_id": _source_trajectory_ids(source, batch["episode_id"]),
+        "appearance_seed": batch["appearance_seed"],
+        "appearance_severity": batch["appearance_severity"],
+    }
+
+
+def _build_v2(cfg: Any) -> None:
+    if int(cfg.data.num_frames) != 6:
+        raise ValueError("cross_benchmark_v2 requires data.num_frames=6")
+    if int(cfg.data.context_frames) != 3 or int(cfg.data.future_frames) != 3:
+        raise ValueError("cross_benchmark_v2 requires three context and three future frames")
+    seed_everything(int(cfg.data.window_seed))
+    backend = _backend(cfg)
+    benchmark = build_benchmark(cfg)
+    resolved_task = benchmark.resolve_task(strict=True)
+    task_manifest = benchmark.write_task_manifest(resolved_task)
+    source = benchmark.build_source_dataset(output_environment_info=False)
+    train_episodes, evaluation_episodes = benchmark.split_trajectory_ids(source)
+    candidates = benchmark.enumerate_window_candidates(
+        source, int(cfg.data.num_frames), int(cfg.data.frameskip)
+    )
+    selected = benchmark.select_windows(
+        candidates,
+        train_episodes,
+        int(cfg.data.num_train_windows),
+        int(cfg.data.window_seed),
+    )
+    if len(selected) != int(cfg.data.num_train_windows):
+        raise RuntimeError(
+            f"V2 requested {cfg.data.num_train_windows} windows, selected {len(selected)}"
+        )
+    severity_range = (
+        float(cfg.appearance.training_severity_min),
+        float(cfg.appearance.training_severity_max),
+    )
+    windows = benchmark.make_window_dataset(
+        source,
+        selected,
+        num_frames=6,
+        frameskip=int(cfg.data.frameskip),
+        appearance_seed=int(cfg.training.seed),
+        appearance_severity=1.0,
+        appearance_severity_range=severity_range,
+    )
+    loader = DataLoader(
+        windows,
+        batch_size=int(cfg.cache.encoder_batch_size),
+        shuffle=False,
+        num_workers=int(cfg.cache.num_workers),
+        pin_memory=True,
+        persistent_workers=int(cfg.cache.num_workers) > 0,
+    )
+    middle_site = backend.num_encoder_blocks // 2
+    late_site = backend.num_encoder_blocks - 1
+    output_path = resolve_path(cfg.paths.feature_cache)
+    if output_path.exists():
+        raise FileExistsError(f"V2 feature cache will not be overwritten: {output_path}")
+    layout_images = next(iter(loader))["clean_images"][:1]
+    _assert_split_encoder_parity(backend, layout_images)
+    layout = backend.token_layout
+    metadata = {
+        "backend": "jepa_wm_droid",
+        "benchmark": resolved_task.benchmark,
+        "benchmark_suite": resolved_task.suite,
+        "task_id": resolved_task.task_id,
+        "task_name": resolved_task.task_name,
+        "task_key": resolved_task.task_key,
+        "task_manifest_sha256": task_manifest["task_manifest_sha256"],
+        "dataset_sha256": resolved_task.dataset_sha256 or "directory_manifest",
+        "base_checkpoint_sha256": backend.base_checkpoint_sha256,
+        "dinov3_checkpoint_sha256": backend.dinov3_checkpoint_sha256,
+        "upstream_commits": backend.upstream_commits,
+        "middle_site_index": middle_site,
+        "late_site_index": late_site,
+        "num_encoder_blocks": backend.num_encoder_blocks,
+        "num_frames": 6,
+        "context_frames": 3,
+        "future_frames": 3,
+        "patch_grid_height": layout.grid_height,
+        "patch_grid_width": layout.grid_width,
+        "token_dim": layout.token_dim,
+        "prefix_token_count": layout.prefix_tokens,
+        "frameskip": int(cfg.data.frameskip),
+        "action_convention": resolved_task.action_convention,
+        "action_transform": resolved_task.action_transform,
+        "camera_height": resolved_task.camera_height,
+        "camera_width": resolved_task.camera_width,
+        "camera_channel_order": resolved_task.camera_channel_order,
+        "camera_vertical_flip": resolved_task.camera_vertical_flip,
+        "camera_contract": {
+            "key": resolved_task.camera_key,
+            "height": resolved_task.camera_height,
+            "width": resolved_task.camera_width,
+            "channel_order": resolved_task.camera_channel_order,
+            "vertical_flip": resolved_task.camera_vertical_flip,
+        },
+        "appearance_distribution": {
+            "pipeline_version": str(cfg.appearance.pipeline_version),
+            "seed_rule": "sha256(training_seed,episode_id,window_id)",
+            "severity_min": severity_range[0],
+            "severity_max": severity_range[1],
+        },
+        "train_test_split": {
+            "strategy": EPISODE_SPLIT_STRATEGY,
+            "seed": int(cfg.data.split_seed),
+            "train_fraction": float(cfg.data.train_fraction),
+            "train_ids": list(resolved_task.selected_train_demonstrations),
+            "test_ids": list(resolved_task.selected_test_demonstrations),
+        },
+        "window_selection": {
+            "strategy": WINDOW_SELECTION_STRATEGY,
+            "seed": int(cfg.data.window_seed),
+            "selected_sha256": _sha256_array(np.asarray(selected, dtype=np.int64)),
+        },
+    }
+    writer = FeatureCacheV2Writer(output_path, metadata)
+    completed = 0
+    started = time.perf_counter()
+    try:
+        for batch in loader:
+            encoded = _encode_v2_batch(backend, source, batch, middle_site)
+            writer.append(encoded)
+            completed += int(batch["clean_images"].shape[0])
+            elapsed = max(time.perf_counter() - started, 1.0e-9)
+            print(
+                f"CACHE_PROGRESS completed={completed} total={len(windows)} "
+                f"rate={completed / elapsed:.3f}",
+                flush=True,
+            )
+        fingerprint = writer.finalize()
+    except BaseException:
+        writer.close_unfinalized()
+        raise
+    print(
+        f"CACHE_COMPLETE path={output_path} fingerprint={fingerprint} "
+        f"windows={completed}",
+        flush=True,
+    )
+
+
+def main() -> None:
+    cfg = load_experiment_config()
+    if str(cfg.cache.get("schema_version", "")) == CACHE_SCHEMA_VERSION_V2:
+        _build_v2(cfg)
+    else:
+        _build_v1(cfg)
 
 
 if __name__ == "__main__":

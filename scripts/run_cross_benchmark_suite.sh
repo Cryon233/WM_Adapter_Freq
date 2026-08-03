@@ -20,8 +20,14 @@ if [[ -f ./env_libero.sh ]]; then
     source ./env_libero.sh
 fi
 
+if [[ -n "${GPUS:-}" ]]; then
+    export GPUS
+elif [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    export GPUS="$CUDA_VISIBLE_DEVICES"
+else
+    export GPUS="0,1,2,3"
+fi
 unset CUDA_VISIBLE_DEVICES
-export GPUS="${GPUS:-0,1,2,3}"
 export MUJOCO_GL=egl
 export PYOPENGL_PLATFORM=egl
 export HDF5_USE_FILE_LOCKING=FALSE

@@ -32,6 +32,13 @@ CEM_PATTERN = re.compile(
     r"Action optim at step\s+(\d+)\s+took\s+([0-9]+(?:\.[0-9]+)?)\s+seconds"
 )
 OFFLINE_PATTERN = re.compile(r"OFFLINE_PROGRESS completed=(\d+) total=(\d+)")
+CACHE_PROGRESS_PATTERN = re.compile(
+    r"CACHE_PROGRESS\s+completed=(\d+)\s+total=(\d+)\s+rate=([^\s]+)"
+)
+PROTOCOL_PROGRESS_PATTERN = re.compile(
+    r"PROTOCOL_PROGRESS\s+task=([^\s]+)\s+completed=(\d+)\s+total=(\d+)"
+)
+TRAIN_PROGRESS_PATTERN = re.compile(r"TRAIN_PROGRESS\s+(.*)")
 TRAIN_TQDM_PATTERN = re.compile(
     r"epoch\s+(\d+)\s*/\s*(\d+):[^\n]*?(\d+)\s*/\s*(\d+)"
 )
@@ -237,6 +244,42 @@ def parse_planning(text: str) -> Progress | None:
 
 
 def parse_training(text: str, heartbeat: str) -> Progress | None:
+    structured = [
+        dict(FIELD_PATTERN.findall(match.group(1)))
+        for match in TRAIN_PROGRESS_PATTERN.finditer(text)
+    ]
+    if structured:
+        latest = structured[-1]
+        step = int(latest["step"])
+        total = int(latest["total"])
+        recent = structured[-10:]
+        if (
+            len(recent) >= 2
+            and "elapsed_seconds" in recent[0]
+            and "elapsed_seconds" in recent[-1]
+        ):
+            first_step = int(recent[0]["step"])
+            last_step = int(recent[-1]["step"])
+            elapsed_delta = float(recent[-1]["elapsed_seconds"]) - float(
+                recent[0]["elapsed_seconds"]
+            )
+            step_rate = max(last_step - first_step, 0) / max(elapsed_delta, 1.0e-9)
+        else:
+            step_rate = 0.0
+        eta = (
+            f" | ETA≈{human_duration((total - step) / step_rate)}"
+            if step_rate > 0 and len(structured) >= 10
+            else ""
+        )
+        detail = (
+            f"step {step}/{total} | loss {latest.get('loss', 'n/a')} | "
+            f"clean {latest.get('clean_mse', 'n/a')} | OOD {latest.get('ood_mse', 'n/a')} | "
+            f"future {latest.get('future_mse', 'n/a')} | lr {latest.get('lr', 'n/a')} | "
+            f"grad {latest.get('grad_norm', 'n/a')} | samples/s {latest.get('samples_per_sec', 'n/a')} | "
+            f"core {latest.get('core_delta_ratio', 'n/a')} | spectral {latest.get('spectral_delta_ratio', 'n/a')}"
+            f"{eta} | {heartbeat}"
+        )
+        return Progress(100.0 * step / max(total, 1), "RUN", detail)
     tqdm_matches = list(TRAIN_TQDM_PATTERN.finditer(text))
     if tqdm_matches:
         epoch, epochs, batch, batches = map(int, tqdm_matches[-1].groups())
@@ -279,7 +322,18 @@ def artifact_detail(entry: dict[str, Any]) -> str:
     if "window_count" in artifact:
         return f"{artifact['window_count']} windows complete"
     if "parameter_count" in artifact:
-        return f"checkpoint complete | params {artifact['parameter_count']}"
+        steps = artifact.get("completed_optimizer_steps")
+        suffix = f" | steps {steps}" if steps is not None else ""
+        return f"checkpoint complete | params {artifact['parameter_count']}{suffix}"
+    if "cache_fingerprint" in artifact:
+        windows = artifact.get("available_windows", artifact.get("used_windows", "?"))
+        return f"cache {windows} windows | fingerprint {str(artifact['cache_fingerprint'])[:12]}"
+    if artifact.get("status") in {"passed", "not_applicable"}:
+        sequence = artifact.get("sequence_replay") or {}
+        detail = f"protocol {artifact['status']}"
+        if sequence:
+            detail += f" | qpos MAE {sequence.get('qpos_mae', 'n/a')}"
+        return detail
     if "source_path" in artifact:
         return "existing result reused"
     return "artifact validated"
@@ -316,6 +370,23 @@ def job_progress(job_id: str, entry: dict[str, Any]) -> Progress:
             percent,
             "RUN",
             f"offline windows {completed}/{total} | {heartbeat}",
+        )
+
+    cache_matches = list(CACHE_PROGRESS_PATTERN.finditer(text))
+    if cache_matches:
+        completed, total = map(int, cache_matches[-1].groups()[:2])
+        rate = cache_matches[-1].group(3)
+        return Progress(
+            100.0 * completed / max(total, 1), "RUN",
+            f"cache windows {completed}/{total} | {rate} windows/s | {heartbeat}",
+        )
+
+    protocol_matches = list(PROTOCOL_PROGRESS_PATTERN.finditer(text))
+    if protocol_matches:
+        task, completed, total = protocol_matches[-1].groups()
+        return Progress(
+            100.0 * int(completed) / max(int(total), 1), "RUN",
+            f"protocol {task} {completed}/{total} | {heartbeat}",
         )
 
     training = parse_training(text, heartbeat)

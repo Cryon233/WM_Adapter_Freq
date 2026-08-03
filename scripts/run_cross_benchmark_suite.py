@@ -28,9 +28,13 @@ from wm_adapter.experiments.cross_benchmark import (
     phase_summary,
     run_gpu_phase,
     validate_cache,
+    validate_cache_v2,
     validate_checkpoint,
+    validate_checkpoint_v2,
     validate_offline,
+    validate_offline_v2,
     validate_planning,
+    validate_planning_v2,
     validate_task_manifest,
 )
 from wm_adapter.experiments.cross_jobs import build_job_graph, logical_rollout_counts
@@ -43,11 +47,11 @@ from wm_adapter.utils.checkpoints import (
 from wm_adapter.utils.reproducibility import project_root, resolve_path
 
 
-DEFAULT_SUITE_CONFIG = "configs/experiment/cross_benchmark_v1.yaml"
+DEFAULT_SUITE_CONFIG = "configs/experiment/cross_benchmark_v2.yaml"
 
 
 def _arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the cross_benchmark_v1 experiment graph")
+    parser = argparse.ArgumentParser(description="Run a configured cross-benchmark experiment graph")
     parser.add_argument("--config", default=DEFAULT_SUITE_CONFIG)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--self-test", action="store_true")
@@ -81,7 +85,9 @@ def _self_test_suite(suite: Any) -> Any:
     cloned.checkpoint_root = roots.checkpoint_root
     cloned.output_root = roots.output_root
     cloned.analysis_root = roots.analysis_root
-    cloned.manifest_root = f"{roots.output_root}/manifests"
+    cloned.manifest_root = roots.get("manifest_root", f"{roots.output_root}/manifests")
+    if "protocol_validation_root" in roots:
+        cloned.protocol_validation_root = roots.protocol_validation_root
     cloned.reuse_sources = {}
     selected = {str(value) for value in cloned.self_test.task_keys}
     cloned.tasks = {
@@ -285,15 +291,16 @@ def _dry_run(suite: Any, jobs: list[JobSpec]) -> None:
                 "seed": job.seed,
                 "severity": job.severity,
                 "variant": job.variant,
+                "dependencies": list(job.dependencies),
+                "command": list(job.command),
                 "status": status,
                 "reuse_candidate": source,
                 "planned_reuse_job": linked_job,
                 "artifact_path": job.artifact_path,
             }
         )
-    stage_counts = {
-        phase: sum(job.phase == phase for job in jobs) for phase in PHASES
-    }
+    phases = [str(value) for value in suite.get("phases", PHASES)]
+    stage_counts = {phase: sum(job.phase == phase for job in jobs) for phase in phases}
     rollouts = logical_rollout_counts(jobs)
     rollouts["intrinsic_reuse_rollouts"] = intrinsic_reuse_rollouts
     rollouts["external_candidate_reusable_rollouts"] = reusable_rollouts
@@ -335,11 +342,12 @@ def _linked_reuse_job(job: JobSpec) -> str | None:
         )
     if job.phase == "OOD severity" and float(job.severity or -1.0) == 1.0:
         return f"planning/main/{job.task}/{job.method}/ood"
-    if job.phase == "DCT ablations" and job.variant == "full":
+    if job.phase in {"DCT ablations", "HFRA ablations"} and job.variant == "full":
+        main_method = "hfra" if job.phase == "HFRA ablations" else "dct_adapter"
         return {
-            "checkpoint": f"train/main/{job.task}/dct_adapter",
-            "offline": f"offline/main/{job.task}/dct_adapter",
-            "planning": f"planning/main/{job.task}/dct_adapter/ood",
+            "checkpoint": f"train/main/{job.task}/{main_method}",
+            "offline": f"offline/main/{job.task}/{main_method}",
+            "planning": f"planning/main/{job.task}/{main_method}/ood",
         }.get(job.kind)
     return None
 
@@ -558,6 +566,7 @@ def _validate_job(
     *,
     self_test: bool,
 ) -> dict[str, Any]:
+    is_v2 = str(suite.suite_name) == "cross_benchmark_v2"
     allow_legacy = (
         job.task == "robocasa_place"
         and resolve_path(path) != resolve_path(job.artifact_path)
@@ -568,6 +577,37 @@ def _validate_job(
             job.task,
             allow_legacy_place=allow_legacy,
         )
+    if job.kind == "protocol":
+        resolved = resolve_path(path)
+        payload = json.loads(resolved.read_text(encoding="utf-8"))
+        if job.benchmark == "libero":
+            expected = {
+                "schema_version": "libero_action_replay_contract_v1",
+                "task": job.task,
+                "status": "passed",
+                "sequence_replay_contract": "passed",
+                "repeat_action_contract": "passed",
+            }
+            mismatch = {
+                key: {"expected": value, "actual": payload.get(key)}
+                for key, value in expected.items()
+                if payload.get(key) != value
+            }
+            if mismatch:
+                raise RuntimeError(
+                    f"LIBERO protocol-validation artifact mismatch at {resolved}: {mismatch}"
+                )
+        elif payload.get("status") != "not_applicable":
+            raise RuntimeError(
+                f"RoboCasa protocol artifact must be not_applicable: {resolved}"
+            )
+        return {
+            "path": str(resolved),
+            "sha256": sha256_file(resolved),
+            "status": str(payload["status"]),
+            "sequence_replay": payload.get("sequence_replay"),
+            "repeated_action_replay": payload.get("repeated_action_replay"),
+        }
     if job.kind == "cache":
         task_manifest_path, _ = _manifest_paths(suite, job.task)
         task_manifest = json.loads(task_manifest_path.read_text(encoding="utf-8"))
@@ -580,6 +620,17 @@ def _validate_job(
                 "camera_vertical_flip",
             )
         }
+        if is_v2:
+            resources = state["jobs"][f"preflight/{job.task}"]["artifact_validation"]["report"]["resources"]
+            return validate_cache_v2(
+                path, int(job.required_count or 0), benchmark=job.benchmark,
+                task=job.task,
+                expected_task_manifest_sha256=str(task_manifest["task_manifest_sha256"]),
+                expected_action_transform=task_manifest.get("action_transform"),
+                expected_camera_contract=camera_contract,
+                expected_base_checkpoint_sha256=str(resources["jepa_checkpoint_sha256"]),
+                expected_dinov3_checkpoint_sha256=str(resources["dinov3_checkpoint_sha256"]),
+            )
         return validate_cache(
             path, int(job.required_count or 0), benchmark=job.benchmark,
             task=job.task, allow_legacy_place=allow_legacy,
@@ -608,8 +659,12 @@ def _validate_job(
             ablation = suite.ablations.variants[job.variant]
             method_config_path = str(ablation.method_config)
             loss_weights = (
-                float(ablation.canonical_weight),
-                float(ablation.dynamics_weight),
+                (
+                    float(ablation.canonical_weight),
+                    float(ablation.dynamics_weight),
+                )
+                if not is_v2
+                else None
             )
         else:
             method_config_path = str(task_config.method_configs[str(job.method)])
@@ -619,6 +674,20 @@ def _validate_job(
         )
         if not isinstance(method_config, dict):
             raise TypeError(f"Method config is not a mapping: {method_config_path}")
+        if is_v2:
+            expected_steps = int(
+                suite.self_test.optimizer_steps if self_test
+                else task_config.training.max_optimizer_steps
+            )
+            return validate_checkpoint_v2(
+                path, str(job.method), str(cache["cache_fingerprint"]),
+                benchmark=job.benchmark, task=job.task,
+                expected_training_seed=int(job.seed or 42),
+                expected_method_config=method_config,
+                expected_optimizer_steps=expected_steps,
+                expected_action_transform=task_manifest.get("action_transform"),
+                expected_camera_contract=camera_contract,
+            )
         return validate_checkpoint(
             path, str(job.method), str(cache["cache_fingerprint"]),
             benchmark=job.benchmark, task=job.task, allow_legacy_place=allow_legacy,
@@ -631,6 +700,23 @@ def _validate_job(
     if job.kind == "offline":
         task_manifest_path, _ = _manifest_paths(suite, job.task)
         task_manifest = json.loads(task_manifest_path.read_text(encoding="utf-8"))
+        if is_v2:
+            cache = _cache_info(state, job.task)
+            dependency = _dependency_job(job)
+            checkpoint = (
+                state["jobs"][dependency]["artifact_validation"]
+                if dependency is not None and dependency in state["jobs"]
+                else None
+            )
+            return validate_offline_v2(
+                path, int(job.required_count or 0), benchmark=job.benchmark,
+                task=job.task, method=str(job.method),
+                expected_cache_fingerprint=str(cache["cache_fingerprint"]),
+                expected_checkpoint_sha256=(
+                    str(checkpoint["sha256"]) if checkpoint is not None else None
+                ),
+                expected_action_transform=task_manifest.get("action_transform"),
+            )
         return validate_offline(
             path, int(job.required_count or 0), benchmark=job.benchmark,
             task=job.task, method=str(job.method),
@@ -657,7 +743,8 @@ def _validate_job(
             if dependency is not None and dependency in state["jobs"]
             else None
         )
-        return validate_planning(
+        planning_validator = validate_planning_v2 if is_v2 else validate_planning
+        return planning_validator(
             path, int(job.required_count or 0), benchmark=job.benchmark,
             task=job.task, method=str(job.method), domain=str(job.domain),
             seed=int(suite.main.eval_seed), severity=float(job.severity or 1.0),
@@ -701,7 +788,7 @@ def _resume_or_pending(
                 suite, state, job, str(standard), self_test=self_test
             )
         except Exception:
-            if job.kind in {"cache", "checkpoint", "planning", "offline"}:
+            if job.kind in {"protocol", "cache", "checkpoint", "planning", "offline"}:
                 archived = archive_incomplete(standard)
                 state.setdefault("archives", []).append(str(archived))
                 if job.kind == "offline":
@@ -742,6 +829,8 @@ def _resume_or_pending(
 
 
 def _run(suite: Any, jobs: list[JobSpec], *, self_test: bool) -> None:
+    is_v2 = str(suite.suite_name) == "cross_benchmark_v2"
+    suite_config_path = resolve_path(str(suite._suite_config_path))
     state_path = resolve_path(str(suite.state_path))
     if state_path.is_file():
         state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -755,6 +844,10 @@ def _run(suite: Any, jobs: list[JobSpec], *, self_test: bool) -> None:
     _reset_failed_state_for_resume(state, jobs)
     state["expected_jobs"] = len(jobs)
     state["state_path"] = str(state_path)
+    state["suite_name"] = str(suite.suite_name)
+    state["protocol"] = str(suite.protocol)
+    state["suite_config_path"] = str(suite_config_path)
+    state["suite_config_sha256"] = sha256_file(suite_config_path)
     state["git"] = {
         "commit": git_commit(project_root()),
         "dirty": bool(
@@ -788,9 +881,26 @@ def _run(suite: Any, jobs: list[JobSpec], *, self_test: bool) -> None:
         )
         state["phase_summary"] = phase_summary(state, jobs)
         atomic_json(state_path, state)
-        report = _run_isolated_preflight(
-            suite, job, str(config_path), self_test=self_test
-        )
+        try:
+            report = _run_isolated_preflight(
+                suite, job, str(config_path), self_test=self_test
+            )
+        except Exception as error:
+            if not is_v2:
+                raise
+            preflight_ended = time.time()
+            entry = job.state_fields()
+            entry.update(
+                status="failed", start_time=preflight_started,
+                end_time=preflight_ended,
+                elapsed_seconds=preflight_ended - preflight_started,
+                return_code=1,
+                error=f"{type(error).__name__}: {error}",
+            )
+            state["jobs"][job_id] = entry
+            state["phase_summary"] = phase_summary(state, jobs)
+            atomic_json(state_path, state)
+            continue
         entry = job.state_fields()
         preflight_ended = time.time()
         entry.update(
@@ -809,14 +919,15 @@ def _run(suite: Any, jobs: list[JobSpec], *, self_test: bool) -> None:
     state["status"] = "running"
     state["phase_summary"] = phase_summary(state, jobs)
     atomic_json(state_path, state)
-    for phase in PHASES[1:]:
+    phases = [str(value) for value in suite.get("phases", PHASES)]
+    for phase in phases[1:]:
         phase_jobs = [job for job in jobs if job.phase == phase]
         # Stability and ablation phases contain both producers and consumers.
         # Preserve phase-level GPU parallelism while never starting an evaluator
         # before its task-specific checkpoint has completed or been reused.
         kind_waves = (
             (("checkpoint",), ("offline", "planning"))
-            if phase == "DCT ablations"
+            if phase in {"DCT ablations", "HFRA ablations"}
             else (("checkpoint",), ("planning",))
             if phase == "Training-seed stability"
             else (tuple(sorted({job.kind for job in phase_jobs})),)
@@ -825,6 +936,34 @@ def _run(suite: Any, jobs: list[JobSpec], *, self_test: bool) -> None:
             wave_jobs = [job for job in phase_jobs if job.kind in kinds]
             pending: list[JobSpec] = []
             for job in wave_jobs:
+                failed_dependencies = [
+                    dependency
+                    for dependency in job.dependencies
+                    if state["jobs"].get(dependency, {}).get("status")
+                    in {"failed", "blocked", "stopped"}
+                ]
+                if failed_dependencies:
+                    entry = job.state_fields()
+                    entry.update(
+                        status="blocked",
+                        error=(
+                            "blocked because dependencies failed: "
+                            + ", ".join(failed_dependencies)
+                        ),
+                    )
+                    state["jobs"][job.job_id] = entry
+                    continue
+                incomplete_dependencies = [
+                    dependency
+                    for dependency in job.dependencies
+                    if state["jobs"].get(dependency, {}).get("status")
+                    not in {"completed", "reused"}
+                ]
+                if incomplete_dependencies:
+                    raise RuntimeError(
+                        f"Job {job.job_id} reached phase {phase} before dependencies "
+                        f"completed: {incomplete_dependencies}"
+                    )
                 candidate = _resume_or_pending(
                     suite, state, job, self_test=self_test
                 )
@@ -838,10 +977,15 @@ def _run(suite: Any, jobs: list[JobSpec], *, self_test: bool) -> None:
                     lambda job, path: _validate_job(
                         suite, state, job, path, self_test=self_test
                     ),
+                    raise_on_failure=not is_v2,
                 )
             state["phase_summary"] = phase_summary(state, jobs)
             atomic_json(state_path, state)
-    state["status"] = "completed"
+    failed_or_blocked = any(
+        entry.get("status") in {"failed", "blocked"}
+        for entry in state["jobs"].values()
+    )
+    state["status"] = "completed_with_failures" if failed_or_blocked else "completed"
     state["completed_at_unix"] = time.time()
     state["phase_summary"] = phase_summary(state, jobs)
     atomic_json(state_path, state)
@@ -852,6 +996,8 @@ def _run(suite: Any, jobs: list[JobSpec], *, self_test: bool) -> None:
             "protocol": str(suite.protocol),
             "state_path": str(state_path),
             "git": state.get("git"),
+            "suite_config_path": str(suite_config_path),
+            "suite_config_sha256": state["suite_config_sha256"],
             "jobs": state["jobs"],
         },
     )

@@ -1,4 +1,10 @@
 from wm_adapter.data.feature_cache import FeatureCacheDataset, FeatureCacheWriter
+from wm_adapter.data.feature_cache_v2 import (
+    CACHE_SCHEMA_VERSION_V2,
+    FeatureCacheV2Dataset,
+    FeatureCacheV2Writer,
+    V2_ARRAY_KEYS,
+)
 from wm_adapter.data.robocasa_windows import (
     EPISODE_SPLIT_STRATEGY,
     WINDOW_SELECTION_STRATEGY,
@@ -18,6 +24,10 @@ __all__ = [
     "EPISODE_SPLIT_STRATEGY",
     "FeatureCacheDataset",
     "FeatureCacheWriter",
+    "CACHE_SCHEMA_VERSION_V2",
+    "FeatureCacheV2Dataset",
+    "FeatureCacheV2Writer",
+    "V2_ARRAY_KEYS",
     "LEROBOT_SOURCE_ID",
     "LEROBOT_SOURCE_REVISION",
     "RoboCasaLeRobotDataset",

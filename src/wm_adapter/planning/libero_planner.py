@@ -19,6 +19,7 @@ from wm_adapter.planning.jepa_wm_planner import (
     JEPAWMPlanningModel,
     PlanningResult,
     _build_official_agent,
+    frozen_goal_latent_fingerprint,
 )
 from wm_adapter.utils.reproducibility import resolve_path, seed_everything
 
@@ -169,6 +170,7 @@ def run_libero_planning(
     source_ids: list[str] = []
     initialization_fingerprints: list[str] = []
     goal_fingerprints: list[str] = []
+    goal_base_latent_fingerprints: list[str] = []
     appearance_specs: list[dict[str, Any] | None] = []
     cem_seeds: list[int] = []
     environment: Any | None = None
@@ -223,6 +225,9 @@ def run_libero_planning(
             current_observation = environment.set_init_state(states[0].numpy())
             current_image = benchmark._observation_image(current_observation)
             goal = observation["visual"][-1]
+            goal_base_latent_fingerprint = frozen_goal_latent_fingerprint(
+                backend, goal
+            )
             if goal.dtype != torch.uint8:
                 goal_tensor = goal.float()
             else:
@@ -281,6 +286,7 @@ def run_libero_planning(
                 str(instance["initialization_fingerprint"])
             )
             goal_fingerprints.append(str(instance["goal_fingerprint"]))
+            goal_base_latent_fingerprints.append(goal_base_latent_fingerprint)
             appearance_specs.append(
                 appearance_spec.as_dict() if domain_name == "ood" else None
             )
@@ -347,6 +353,7 @@ def run_libero_planning(
         source_trajectory_ids=source_ids,
         initialization_fingerprints=initialization_fingerprints,
         goal_fingerprints=goal_fingerprints,
+        goal_base_latent_fingerprints=goal_base_latent_fingerprints,
         appearance_specs=appearance_specs,
         cem_seeds=cem_seeds,
     )

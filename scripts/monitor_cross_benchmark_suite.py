@@ -18,22 +18,21 @@ from wm_adapter.experiments.cross_jobs import build_job_graph
 from wm_adapter.utils.reproducibility import project_root, resolve_path
 
 
-DEFAULT_STATE = project_root() / "logs/cross_benchmark_v1/state.json"
-DEFAULT_SUITE = project_root() / "configs/experiment/cross_benchmark_v1.yaml"
+DEFAULT_SUITE = project_root() / "configs/experiment/cross_benchmark_v2.yaml"
 RUNNER_COMMAND = "scripts/run_cross_benchmark_suite.py"
 
 
-def _state(path: Path) -> dict[str, Any]:
+def _state(path: Path, fallback_suite: str) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(value, dict):
             raise TypeError("state root is not a mapping")
         return value
     except FileNotFoundError:
-        return {"suite": "cross_benchmark_v1", "status": "waiting", "jobs": {}}
+        return {"suite": fallback_suite, "status": "waiting", "jobs": {}}
     except Exception as error:
         return {
-            "suite": "cross_benchmark_v1", "status": "failed", "jobs": {},
+            "suite": fallback_suite, "status": "failed", "jobs": {},
             "error": f"Cannot read state: {type(error).__name__}: {error}",
         }
 
@@ -122,26 +121,33 @@ def _wrap_dashboard_lines(lines: list[str], width: int) -> list[str]:
     return wrapped
 
 
-def _expected(suite_path: Path, state: dict[str, Any]) -> dict[str, int]:
+def _suite_phases(suite: Any) -> list[str]:
+    return [str(value) for value in suite.get("phases", PHASES)]
+
+
+def _expected(suite: Any, state: dict[str, Any], phases: list[str]) -> dict[str, int]:
     if state.get("phase_summary"):
         return {
             phase: int(state["phase_summary"].get(phase, {}).get("total", 0))
-            for phase in PHASES
+            for phase in phases
         }
-    suite = load_suite_config(suite_path)
     jobs = build_job_graph(suite, self_test=bool(state.get("self_test", False)))
-    return {phase: sum(job.phase == phase for job in jobs) for phase in PHASES}
+    return {phase: sum(job.phase == phase for job in jobs) for phase in phases}
 
 
 def dashboard_lines(
     state_path: Path, suite_path: Path, width: int, height: int, refresh: float
 ) -> list[str]:
-    state = _state(state_path)
+    suite = load_suite_config(suite_path)
+    suite_name = str(suite.suite_name)
+    protocol = str(suite.protocol)
+    phases_order = _suite_phases(suite)
+    state = _state(state_path, suite_name)
     jobs: dict[str, dict[str, Any]] = dict(state.get("jobs", {}))
-    expected = _expected(suite_path, state)
-    phases = [_phase_progress(phase, expected[phase], jobs) for phase in PHASES]
+    expected = _expected(suite, state, phases_order)
+    phases = [_phase_progress(phase, expected[phase], jobs) for phase in phases_order]
     total = sum(expected.values())
-    overall = sum(item.percent / 100.0 * expected[phase] for phase, item in zip(PHASES, phases))
+    overall = sum(item.percent / 100.0 * expected[phase] for phase, item in zip(phases_order, phases))
     overall = 100.0 * overall / max(total, 1)
     running = [(key, value) for key, value in jobs.items() if value.get("status") == "running"]
     completed = sum(value.get("status") in {"completed", "reused"} for value in jobs.values())
@@ -150,6 +156,9 @@ def dashboard_lines(
     pending = max(0, total - completed - len(running) - failed - blocked)
     lines = [
         f"WM Adapter RoboCasa + LIBERO Dashboard  {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Suite: {suite_name} | protocol: {protocol}",
+        f"Git: {state.get('git', {}).get('commit', 'unknown')} | "
+        f"{'dirty' if state.get('git', {}).get('dirty') else 'clean'} | runner: {state.get('status', 'waiting')}",
         f"Project: {project_root()}",
         f"State:   {state_path}",
         f"Overall [{progress_core.bar(overall, max(12, min(42, width - 22)))}] {overall:6.2f}%",
@@ -158,7 +167,7 @@ def dashboard_lines(
     ]
     lines.extend(
         _progress_line(f"{index}. {phase}", progress, width)
-        for index, (phase, progress) in enumerate(zip(PHASES, phases), start=1)
+        for index, (phase, progress) in enumerate(zip(phases_order, phases), start=1)
     )
     lines.extend(["", "GPU TASKS"])
     gpu = progress_core.gpu_stats()
@@ -266,7 +275,8 @@ def _runner_pid_path(suite_path: Path, state: dict[str, Any]) -> Path:
 
 
 def _mark_stopped(state_path: Path) -> None:
-    state = _state(state_path)
+    suite = load_suite_config(suite_path)
+    state = _state(state_path, str(suite.suite_name))
     stopped = time.time()
     state.update(
         status="stopped",
@@ -286,7 +296,8 @@ def _mark_stopped(state_path: Path) -> None:
 
 
 def _terminate_suite(state_path: Path, suite_path: Path) -> str:
-    state = _state(state_path)
+    suite = load_suite_config(suite_path)
+    state = _state(state_path, str(suite.suite_name))
     pid_path = _runner_pid_path(suite_path, state)
     pid = _read_runner_pid(pid_path)
     if pid is None:
@@ -397,13 +408,14 @@ def _curses(screen: Any, state: Path, suite: Path, refresh: float) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--state", default=str(DEFAULT_STATE))
+    parser.add_argument("--state")
     parser.add_argument("--suite-config", default=str(DEFAULT_SUITE))
     parser.add_argument("--refresh", type=float, default=2.0)
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
-    state = resolve_path(args.state)
     suite = resolve_path(args.suite_config)
+    suite_cfg = load_suite_config(suite)
+    state = resolve_path(args.state or str(suite_cfg.state_path))
     if args.once:
         print("\n".join(dashboard_lines(state, suite, 160, 200, args.refresh)))
         return

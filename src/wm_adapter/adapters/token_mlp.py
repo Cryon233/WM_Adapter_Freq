@@ -28,6 +28,13 @@ class TokenMLPAdapter(PEFTMethod):
             )
         return patch_tokens + self.up(self.activation(self.down(patch_tokens)))
 
+    def adapter_site_indices(self, num_encoder_blocks: int) -> tuple[int, ...]:
+        if num_encoder_blocks <= 0:
+            raise ValueError(
+                f"num_encoder_blocks must be positive, received {num_encoder_blocks}"
+            )
+        return (num_encoder_blocks - 1,)
+
     def forward(self, patch_tokens: Tensor) -> Tensor:
         return self.apply_patch_tokens(patch_tokens)
 

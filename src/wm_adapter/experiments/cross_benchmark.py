@@ -18,6 +18,11 @@ from wm_adapter.benchmarks.base import (
     canonical_sha256,
 )
 from wm_adapter.data.feature_cache import ARRAY_KEYS, CACHE_SCHEMA_VERSION
+from wm_adapter.data.feature_cache_v2 import (
+    CACHE_SCHEMA_VERSION_V2,
+    V2_ARRAY_KEYS,
+)
+from wm_adapter.training.trainer_v2 import CHECKPOINT_SCHEMA_V2
 from wm_adapter.utils.checkpoints import load_method_checkpoint, sha256_file
 from wm_adapter.utils.reproducibility import project_root, resolve_path
 
@@ -59,6 +64,7 @@ class JobSpec:
     variant: str | None = None
     required_count: int | None = None
     reuse_sources: tuple[str, ...] = field(default_factory=tuple)
+    dependencies: tuple[str, ...] = field(default_factory=tuple)
 
     def state_fields(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -81,6 +87,7 @@ def load_suite_config(path: str | Path) -> DictConfig:
         raise FileNotFoundError(f"Cross-benchmark suite config does not exist: {resolved}")
     cfg = OmegaConf.load(resolved)
     OmegaConf.resolve(cfg)
+    cfg["_suite_config_path"] = str(resolved)
     return cfg
 
 
@@ -271,6 +278,95 @@ def validate_cache(
         }
 
 
+def _decoded_hdf5_attr(value: Any) -> Any:
+    if hasattr(value, "item"):
+        value = value.item()
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    if isinstance(value, str) and value[:1] in {"{", "["}:
+        return json.loads(value)
+    return value
+
+
+def validate_cache_v2(
+    path: str | Path,
+    windows: int,
+    *,
+    benchmark: str,
+    task: str,
+    expected_task_manifest_sha256: str,
+    expected_action_transform: dict[str, Any] | None,
+    expected_camera_contract: dict[str, Any],
+    expected_base_checkpoint_sha256: str,
+    expected_dinov3_checkpoint_sha256: str,
+) -> dict[str, Any]:
+    resolved = resolve_path(path)
+    with h5py.File(resolved, "r", libver="latest", swmr=True) as handle:
+        if str(handle.attrs.get("schema_version", "")) != CACHE_SCHEMA_VERSION_V2:
+            raise RuntimeError(f"V2 feature-cache schema mismatch: {resolved}")
+        if not bool(handle.attrs.get("finalized", False)):
+            raise RuntimeError(f"V2 feature cache is not finalized: {resolved}")
+        missing = sorted(set(V2_ARRAY_KEYS).difference(handle.keys()))
+        if missing:
+            raise RuntimeError(f"V2 feature cache is missing arrays {missing}: {resolved}")
+        counts = {key: int(handle[key].shape[0]) for key in V2_ARRAY_KEYS}
+        if len(set(counts.values())) != 1 or min(counts.values()) < windows:
+            raise RuntimeError(
+                f"V2 feature-cache window counts are invalid for required={windows}: "
+                f"{counts}, path={resolved}"
+            )
+        expected_scalars = {
+            "benchmark": benchmark,
+            "task_key": task,
+            "task_manifest_sha256": expected_task_manifest_sha256,
+            "base_checkpoint_sha256": expected_base_checkpoint_sha256,
+            "dinov3_checkpoint_sha256": expected_dinov3_checkpoint_sha256,
+            "num_frames": 6,
+            "context_frames": 3,
+            "future_frames": 3,
+        }
+        mismatch = {
+            key: {"expected": value, "actual": _decoded_hdf5_attr(handle.attrs.get(key))}
+            for key, value in expected_scalars.items()
+            if _decoded_hdf5_attr(handle.attrs.get(key)) != value
+        }
+        num_blocks = int(_decoded_hdf5_attr(handle.attrs.get("num_encoder_blocks", -1)))
+        middle = int(_decoded_hdf5_attr(handle.attrs.get("middle_site_index", -1)))
+        late = int(_decoded_hdf5_attr(handle.attrs.get("late_site_index", -1)))
+        if middle != num_blocks // 2 or late != num_blocks - 1:
+            mismatch["adapter_sites"] = {
+                "expected": [num_blocks // 2, num_blocks - 1],
+                "actual": [middle, late],
+            }
+        actual_transform = _decoded_hdf5_attr(handle.attrs.get("action_transform"))
+        if actual_transform != expected_action_transform:
+            mismatch["action_transform"] = {
+                "expected": expected_action_transform,
+                "actual": actual_transform,
+            }
+        actual_camera = {
+            key: _decoded_hdf5_attr(handle.attrs.get(key))
+            for key in expected_camera_contract
+        }
+        if actual_camera != expected_camera_contract:
+            mismatch["camera_contract"] = {
+                "expected": expected_camera_contract,
+                "actual": actual_camera,
+            }
+        if mismatch:
+            raise RuntimeError(f"V2 feature-cache contract mismatch at {resolved}: {mismatch}")
+        return {
+            "path": str(resolved),
+            "sha256": sha256_file(resolved),
+            "cache_fingerprint": str(handle.attrs["cache_fingerprint"]),
+            "available_windows": min(counts.values()),
+            "used_windows": windows,
+            "schema_version": CACHE_SCHEMA_VERSION_V2,
+            "middle_site_index": middle,
+            "late_site_index": late,
+        }
+
+
 def validate_checkpoint(
     path: str | Path,
     method: str,
@@ -357,6 +453,78 @@ def validate_checkpoint(
     }
 
 
+def validate_checkpoint_v2(
+    path: str | Path,
+    method: str,
+    cache_fingerprint: str,
+    *,
+    benchmark: str,
+    task: str,
+    expected_training_seed: int,
+    expected_method_config: dict[str, Any],
+    expected_optimizer_steps: int,
+    expected_action_transform: dict[str, Any] | None,
+    expected_camera_contract: dict[str, Any],
+) -> dict[str, Any]:
+    resolved = resolve_path(path)
+    payload = load_method_checkpoint(resolved)
+    expected = {
+        "schema_version": CHECKPOINT_SCHEMA_V2,
+        "method_name": method,
+        "cache_fingerprint": cache_fingerprint,
+        "loss_name": "unified_trajectory_mse",
+        "max_optimizer_steps": expected_optimizer_steps,
+        "completed_optimizer_steps": expected_optimizer_steps,
+        "training_seed": expected_training_seed,
+        "goal_encoder": "frozen_base",
+    }
+    mismatch = {
+        key: {"expected": value, "actual": payload.get(key)}
+        for key, value in expected.items()
+        if payload.get(key) != value
+    }
+    configured = {key: value for key, value in expected_method_config.items() if key != "name"}
+    actual_method = dict(payload.get("method_config", {}))
+    for key, value in configured.items():
+        if actual_method.get(key) != value:
+            mismatch[f"method_config.{key}"] = {
+                "expected": value,
+                "actual": actual_method.get(key),
+            }
+    metadata = dict(payload.get("data_metadata", {}))
+    expected_metadata = {
+        "benchmark": benchmark,
+        "task_key": task,
+        "action_transform": expected_action_transform,
+        **expected_camera_contract,
+    }
+    for key, value in expected_metadata.items():
+        if metadata.get(key) != value:
+            mismatch[f"data_metadata.{key}"] = {
+                "expected": value,
+                "actual": metadata.get(key),
+            }
+    optimizer = dict(payload.get("optimizer_config", {}))
+    scheduler = dict(payload.get("scheduler_config", {}))
+    if optimizer.get("name") != "AdamW":
+        mismatch["optimizer_config.name"] = {"expected": "AdamW", "actual": optimizer.get("name")}
+    if scheduler.get("name") != "cosine":
+        mismatch["scheduler_config.name"] = {"expected": "cosine", "actual": scheduler.get("name")}
+    parameter_count = int(payload.get("trainable_parameter_count", -1))
+    if parameter_count <= 0:
+        mismatch["trainable_parameter_count"] = {"expected": ">0", "actual": parameter_count}
+    if mismatch:
+        raise RuntimeError(f"V2 checkpoint contract mismatch at {resolved}: {mismatch}")
+    return {
+        "path": str(resolved),
+        "sha256": sha256_file(resolved),
+        "parameter_count": parameter_count,
+        "cache_fingerprint": cache_fingerprint,
+        "completed_optimizer_steps": expected_optimizer_steps,
+        "schema_version": CHECKPOINT_SCHEMA_V2,
+    }
+
+
 def validate_offline(
     path: str | Path,
     windows: int,
@@ -386,6 +554,56 @@ def validate_offline(
     if expected_action_transform is not None and payload.get("action_transform") != expected_action_transform:
         raise RuntimeError(f"Offline action-transform mismatch: {resolved}")
     return {"path": str(resolved), "sha256": sha256_file(resolved)}
+
+
+def validate_offline_v2(
+    path: str | Path,
+    windows: int,
+    *,
+    benchmark: str,
+    task: str,
+    method: str,
+    expected_cache_fingerprint: str,
+    expected_checkpoint_sha256: str | None,
+    expected_action_transform: dict[str, Any] | None,
+) -> dict[str, Any]:
+    resolved = resolve_path(path)
+    payload = json.loads(resolved.read_text(encoding="utf-8"))
+    expected = {
+        "schema_version": "jepa_wm_offline_metrics_v2",
+        "benchmark": benchmark,
+        "task": task,
+        "method": method,
+        "window_count": windows,
+        "goal_encoder": "frozen_base",
+        "loss_name": "unified_trajectory_mse",
+        "cache_fingerprint": expected_cache_fingerprint,
+        "method_checkpoint_sha256": expected_checkpoint_sha256,
+        "action_transform": expected_action_transform,
+    }
+    mismatch = {
+        key: {"expected": value, "actual": payload.get(key)}
+        for key, value in expected.items()
+        if payload.get(key) != value
+    }
+    required_metrics = {
+        "terminal_h1_mse", "terminal_h2_mse", "terminal_h3_mse",
+        "mean_through_h1_mse", "mean_through_h2_mse", "mean_through_h3_mse",
+        "true_action_rank", "action_top1_accuracy",
+        "action_mean_reciprocal_rank", "true_vs_negative_cost_gap",
+        "zero_action_gap",
+    }
+    for domain in ("clean", "ood"):
+        actual = set(dict(payload.get("domains", {})).get(domain, {}))
+        missing = sorted(required_metrics.difference(actual))
+        if missing:
+            mismatch[f"domains.{domain}"] = {"missing": missing}
+    if mismatch:
+        raise RuntimeError(f"V2 offline artifact mismatch at {resolved}: {mismatch}")
+    return {
+        "path": str(resolved), "sha256": sha256_file(resolved),
+        "window_count": windows, "schema_version": expected["schema_version"],
+    }
 
 
 def validate_planning(
@@ -546,6 +764,64 @@ def validate_planning(
     }
 
 
+def validate_planning_v2(
+    path: str | Path,
+    episodes: int,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    resolved = resolve_path(path)
+    payload = json.loads(resolved.read_text(encoding="utf-8"))
+    result = validate_planning(resolved, episodes, **kwargs)
+    expected = {
+        "goal_encoder": "frozen_base",
+        "current_encoder": "configured_method",
+    }
+    mismatch = {
+        key: {"expected": value, "actual": payload.get(key)}
+        for key, value in expected.items()
+        if payload.get(key) != value
+    }
+    fingerprints = payload.get("goal_base_latent_fingerprint")
+    if (
+        not isinstance(fingerprints, list)
+        or len(fingerprints) < episodes
+        or any(not isinstance(value, str) or len(value) != 64 for value in fingerprints[:episodes])
+    ):
+        mismatch["goal_base_latent_fingerprint"] = {
+            "expected": f"at least {episodes} SHA256 values",
+            "actual": fingerprints,
+        }
+    manifest = json.loads(
+        resolve_path(kwargs["evaluation_manifest"]).read_text(encoding="utf-8")
+    )
+    manifest_fingerprints = [
+        item.get("goal_base_latent_fingerprint")
+        for item in manifest.get("instances", [])[:episodes]
+    ]
+    if all(value is not None for value in manifest_fingerprints) and list(
+        fingerprints or []
+    )[:episodes] != manifest_fingerprints:
+        mismatch["goal_base_latent_fingerprint_manifest"] = {
+            "expected": manifest_fingerprints,
+            "actual": list(fingerprints or [])[:episodes],
+        }
+    benchmark = str(kwargs["benchmark"])
+    if benchmark == "libero":
+        max_steps = int(payload.get("config", {}).get("evaluation", {}).get("max_episode_steps", -1))
+        if max_steps != 600:
+            mismatch["evaluation.max_episode_steps"] = {
+                "expected": 600,
+                "actual": max_steps,
+            }
+    if mismatch:
+        raise RuntimeError(f"V2 planning artifact mismatch at {resolved}: {mismatch}")
+    result.update(
+        goal_encoder="frozen_base",
+        goal_base_latent_fingerprints=fingerprints[:episodes],
+    )
+    return result
+
+
 def _state_job(job: JobSpec, status: str) -> dict[str, Any]:
     value = job.state_fields()
     value["status"] = status
@@ -600,7 +876,9 @@ def run_gpu_phase(
     state_path: str | Path,
     state: dict[str, Any],
     validator: Any,
-) -> None:
+    *,
+    raise_on_failure: bool = True,
+) -> set[str]:
     pending = list(jobs)
     running: dict[
         int,
@@ -618,9 +896,10 @@ def run_gpu_phase(
             "WM_ADAPTER_MIN_GPU_FREE_MIB must be non-negative, "
             f"received {minimum_free_mib}"
     )
-    failure = False
+    failed_tasks: set[str] = set()
     while pending or running:
-        if not failure:
+        stop_launching = bool(failed_tasks) and raise_on_failure
+        if not stop_launching:
             free_memory = _gpu_free_memory_mib(gpu_ids)
             idle_gpus = sorted(
                 (int(gpu) for gpu in gpu_ids if int(gpu) not in running),
@@ -631,7 +910,8 @@ def run_gpu_phase(
                     (
                         index
                         for index, candidate in enumerate(pending)
-                        if gpu not in attempted_gpus[candidate.job_id]
+                        if candidate.task not in failed_tasks
+                        and gpu not in attempted_gpus[candidate.job_id]
                         and (
                             candidate.kind == "analysis"
                             or free_memory[gpu] >= minimum_free_mib
@@ -679,7 +959,7 @@ def run_gpu_phase(
                 )
                 _write_state(state_path, state)
         if not running:
-            if pending and not failure:
+            if pending and not stop_launching:
                 free_memory = _gpu_free_memory_mib(gpu_ids)
                 waiting_payload = {
                     "scheduler_status": "waiting_for_eligible_gpu",
@@ -738,7 +1018,7 @@ def run_gpu_phase(
                 except Exception as error:
                     entry["status"] = "failed"
                     entry["error"] = f"{type(error).__name__}: {error}"
-                    failure = True
+                    failed_tasks.add(job.task)
             elif cuda_oom and len(attempted_gpus[job.job_id]) < len(gpu_ids):
                 remaining = sorted(
                     set(int(value) for value in gpu_ids).difference(
@@ -773,20 +1053,31 @@ def run_gpu_phase(
                     if cuda_oom
                     else f"process exited with code {return_code}"
                 )
-                failure = True
+                failed_tasks.add(job.task)
             del running[gpu]
+            if not raise_on_failure and job.task in failed_tasks:
+                blocked = [candidate for candidate in pending if candidate.task == job.task]
+                pending = [candidate for candidate in pending if candidate.task != job.task]
+                for candidate in blocked:
+                    blocked_entry = _state_job(candidate, "blocked")
+                    blocked_entry["error"] = (
+                        f"blocked because task {job.task} failed in the same phase"
+                    )
+                    state["jobs"][candidate.job_id] = blocked_entry
             _write_state(state_path, state)
-    if failure:
+    if failed_tasks and raise_on_failure:
         for job in pending:
             state["jobs"][job.job_id] = _state_job(job, "blocked")
         _write_state(state_path, state)
         failed = [key for key, value in state["jobs"].items() if value["status"] == "failed"]
         raise RuntimeError(f"Cross-benchmark jobs failed: {failed}")
+    return failed_tasks
 
 
 def phase_summary(state: dict[str, Any], jobs: Sequence[JobSpec]) -> dict[str, Any]:
     summary: dict[str, Any] = {}
-    for phase in PHASES:
+    phases = tuple(dict.fromkeys(job.phase for job in jobs))
+    for phase in phases:
         phase_jobs = [job for job in jobs if job.phase == phase]
         statuses = [state.get("jobs", {}).get(job.job_id, {}).get("status", "pending") for job in phase_jobs]
         complete = sum(value in {"completed", "reused"} for value in statuses)

@@ -124,9 +124,22 @@ def load_method_checkpoint(path: str | Path) -> dict[str, Any]:
         "dinov3_checkpoint_sha256",
         "upstream_commits",
         "cache_fingerprint",
-        "appearance_metadata",
         "training_config",
     }
+    if payload.get("schema_version") == "wm_adapter_checkpoint_v2":
+        required.update(
+            {
+                "loss_name",
+                "max_optimizer_steps",
+                "completed_optimizer_steps",
+                "optimizer_config",
+                "scheduler_config",
+                "training_seed",
+                "goal_encoder",
+            }
+        )
+    else:
+        required.add("appearance_metadata")
     missing = sorted(required.difference(payload))
     if missing:
         raise RuntimeError(f"Method checkpoint is missing fields {missing}: {resolved}")

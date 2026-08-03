@@ -93,6 +93,9 @@ def _planning_record(entry: dict[str, Any]) -> dict[str, Any]:
         "peak_cuda_memory_bytes": int(payload.get("peak_cuda_memory_bytes", 0)),
         "parameter_count": int(payload.get("method_parameter_count", 0)),
         "source_checkpoint_fingerprint": payload.get("method_checkpoint_sha256"),
+        "goal_base_latent_fingerprints": list(
+            payload.get("goal_base_latent_fingerprint", [])
+        )[:used],
     }
 
 
@@ -202,6 +205,7 @@ def _offline_rows(state: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _write_analysis(suite: Any, state: dict[str, Any], output: Path) -> None:
+    is_v2 = str(suite.suite_name) == "cross_benchmark_v2"
     planning: dict[str, dict[str, Any]] = {}
     for job_id, entry in state["jobs"].items():
         if entry.get("kind") == "planning" and entry.get("status") in {"completed", "reused"}:
@@ -209,6 +213,25 @@ def _write_analysis(suite: Any, state: dict[str, Any], output: Path) -> None:
     main_records = [
         value for key, value in planning.items() if key.startswith("planning/main/")
     ]
+    goal_groups: dict[str, set[tuple[str, ...]]] = defaultdict(set)
+    for record in main_records:
+        values = tuple(record["goal_base_latent_fingerprints"])
+        if len(values) != int(record["n"]):
+            raise RuntimeError(
+                "Planning result lacks frozen-Base goal fingerprints: "
+                f"task={record['task']}, method={record['method']}, domain={record['domain']}"
+            )
+        goal_groups[record["task"]].add(values)
+    inconsistent_goals = {
+        task: len(values)
+        for task, values in goal_groups.items()
+        if len(values) != 1
+    }
+    if inconsistent_goals:
+        raise RuntimeError(
+            "Frozen-Base goal fingerprints differ across methods: "
+            f"{inconsistent_goals}"
+        )
     expected_main = len(suite.tasks) * len(suite.methods) * len(suite.domains)
     if len(main_records) != expected_main:
         raise RuntimeError(
@@ -253,30 +276,38 @@ def _write_analysis(suite: Any, state: dict[str, Any], output: Path) -> None:
 
     comparisons: list[dict[str, Any]] = []
     indexed = {(item["task"], item["method"], item["domain"]): item for item in main_records}
+    focal_method = "hfra" if is_v2 else "dct_adapter"
+    comparators = (
+        ("base", "dct_adapter", "token_mlp", "lora")
+        if is_v2
+        else ("base", "token_mlp", "lora")
+    )
     for task in suite.tasks:
         for domain in suite.domains:
-            dct = indexed[(str(task), "dct_adapter", str(domain))]
-            for comparator in ("base", "token_mlp", "lora"):
+            focal = indexed[(str(task), focal_method, str(domain))]
+            for comparator in comparators:
                 other = indexed[(str(task), comparator, str(domain))]
-                if dct["instance_ids"] != other["instance_ids"]:
+                if focal["instance_ids"] != other["instance_ids"]:
                     raise RuntimeError(f"Paired instance IDs differ for {task}/{domain}/{comparator}")
                 bootstrap = _paired_bootstrap(
-                    dct["successes"], other["successes"],
+                    focal["successes"], other["successes"],
                     samples=int(suite.offline.bootstrap_samples), seed=42,
                 )
                 record = {
                     "task": str(task), "domain": str(domain),
-                    "comparison": f"dct_adapter_vs_{comparator}",
+                    "comparison": f"{focal_method}_vs_{comparator}",
                     "paired_success_difference": bootstrap["mean"],
                     "bootstrap_ci_low": bootstrap["ci_low"],
                     "bootstrap_ci_high": bootstrap["ci_high"],
-                    "mcnemar_p": _exact_mcnemar(dct["successes"], other["successes"]),
+                    "mcnemar_p": _exact_mcnemar(focal["successes"], other["successes"]),
+                    "focal_only_success": sum(a and not b for a, b in zip(focal["successes"], other["successes"])),
+                    "comparator_only_success": sum(b and not a for a, b in zip(focal["successes"], other["successes"])),
                 }
-                if dct["benchmark"] == "robocasa":
+                if focal["benchmark"] == "robocasa":
                     cluster = _paired_bootstrap(
-                        dct["successes"], other["successes"],
+                        focal["successes"], other["successes"],
                         samples=int(suite.offline.bootstrap_samples), seed=42,
-                        clusters=dct["source_ids"],
+                        clusters=focal["source_ids"],
                     )
                     record.update({
                         "cluster_bootstrap_ci_low": cluster["ci_low"],
@@ -284,7 +315,8 @@ def _write_analysis(suite: Any, state: dict[str, Any], output: Path) -> None:
                     })
                 comparisons.append(record)
     _holm(comparisons)
-    atomic_json(output / "statistics.json", {"comparisons": comparisons})
+    paired_name = "paired_tests.json" if is_v2 else "statistics.json"
+    atomic_json(output / paired_name, {"comparisons": comparisons})
 
     offline = _offline_rows(state)
     _write_csv(output / "offline_metrics.csv", offline, sorted({key for row in offline for key in row}))
@@ -312,8 +344,26 @@ def _write_analysis(suite: Any, state: dict[str, Any], output: Path) -> None:
         for record in main_records
     ]
     _write_csv(output / "efficiency.csv", efficiency, list(efficiency[0]))
+    parameter_rows = [
+        {
+            "method": method,
+            "trainable_parameter_count": next(
+                (
+                    int(record["parameter_count"])
+                    for record in main_records
+                    if record["method"] == method
+                ),
+                0,
+            ),
+        }
+        for method in [str(value) for value in suite.methods]
+    ]
+    _write_csv(output / "parameter_counts.csv", parameter_rows, list(parameter_rows[0]))
     atomic_json(output / "run_manifest.json", {
-        "suite": "cross_benchmark_v1", "state_path": state.get("state_path"),
+        "suite": str(suite.suite_name), "protocol": str(suite.protocol),
+        "state_path": state.get("state_path"),
+        "suite_config_path": state.get("suite_config_path"),
+        "suite_config_sha256": state.get("suite_config_sha256"),
         "git": state.get("git"), "jobs": state["jobs"],
     })
     resolved_tasks = []
@@ -326,9 +376,9 @@ def _write_analysis(suite: Any, state: dict[str, Any], output: Path) -> None:
             + (f" ({language})" if language else "")
         )
     summary = [
-        "# cross_benchmark_v1 paper summary", "",
+        f"# {suite.suite_name} paper summary", "",
         "The four resolved main tasks are: " + "; ".join(resolved_tasks) + ".",
-        "", "Each main method/domain condition reports n=20 paired closed-loop rollouts. Stability, severity, and closed-loop DCT ablations report n=10.",
+        "", "Each main method/domain condition reports n=20 paired closed-loop rollouts. Stability, severity, and closed-loop ablations report n=10.",
         "", "Training/evaluation partitions are deterministic trajectory-level 80/20 splits (seed 42), and every method/domain uses the same immutable evaluation manifest.",
         "", "RoboCasa and LIBERO are separate benchmark/task stacks, but they are not claimed to be independent physical engines because both use MuJoCo/robosuite-family simulation components.",
         "", "Reused artifacts remain at their source paths and are represented through SHA256 source references; no source result is rewritten.",
@@ -337,6 +387,8 @@ def _write_analysis(suite: Any, state: dict[str, Any], output: Path) -> None:
         "", markdown,
     ]
     _atomic_text(output / "paper_summary.md", "\n".join(summary))
+    if is_v2:
+        _atomic_text(output / "summary.md", "\n".join(summary))
 
 
 def main() -> None:
@@ -364,7 +416,7 @@ def main() -> None:
                 f"Cross-benchmark self-test has incomplete jobs: {incomplete}"
             )
         report = output.parent / "self_test_report.md"
-        _atomic_text(report, "# cross_benchmark_v1 self-test\n\nOverall: PASS\n")
+        _atomic_text(report, f"# {suite.suite_name} self-test\n\nOverall: PASS\n")
         return
     _write_analysis(suite, state, output)
 

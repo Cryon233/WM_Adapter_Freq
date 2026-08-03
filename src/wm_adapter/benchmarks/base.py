@@ -392,6 +392,7 @@ class BenchmarkAdapter(ABC):
         frameskip: int,
         appearance_seed: int,
         appearance_severity: float,
+        appearance_severity_range: tuple[float, float] | None = None,
     ) -> Dataset[Any]:
         raise RuntimeError("Benchmark adapters must implement make_window_dataset")
 

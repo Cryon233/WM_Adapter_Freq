@@ -1,0 +1,55 @@
+suite_name: cross_benchmark_v2
+protocol: paired_visual_goal_hfra_v2
+phases: [Task and resource preflight, Protocol validation, Feature caches, Main adapter training, Main offline evaluation, Main closed-loop planning, Training-seed stability, OOD severity, HFRA ablations, Final analysis]
+state_path: logs/cross_benchmark_v2/state.json
+pid_path: logs/cross_benchmark_v2/runner.pid
+runner_log: logs/cross_benchmark_v2/runner.log
+log_root: logs/cross_benchmark_v2/jobs
+output_root: outputs/cross_benchmark_v2
+analysis_root: outputs/cross_benchmark_v2/analysis
+manifest_root: outputs/cross_benchmark_v2/manifests
+protocol_validation_root: outputs/cross_benchmark_v2/protocol_validation
+storage_root: storage/feature_cache/cross_benchmark_v2
+checkpoint_root: checkpoints/cross_benchmark_v2
+tasks:
+  robocasa_place: configs/experiment/cross_benchmark_v2/robocasa_place.yaml
+  robocasa_articulated: configs/experiment/cross_benchmark_v2/robocasa_articulated.yaml
+  libero_spatial_0: configs/experiment/cross_benchmark_v2/libero_spatial_0.yaml
+  libero_goal_0: configs/experiment/cross_benchmark_v2/libero_goal_0.yaml
+methods: [base, dct_adapter, token_mlp, lora, hfra]
+domains: [clean, ood]
+main: {episodes: 20, eval_seed: 42}
+data: {num_train_windows: 2000, split_seed: 42, window_seed: 42}
+training: {seeds: [42], max_optimizer_steps: 2000}
+stability: {tasks: [robocasa_place, libero_goal_0], methods: [hfra, lora], seeds: [42, 7, 2026], episodes: 10, domain: ood, severity: 1.0}
+severity: {tasks: [robocasa_place, libero_goal_0], methods: [base, hfra], values: [0.5, 1.0, 1.5], episodes: 10, seed: 42}
+ablations:
+  tasks: [robocasa_place, libero_goal_0]
+  variants:
+    full: {method: hfra, method_config: configs/method/hfra.yaml}
+    core_only: {method: hfra_core_only, method_config: configs/method/hfra_core_only.yaml}
+  episodes: 10
+  seed: 42
+  domain: ood
+offline: {windows: 200, seed: 42, shuffle_seed: 100045, negative_actions: 15, bootstrap_samples: 10000}
+appearance: {pipeline_version: composed_photometric_v1, training_severity_min: 0.5, training_severity_max: 1.5, main_severity: 1.0, seed: 2026}
+gpu: {default_ids: [0, 1, 2, 3], one_heavy_job_per_gpu: true}
+reuse_sources: {}
+self_test:
+  task_keys: [robocasa_place, libero_goal_0]
+  methods: [hfra]
+  domains: [ood]
+  windows: 4
+  offline_windows: 1
+  optimizer_steps: 2
+  episodes: 1
+  roots:
+    state_path: logs/cross_benchmark_v2_self_test/state.json
+    pid_path: logs/cross_benchmark_v2_self_test/runner.pid
+    log_root: logs/cross_benchmark_v2_self_test/jobs
+    storage_root: storage/feature_cache/cross_benchmark_v2_self_test
+    checkpoint_root: checkpoints/cross_benchmark_v2_self_test
+    output_root: outputs/cross_benchmark_v2_self_test
+    analysis_root: outputs/cross_benchmark_v2_self_test/analysis
+    manifest_root: outputs/cross_benchmark_v2_self_test/manifests
+    protocol_validation_root: outputs/cross_benchmark_v2_self_test/protocol_validation

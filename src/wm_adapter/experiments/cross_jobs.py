@@ -43,6 +43,11 @@ def _main_result(
 
 
 def build_job_graph(suite: Any, *, self_test: bool = False) -> list[JobSpec]:
+    is_v2 = str(suite.suite_name) == "cross_benchmark_v2"
+    ablation_phase = "HFRA ablations" if is_v2 else "DCT ablations"
+    suite_config_path = str(
+        suite.get("_suite_config_path", "configs/experiment/cross_benchmark_v2.yaml" if is_v2 else "configs/experiment/cross_benchmark_v1.yaml")
+    )
     task_items = list(suite.tasks.items())
     methods = [str(value) for value in suite.methods]
     domains = [str(value) for value in suite.domains]
@@ -75,6 +80,39 @@ def build_job_graph(suite: Any, *, self_test: bool = False) -> list[JobSpec]:
                 kind="task_manifest",
             )
         )
+        protocol_job_id = f"protocol/{task}"
+        if is_v2:
+            protocol_result = (
+                resolve_path(str(suite.protocol_validation_root)) / f"{task}.json"
+            )
+            jobs.append(
+                JobSpec(
+                    job_id=protocol_job_id,
+                    phase="Protocol validation",
+                    benchmark=benchmark,
+                    task=task,
+                    command=(
+                        sys.executable,
+                        "scripts/validate_libero_action_replay.py",
+                        "--config",
+                        config,
+                        f"protocol_validation.output={protocol_result}",
+                        *(
+                            (
+                                "protocol_validation.episodes=1",
+                                "protocol_validation.starts_per_episode=1",
+                            )
+                            if self_test
+                            else ()
+                        ),
+                        *manifest_overrides,
+                    ),
+                    log_path=_log(suite, f"protocol-{task}"),
+                    artifact_path=str(protocol_result),
+                    kind="protocol",
+                    dependencies=(f"preflight/{task}",),
+                )
+            )
         cache = _main_cache(suite, benchmark, task)
         reuse_cache: tuple[str, ...] = ()
         if task in suite.reuse_sources and suite.reuse_sources[task].get("cache"):
@@ -94,6 +132,7 @@ def build_job_graph(suite: Any, *, self_test: bool = False) -> list[JobSpec]:
                 task=task, command=tuple(cache_command),
                 log_path=_log(suite, f"cache-{task}"), artifact_path=str(cache),
                 kind="cache", required_count=cache_windows, reuse_sources=reuse_cache,
+                dependencies=((protocol_job_id,) if is_v2 else (f"preflight/{task}",)),
             )
         )
         train_methods = [method for method in methods if method != "base"]
@@ -110,11 +149,20 @@ def build_job_graph(suite: Any, *, self_test: bool = False) -> list[JobSpec]:
                 f"paths.method_checkpoint={checkpoint}",
             ]
             if self_test:
-                command.extend([
-                    f"training.epochs={int(suite.self_test.epochs)}",
-                    "training.num_workers=0", "training.batch_size=1",
-                    "training.gradient_accumulation=1", *manifest_overrides,
-                ])
+                if is_v2:
+                    command.extend([
+                        "suite_mode=self_test",
+                        f"training.max_optimizer_steps={int(suite.self_test.optimizer_steps)}",
+                        "training.warmup_steps=0", "training.num_workers=0",
+                        "training.microbatch_windows=1", "training.views_per_window=2",
+                        "training.gradient_accumulation=1", *manifest_overrides,
+                    ])
+                else:
+                    command.extend([
+                        f"training.epochs={int(suite.self_test.epochs)}",
+                        "training.num_workers=0", "training.batch_size=1",
+                        "training.gradient_accumulation=1", *manifest_overrides,
+                    ])
             jobs.append(
                 JobSpec(
                     job_id=f"train/main/{task}/{method}",
@@ -123,6 +171,7 @@ def build_job_graph(suite: Any, *, self_test: bool = False) -> list[JobSpec]:
                     log_path=_log(suite, f"train-main-{task}-{method}"),
                     artifact_path=str(checkpoint), kind="checkpoint",
                     reuse_sources=source,
+                    dependencies=(f"cache/{task}",),
                 )
             )
         offline_windows = int(
@@ -157,6 +206,11 @@ def build_job_graph(suite: Any, *, self_test: bool = False) -> list[JobSpec]:
                         suite, f"offline-main-{task}-{method}"
                     ), artifact_path=str(metrics), kind="offline",
                     required_count=offline_windows,
+                    dependencies=(
+                        (f"cache/{task}",)
+                        if method == "base"
+                        else (f"train/main/{task}/{method}",)
+                    ),
                 )
             )
         main_episodes = int(suite.self_test.episodes if self_test else suite.main.episodes)
@@ -196,6 +250,11 @@ def build_job_graph(suite: Any, *, self_test: bool = False) -> list[JobSpec]:
                         log_path=_log(suite, f"plan-main-{task}-{method}-{domain}"),
                         artifact_path=str(result), kind="planning", required_count=main_episodes,
                         reuse_sources=source,
+                        dependencies=(
+                            (f"cache/{task}",)
+                            if method == "base"
+                            else (f"train/main/{task}/{method}",)
+                        ),
                     )
                 )
 
@@ -206,7 +265,7 @@ def build_job_graph(suite: Any, *, self_test: bool = False) -> list[JobSpec]:
                 job_id="analysis/self_test", phase="Final analysis", benchmark="all",
                 task="all", command=(
                     sys.executable, "scripts/analyze_cross_benchmark_suite.py",
-                    "--suite-config", "configs/experiment/cross_benchmark_v1.yaml",
+                    "--suite-config", suite_config_path,
                     "--state", str(suite.state_path), "--output", str(suite.analysis_root),
                     "--self-test",
                 ), log_path=_log(suite, "analysis-self-test"),
@@ -239,6 +298,7 @@ def build_job_graph(suite: Any, *, self_test: bool = False) -> list[JobSpec]:
                             f"paths.method_checkpoint={checkpoint}",
                         ), log_path=_log(suite, f"train-stability-{task}-{method}-seed{train_seed}"),
                         artifact_path=str(checkpoint), kind="checkpoint", reuse_sources=reuse,
+                        dependencies=(f"cache/{task}",),
                     )
                 )
                 result = (
@@ -264,6 +324,9 @@ def build_job_graph(suite: Any, *, self_test: bool = False) -> list[JobSpec]:
                         ), log_path=_log(suite, f"plan-stability-{task}-{method}-seed{train_seed}"),
                         artifact_path=str(result), kind="planning",
                         required_count=int(suite.stability.episodes), reuse_sources=result_reuse,
+                        dependencies=(
+                            f"train/stability/{task}/{method}/seed_{train_seed}",
+                        ),
                     )
                 )
 
@@ -304,6 +367,11 @@ def build_job_graph(suite: Any, *, self_test: bool = False) -> list[JobSpec]:
                         log_path=_log(suite, f"plan-severity-{task}-{method}-{severity_name}"),
                         artifact_path=str(result), kind="planning",
                         required_count=int(suite.severity.episodes), reuse_sources=reuse,
+                        dependencies=(
+                            (f"cache/{task}",)
+                            if method == "base"
+                            else (f"train/main/{task}/{method}",)
+                        ),
                     )
                 )
 
@@ -312,26 +380,37 @@ def build_job_graph(suite: Any, *, self_test: bool = False) -> list[JobSpec]:
         benchmark, task = _task_identity(config)
         for variant_value, spec in suite.ablations.variants.items():
             variant = str(variant_value)
+            ablation_method = str(spec.get("method", "dct_adapter"))
             checkpoint = (
                 resolve_path(str(suite.checkpoint_root)) / "ablations" / benchmark /
                 task / f"{variant}_final.pt"
             )
-            main_checkpoint = _main_checkpoint(suite, benchmark, task, "dct_adapter")
+            main_checkpoint = _main_checkpoint(suite, benchmark, task, ablation_method)
             checkpoint_reuse = (str(main_checkpoint),) if variant == "full" else ()
-            jobs.append(
-                JobSpec(
-                    job_id=f"train/ablation/{task}/{variant}", phase="DCT ablations",
-                    benchmark=benchmark, task=task, method="dct_adapter", variant=variant,
-                    seed=42, command=(
-                        sys.executable, "scripts/train_adapter.py", "--config", config,
-                        "method=dct_adapter", f"method_configs.dct_adapter={spec.method_config}",
+            training_overrides = [
+                f"method={ablation_method}",
+                f"method_configs.{ablation_method}={spec.method_config}",
+            ]
+            if not is_v2:
+                training_overrides.extend(
+                    (
                         f"training.canonical_weight={float(spec.canonical_weight)}",
                         f"training.dynamics_weight={float(spec.dynamics_weight)}",
+                    )
+                )
+            jobs.append(
+                JobSpec(
+                    job_id=f"train/ablation/{task}/{variant}", phase=ablation_phase,
+                    benchmark=benchmark, task=task, method=ablation_method, variant=variant,
+                    seed=42, command=tuple((
+                        sys.executable, "scripts/train_adapter.py", "--config", config,
+                        *training_overrides,
                         f"paths.feature_cache={_main_cache(suite, benchmark, task)}",
                         f"paths.method_checkpoint={checkpoint}",
-                    ), log_path=_log(suite, f"train-ablation-{task}-{variant}"),
+                    )), log_path=_log(suite, f"train-ablation-{task}-{variant}"),
                     artifact_path=str(checkpoint), kind="checkpoint",
                     reuse_sources=checkpoint_reuse,
+                    dependencies=(f"cache/{task}",),
                 )
             )
             metrics = (
@@ -340,65 +419,87 @@ def build_job_graph(suite: Any, *, self_test: bool = False) -> list[JobSpec]:
             )
             main_metrics = (
                 resolve_path(str(suite.output_root)) / "offline" / "main" /
-                benchmark / task / "dct_adapter" / "metrics.json"
+                benchmark / task / ablation_method / "metrics.json"
             )
-            jobs.append(
-                JobSpec(
-                    job_id=f"offline/ablation/{task}/{variant}", phase="DCT ablations",
-                    benchmark=benchmark, task=task, method="dct_adapter", variant=variant,
-                    command=(
-                        sys.executable, "scripts/evaluate_offline_dynamics.py", "--config", config,
-                        "method=dct_adapter", "domain=both",
-                        f"method_configs.dct_adapter={spec.method_config}",
+            offline_overrides = [
+                f"method={ablation_method}",
+                "domain=both",
+                f"method_configs.{ablation_method}={spec.method_config}",
+            ]
+            if not is_v2:
+                offline_overrides.extend(
+                    (
                         f"training.canonical_weight={float(spec.canonical_weight)}",
                         f"training.dynamics_weight={float(spec.dynamics_weight)}",
+                    )
+                )
+            jobs.append(
+                JobSpec(
+                    job_id=f"offline/ablation/{task}/{variant}", phase=ablation_phase,
+                    benchmark=benchmark, task=task, method=ablation_method, variant=variant,
+                    command=tuple((
+                        sys.executable, "scripts/evaluate_offline_dynamics.py", "--config", config,
+                        *offline_overrides,
                         f"paths.method_checkpoint={checkpoint}",
                         f"paths.feature_cache={_main_cache(suite, benchmark, task)}",
                         f"offline.num_windows={int(suite.offline.windows)}",
                         f"offline.seed={int(suite.offline.seed)}",
                         f"offline.shuffle_seed={int(suite.offline.shuffle_seed)}",
                         f"offline.output_directory={metrics.parent}",
-                    ), log_path=_log(suite, f"offline-ablation-{task}-{variant}"),
+                    )), log_path=_log(suite, f"offline-ablation-{task}-{variant}"),
                     artifact_path=str(metrics), kind="offline",
                     required_count=int(suite.offline.windows),
                     reuse_sources=(str(main_metrics),) if variant == "full" else (),
+                    dependencies=(f"train/ablation/{task}/{variant}",),
                 )
             )
             result = (
                 resolve_path(str(suite.output_root)) / "ablations" / benchmark / task /
                 variant / "ood" / "results.json"
             )
-            main_result = _main_result(suite, benchmark, task, "dct_adapter", "ood")
-            jobs.append(
-                JobSpec(
-                    job_id=f"planning/ablation/{task}/{variant}", phase="DCT ablations",
-                    benchmark=benchmark, task=task, method="dct_adapter", domain="ood",
-                    seed=int(suite.ablations.seed), severity=1.0, variant=variant,
-                    command=(
-                        sys.executable, "scripts/plan.py", "--config", config,
-                        "method=dct_adapter", "domain=ood",
-                        f"method_configs.dct_adapter={spec.method_config}",
+            main_result = _main_result(suite, benchmark, task, ablation_method, "ood")
+            planning_overrides = [
+                f"method={ablation_method}",
+                "domain=ood",
+                f"method_configs.{ablation_method}={spec.method_config}",
+            ]
+            if not is_v2:
+                planning_overrides.extend(
+                    (
                         f"training.canonical_weight={float(spec.canonical_weight)}",
                         f"training.dynamics_weight={float(spec.dynamics_weight)}",
+                    )
+                )
+            jobs.append(
+                JobSpec(
+                    job_id=f"planning/ablation/{task}/{variant}", phase=ablation_phase,
+                    benchmark=benchmark, task=task, method=ablation_method, domain="ood",
+                    seed=int(suite.ablations.seed), severity=1.0, variant=variant,
+                    command=tuple((
+                        sys.executable, "scripts/plan.py", "--config", config,
+                        *planning_overrides,
                         f"paths.method_checkpoint={checkpoint}",
                         f"evaluation.num_episodes={int(suite.ablations.episodes)}",
                         f"evaluation.eval_seed={int(suite.ablations.seed)}",
                         "appearance.severity=1.0", f"output.run_directory={result.parent}",
                         "suite.family=ablation", f"suite.variant={variant}",
-                    ), log_path=_log(suite, f"plan-ablation-{task}-{variant}"),
+                    )), log_path=_log(suite, f"plan-ablation-{task}-{variant}"),
                     artifact_path=str(result), kind="planning",
                     required_count=int(suite.ablations.episodes),
                     reuse_sources=(str(main_result),) if variant == "full" else (),
+                    dependencies=(f"train/ablation/{task}/{variant}",),
                 )
             )
 
-    summary = resolve_path(str(suite.analysis_root)) / "paper_summary.md"
+    summary = resolve_path(str(suite.analysis_root)) / (
+        "summary.md" if is_v2 else "paper_summary.md"
+    )
     jobs.append(
         JobSpec(
             job_id="analysis/final", phase="Final analysis", benchmark="all", task="all",
             command=(
                 sys.executable, "scripts/analyze_cross_benchmark_suite.py",
-                "--suite-config", "configs/experiment/cross_benchmark_v1.yaml",
+                "--suite-config", suite_config_path,
                 "--state", str(suite.state_path), "--output", str(suite.analysis_root),
             ), log_path=_log(suite, "analysis-final"), artifact_path=str(summary),
             kind="analysis",

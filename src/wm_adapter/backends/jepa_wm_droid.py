@@ -12,6 +12,7 @@ from omegaconf import OmegaConf
 from torch import Tensor, nn
 
 from wm_adapter.adapters.base import PEFTMethod
+from wm_adapter.backends.frozen_projection import frozen_base_projection
 from wm_adapter.utils.checkpoints import sha256_file, verify_upstream_commits
 from wm_adapter.utils.reproducibility import resolve_path
 
@@ -153,6 +154,7 @@ class JEPAWMDroidBackend(nn.Module):
         if len(self.encoder.blocks) < 2:
             raise ValueError(f"DINOv3 encoder must have at least two blocks, found {len(self.encoder.blocks)}")
         self.last_block = self.encoder.blocks[-1]
+        self.num_encoder_blocks = len(self.encoder.blocks)
         self.final_norm = self.encoder.norm
         self.image_size = image_size
         self.patch_size = int(self.encoder.patch_size)
@@ -296,6 +298,13 @@ class JEPAWMDroidBackend(nn.Module):
         return self._encode_normalized_prefix(normalized)
 
     def _encode_normalized_prefix(self, normalized: Tensor) -> Tensor:
+        return self._encode_normalized_until_site(
+            normalized, self.num_encoder_blocks - 1
+        )
+
+    def _prepare_normalized_tokens(
+        self, normalized: Tensor
+    ) -> tuple[Tensor, int, int, TokenLayout, Tensor]:
         if normalized.ndim != 5 or normalized.shape[2:] != (
             3,
             self.image_size,
@@ -332,9 +341,130 @@ class JEPAWMDroidBackend(nn.Module):
             raise RuntimeError(f"DINOv3 token layout changed from {self._token_layout} to {layout}")
         self._token_layout = layout
         rope = self.encoder.rope_embed(H=grid_height, W=grid_width)
-        for block in self.encoder.blocks[:-1]:
-            tokens = block(tokens, rope)
-        return tokens.reshape(batch, sequence_length, layout.total_tokens, layout.token_dim)
+        return tokens, batch, sequence_length, layout, rope
+
+    def _encode_normalized_until_site(
+        self, normalized: Tensor, site_index: int
+    ) -> Tensor:
+        if not 0 <= site_index <= self.num_encoder_blocks:
+            raise ValueError(
+                f"site_index must be in [0,{self.num_encoder_blocks}], "
+                f"received {site_index}"
+            )
+        tokens, batch, sequence_length, layout, rope = (
+            self._prepare_normalized_tokens(normalized)
+        )
+        for block_index in range(site_index):
+            tokens = self.encoder.blocks[block_index](tokens, rope)
+        return tokens.reshape(
+            batch, sequence_length, layout.total_tokens, layout.token_dim
+        )
+
+    def encode_until_site(self, images: Tensor, site_index: int) -> Tensor:
+        return self._encode_normalized_until_site(
+            self._normalize_images(images), site_index
+        )
+
+    def _apply_method_site(
+        self,
+        tokens: Tensor,
+        method: PEFTMethod,
+        site_index: int,
+        batch_size: int,
+        sequence_length: int,
+        prefix_count: int,
+    ) -> Tensor:
+        total_tokens = int(tokens.shape[1])
+        shaped = tokens.reshape(
+            batch_size, sequence_length, total_tokens, self.token_dim
+        )
+        prefix = shaped[:, :, :prefix_count]
+        patches = shaped[:, :, prefix_count:]
+        adapted = method.apply_at_site(site_index, patches)
+        if adapted.shape != patches.shape:
+            raise RuntimeError(
+                f"Method {method.method_name} changed patch shape at site "
+                f"{site_index}: input={tuple(patches.shape)}, "
+                f"output={tuple(adapted.shape)}"
+            )
+        return torch.cat((prefix, adapted), dim=2).reshape(
+            batch_size * sequence_length, total_tokens, self.token_dim
+        )
+
+    def _final_patch_norm(self, tokens: Tensor, prefix_count: int) -> Tensor:
+        if self.encoder.untie_cls_and_patch_norms or self.encoder.untie_global_and_local_cls_norm:
+            prefix_norm = (
+                self.encoder.cls_norm
+                if self.encoder.untie_cls_and_patch_norms
+                else self.final_norm
+            )
+            return torch.cat(
+                (
+                    prefix_norm(tokens[:, :prefix_count]),
+                    self.final_norm(tokens[:, prefix_count:]),
+                ),
+                dim=1,
+            )
+        return self.final_norm(tokens)
+
+    def encode_from_site(
+        self,
+        tokens: Tensor,
+        start_site_index: int,
+        method: PEFTMethod,
+    ) -> Tensor:
+        if tokens.ndim != 4:
+            raise ValueError(
+                "Site tokens must have shape [B,T,N,D], "
+                f"received {tuple(tokens.shape)}"
+            )
+        if not 0 <= start_site_index < self.num_encoder_blocks:
+            raise ValueError(
+                f"start_site_index must be in [0,{self.num_encoder_blocks - 1}], "
+                f"received {start_site_index}"
+            )
+        batch_size, sequence_length, total_tokens, dimension = tokens.shape
+        prefix_count = total_tokens - self.num_patch_tokens
+        if prefix_count < 1 or dimension != self.token_dim:
+            raise ValueError(
+                f"Site token layout mismatch: expected D={self.token_dim}, "
+                f"P={self.num_patch_tokens}, received {tuple(tokens.shape)}"
+            )
+        sites = method.adapter_site_indices(self.num_encoder_blocks)
+        if tuple(sorted(set(sites))) != sites:
+            raise RuntimeError(
+                f"Method {method.method_name} returned invalid adapter sites {sites}"
+            )
+        missed = [site for site in sites if site < start_site_index]
+        if missed:
+            raise RuntimeError(
+                f"Cannot encode method {method.method_name} from site "
+                f"{start_site_index}; earlier adapter sites would be skipped: {missed}"
+            )
+        flattened = tokens.reshape(
+            batch_size * sequence_length, total_tokens, self.token_dim
+        )
+        rope = self.encoder.rope_embed(H=self.grid_height, W=self.grid_width)
+        site_set = set(sites)
+        for block_index in range(start_site_index, self.num_encoder_blocks):
+            if block_index in site_set:
+                flattened = self._apply_method_site(
+                    flattened,
+                    method,
+                    block_index,
+                    batch_size,
+                    sequence_length,
+                    prefix_count,
+                )
+            flattened = self.encoder.blocks[block_index](flattened, rope)
+        final = self._final_patch_norm(flattened, prefix_count)
+        patches = final[:, prefix_count:].reshape(
+            batch_size,
+            sequence_length,
+            self.num_patch_tokens,
+            self.token_dim,
+        )
+        return patches
 
     def encode_from_prefix(
         self,
@@ -352,38 +482,11 @@ class JEPAWMDroidBackend(nn.Module):
                 f"Prefix batch/time mismatch: declared {(batch_size, sequence_length)}, "
                 f"received {tuple(prefix_tokens.shape[:2])}"
             )
-        total_tokens = int(prefix_tokens.shape[2])
-        prefix_count = total_tokens - self.num_patch_tokens
-        if prefix_count < 1 or prefix_tokens.shape[3] != self.token_dim:
-            raise ValueError(
-                f"Prefix layout mismatch: expected D={self.token_dim}, P={self.num_patch_tokens}; "
-                f"received {tuple(prefix_tokens.shape)}"
-            )
-        prefix = prefix_tokens[:, :, :prefix_count]
-        patches = prefix_tokens[:, :, prefix_count:]
-        adapted_patches = method.apply_patch_tokens(patches)
-        if adapted_patches.shape != patches.shape:
-            raise RuntimeError(
-                f"Method {method.method_name} changed patch shape from {tuple(patches.shape)} "
-                f"to {tuple(adapted_patches.shape)}"
-            )
-        tokens = torch.cat((prefix, adapted_patches), dim=2)
-        flattened = tokens.reshape(batch_size * sequence_length, total_tokens, self.token_dim)
-        rope = self.encoder.rope_embed(H=self.grid_height, W=self.grid_width)
-        final = self.last_block(flattened, rope)
-        if self.encoder.untie_cls_and_patch_norms or self.encoder.untie_global_and_local_cls_norm:
-            prefix_norm = self.encoder.cls_norm if self.encoder.untie_cls_and_patch_norms else self.final_norm
-            normalized_prefix = prefix_norm(final[:, :prefix_count])
-            normalized_patches = self.final_norm(final[:, prefix_count:])
-            final = torch.cat((normalized_prefix, normalized_patches), dim=1)
-        else:
-            final = self.final_norm(final)
-        patches = final[:, prefix_count:]
-        expected = (batch_size, sequence_length, self.num_patch_tokens, self.token_dim)
-        patches = patches.reshape(expected)
-        if tuple(patches.shape) != expected:
-            raise RuntimeError(f"Final visual latent shape {tuple(patches.shape)} does not match {expected}")
-        return patches
+        return self.encode_from_site(
+            prefix_tokens,
+            self.num_encoder_blocks - 1,
+            method,
+        )
 
     def encode_images(
         self,
@@ -397,8 +500,84 @@ class JEPAWMDroidBackend(nn.Module):
                 f"Image batch/time mismatch: declared {(batch_size, sequence_length)}, "
                 f"received {tuple(images.shape[:2])}"
             )
-        prefix = self.encode_prefix(images)
-        return self.encode_from_prefix(prefix, method, batch_size, sequence_length)
+        return self.encode_images_with_method(images, method)
+
+    def encode_images_with_method(
+        self, images: Tensor, method: PEFTMethod
+    ) -> Tensor:
+        if images.ndim != 5:
+            raise ValueError(
+                f"Images must have shape [B,T,3,H,W], received {tuple(images.shape)}"
+            )
+        tokens = self.encode_until_site(images, 0)
+        return self.encode_from_site(tokens, 0, method)
+
+    def encode_images_frozen_base(self, images: Tensor) -> Tensor:
+        from wm_adapter.adapters.base import BaseMethod
+
+        with frozen_base_projection(self):
+            return self.encode_images_with_method(
+                images, BaseMethod().to(self.device)
+            )
+
+    def differentiable_unroll(
+        self, context_latents: Tensor, actions: Tensor
+    ) -> Tensor:
+        if context_latents.ndim != 4 or context_latents.shape[1:] != (
+            3,
+            self.num_patch_tokens,
+            self.token_dim,
+        ):
+            raise ValueError(
+                "Differentiable rollout context must be "
+                f"[B,3,{self.num_patch_tokens},{self.token_dim}], "
+                f"received {tuple(context_latents.shape)}"
+            )
+        if actions.ndim != 3 or tuple(actions.shape[1:]) != (3, 7):
+            raise ValueError(
+                "Differentiable rollout actions must be [B,3,7], "
+                f"received {tuple(actions.shape)}"
+            )
+        visual = rearrange(
+            context_latents,
+            "b t (h w) d -> b t 1 h w d",
+            h=self.grid_height,
+            w=self.grid_width,
+        )
+        context_window = int(self.official_model.ctxt_window)
+        if context_window <= 0:
+            raise ValueError(
+                f"JEPA-WM ctxt_window must be positive, received {context_window}"
+            )
+        history_steps = max(min(context_window, visual.shape[1]) - 1, 0)
+        raw_timeline = actions
+        if history_steps:
+            raw_timeline = torch.cat(
+                (torch.zeros_like(actions[:, :1]).repeat(1, history_steps, 1), actions),
+                dim=1,
+            )
+        action_features = self.video_model.encode_act(raw_timeline)
+        predictions: list[Tensor] = []
+        for step in range(3):
+            action_end = history_steps + step + 1
+            visual_window = visual[:, -context_window:]
+            action_window = action_features[
+                :, max(0, action_end - context_window) : action_end
+            ]
+            if visual_window.shape[1] != action_window.shape[1]:
+                raise RuntimeError(
+                    "Differentiable JEPA-WM rollout context mismatch: "
+                    f"step={step}, visual={tuple(visual_window.shape)}, "
+                    f"actions={tuple(action_window.shape)}"
+                )
+            predicted, _, _ = self.video_model.forward_pred(
+                visual_window, action_window, None
+            )
+            next_visual = predicted[:, -1:]
+            predictions.append(next_visual)
+            visual = torch.cat((visual, next_visual), dim=1)
+        future = torch.cat(predictions, dim=1)
+        return rearrange(future, "b t 1 h w d -> b t (h w) d")
 
     def predict(self, context_latents: Tensor, actions: Tensor) -> Tensor:
         if context_latents.ndim != 4 or context_latents.shape[2:] != (

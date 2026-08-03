@@ -336,3 +336,27 @@ Status snapshot: `bash scripts/run_cross_benchmark_suite.sh --status`
 Explicit stop: `bash scripts/run_cross_benchmark_suite.sh --stop`
 
 The Dashboard wraps long status and error lines to the live terminal width. Leaving it with `q` or `Ctrl+C` only detaches it; the runner remains in its independent process group. Uppercase `X` verifies the runner PID and terminates its complete process group, including active GPU child jobs, before exiting the Dashboard. The formal CEM settings remain 15 iterations, 300 candidates, 10 elites, horizon 3, and one executed action step for every method within a task.
+
+# Hybrid Fourier cross-benchmark suite (`cross_benchmark_v2`)
+
+`cross_benchmark_v2` is isolated from v1 at every cache, checkpoint, log, manifest, result, and analysis path. It adds the 17,024-parameter Hybrid Fourier Residual Adapter (HFRA) to the same four tasks and paired clean/OOD protocol. HFRA uses independent rank-4 modules before dynamically resolved DINOv3 middle and final blocks; its zero-initialized up projections make both sites exact identities at initialization. `hfra_core_only` keeps the same two RMSNorm/bottleneck sites but creates no Fourier parameters.
+
+The v2 cache stores six-frame windows: three clean/OOD context frames at the middle site, six frozen-Base clean targets, and the three canonical rollout actions. Each window has a deterministic shared appearance specification with severity uniformly sampled in `[0.5, 1.5]`. All learned methods use one equally weighted scalar `unified_trajectory_mse` over the adapted three-frame context and true three-step autoregressive future, for both clean and OOD views. Training uses AdamW at `3e-4`, BF16, effective view batch 32, 100 warmup steps, cosine decay, and exactly 2,000 optimizer steps. The goal image is always clean and encoded with the frozen Base projection, including while LoRA is attached.
+
+Before a LIBERO v2 cache is built, the protocol-validation phase compares five-action sequence replay against repeated-action replay using recorded simulator states, EEF pose, and agent-view imagery. An incompatible sequence replay or unsupported repeat-action contract blocks only that LIBERO task; independent RoboCasa and LIBERO tasks continue. The formal LIBERO evaluation is the paired visual-goal protocol using a held-out demonstration initial state, that demonstration's final clean RGB goal, official simulator success, and 600 environment steps. It is not described as the official fixed-init protocol.
+
+The v2 main matrix is four tasks × five methods (`base`, `dct_adapter`, `token_mlp`, `lora`, `hfra`) × clean/OOD × 20 paired episodes. CEM remains 15 iterations, 300 candidates, 10 elites, horizon 3, and one action step. V2 never reuses v1 artifacts because its cache schema, loss, goal encoder, and planning contract differ. Its roots are `storage/feature_cache/cross_benchmark_v2/`, `checkpoints/cross_benchmark_v2/`, `logs/cross_benchmark_v2/`, and `outputs/cross_benchmark_v2/`.
+
+No-resource dry-run: `bash scripts/run_cross_benchmark_v2.sh --dry-run`
+
+Isolated resource-backed self-test: `bash scripts/run_cross_benchmark_v2.sh --self-test`
+
+Formal start: `bash scripts/run_cross_benchmark_v2.sh`
+
+Attach Dashboard: `bash scripts/run_cross_benchmark_v2.sh --attach`
+
+One-shot status: `bash scripts/run_cross_benchmark_v2.sh --status`
+
+Explicit stop: `bash scripts/run_cross_benchmark_v2.sh --stop`
+
+The generic v1 entry remains available as `bash scripts/run_cross_benchmark_suite.sh --config configs/experiment/cross_benchmark_v1.yaml`. The Dashboard derives its title, protocol, phase list, state path, and job counts from the selected suite and parses structured cache, protocol, optimizer-step, offline, and planning progress while retaining legacy v1 log parsing.

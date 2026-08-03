@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -150,6 +151,7 @@ class RoboCasaWindowDataset(Dataset[dict[str, Tensor]]):
         frameskip: int,
         appearance_seed: int,
         appearance_severity: float,
+        appearance_severity_range: tuple[float, float] | None = None,
     ) -> None:
         self.source_dataset = source_dataset
         self.windows = [WindowIdentity(int(episode), int(start)) for episode, start in windows]
@@ -157,6 +159,7 @@ class RoboCasaWindowDataset(Dataset[dict[str, Tensor]]):
         self.frameskip = frameskip
         self.appearance_seed = appearance_seed
         self.appearance_severity = appearance_severity
+        self.appearance_severity_range = appearance_severity_range
         self.appearance = ComposedPhotometricShift()
 
     @staticmethod
@@ -187,8 +190,20 @@ class RoboCasaWindowDataset(Dataset[dict[str, Tensor]]):
                 f"RoboCasa window {identity} returned action shape {tuple(actions.shape)}, "
                 f"expected {(self.num_frames, 7)}"
             )
-        spec_seed = int(self.appearance_seed + index)
-        spec = self.appearance.sample_spec(spec_seed, self.appearance_severity)
+        if self.appearance_severity_range is None:
+            spec_seed = int(self.appearance_seed + index)
+            severity = self.appearance_severity
+        else:
+            low, high = self.appearance_severity_range
+            if not 0.0 <= low <= high:
+                raise ValueError(f"Invalid appearance severity range {(low, high)}")
+            digest = hashlib.sha256(
+                f"{self.appearance_seed}:{identity.episode_id}:{identity.start_step}".encode("utf-8")
+            ).digest()
+            spec_seed = int.from_bytes(digest[:8], "little") % (2**63 - 1)
+            unit = int.from_bytes(digest[8:16], "little") / float(2**64 - 1)
+            severity = low + (high - low) * unit
+        spec = self.appearance.sample_spec(spec_seed, severity)
         shifted = self.appearance.apply(clean, spec)
         return {
             "clean_images": clean,
@@ -197,4 +212,5 @@ class RoboCasaWindowDataset(Dataset[dict[str, Tensor]]):
             "episode_id": torch.tensor(identity.episode_id, dtype=torch.int64),
             "window_id": torch.tensor(identity.start_step, dtype=torch.int64),
             "appearance_seed": torch.tensor(spec_seed, dtype=torch.int64),
+            "appearance_severity": torch.tensor(severity, dtype=torch.float32),
         }

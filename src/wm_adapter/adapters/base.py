@@ -15,6 +15,14 @@ class PEFTMethod(nn.Module):
     def apply_patch_tokens(self, patch_tokens: Tensor) -> Tensor:
         return patch_tokens
 
+    def adapter_site_indices(self, num_encoder_blocks: int) -> tuple[int, ...]:
+        del num_encoder_blocks
+        return ()
+
+    def apply_at_site(self, site_index: int, patch_tokens: Tensor) -> Tensor:
+        del site_index
+        return self.apply_patch_tokens(patch_tokens)
+
     def trainable_parameters(self) -> Iterable[nn.Parameter]:
         return (parameter for parameter in self.parameters() if parameter.requires_grad)
 

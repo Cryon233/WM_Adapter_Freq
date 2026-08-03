@@ -8,6 +8,7 @@ from pathlib import Path
 
 import h5py
 import numpy as np
+import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -20,7 +21,20 @@ from wm_adapter.benchmarks.libero import (
     _camera_contract_from_shape,
     _validated_split_indices,
 )
-from wm_adapter.experiments.cross_benchmark import validate_task_manifest
+from wm_adapter.experiments.cross_benchmark import (
+    load_suite_config,
+    validate_checkpoint_v2,
+    validate_task_manifest,
+)
+from wm_adapter.experiments.cross_jobs import build_job_graph
+from wm_adapter.adapters.hfra import (
+    HFRACoreOnlyAdapter,
+    HybridFourierResidualAdapter,
+)
+from wm_adapter.data.feature_cache_v2 import FeatureCacheV2Dataset
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+from monitor_all_paper_experiments import parse_training
 
 
 def _transform(*, scale: float = 1.0, gripper: str = "identity") -> ActionTransform:
@@ -80,6 +94,130 @@ def _task(*, benchmark: str, transform: dict[str, object] | None) -> ResolvedTas
 
 
 class CrossBenchmarkContractTest(unittest.TestCase):
+    def test_hfra_identity_parameters_sites_and_gradients(self) -> None:
+        adapter = HybridFourierResidualAdapter(
+            embed_dim=1024,
+            grid_height=16,
+            grid_width=16,
+            num_encoder_blocks=24,
+            rank=4,
+        )
+        self.assertEqual(adapter.adapter_site_indices(24), (12, 23))
+        self.assertEqual(adapter.parameter_count(), 17024)
+        value = torch.randn(1, 2, 256, 1024)
+        output = adapter.apply_at_site(12, value)
+        self.assertTrue(torch.equal(output, value))
+        output.square().mean().backward()
+        self.assertTrue(
+            any(
+                parameter.grad is not None
+                and torch.isfinite(parameter.grad).all()
+                and torch.count_nonzero(parameter.grad) > 0
+                for parameter in adapter.parameters()
+            )
+        )
+
+    def test_hfra_bf16_identity_fft_shape_and_core_only_parameters(self) -> None:
+        adapter = HybridFourierResidualAdapter(
+            embed_dim=32,
+            grid_height=4,
+            grid_width=4,
+            num_encoder_blocks=6,
+            rank=4,
+        ).to(torch.bfloat16)
+        value = torch.randn(2, 3, 16, 32, dtype=torch.bfloat16)
+        self.assertTrue(torch.equal(adapter.apply_at_site(3, value), value))
+        site = adapter.sites["3"]
+        core = site.activation(site.down(site.norm(value)))
+        self.assertEqual(site._spectral_residual(core).shape, core.shape)
+        core_only = HFRACoreOnlyAdapter(
+            embed_dim=32,
+            grid_height=4,
+            grid_width=4,
+            num_encoder_blocks=6,
+            rank=4,
+        )
+        self.assertFalse(
+            any("frequency" in name or "channel_mixer" in name for name, _ in core_only.named_parameters())
+        )
+
+    def test_v2_loader_rejects_v1_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "v1.h5"
+            with h5py.File(path, "w") as handle:
+                handle.attrs["schema_version"] = "jepa_wm_robocasa_feature_cache_v2"
+                handle.attrs["finalized"] = True
+            with self.assertRaisesRegex(RuntimeError, "V2 loader rejects"):
+                FeatureCacheV2Dataset(path)
+
+    def test_structured_step_progress_parser(self) -> None:
+        text = (
+            "TRAIN_PROGRESS step=120 total=2000 loss=0.0123 clean_mse=0.0098 "
+            "ood_mse=0.0148 context_mse=0.0101 future_mse=0.0145 "
+            "lr=0.000287 grad_norm=0.82 samples_per_sec=14.3 "
+            "core_delta_ratio=0.031 spectral_delta_ratio=0.008"
+        )
+        progress = parse_training(text, "log updated 0s ago")
+        self.assertIsNotNone(progress)
+        assert progress is not None
+        self.assertAlmostEqual(progress.percent, 6.0)
+        self.assertIn("step 120/2000", progress.detail)
+
+    def test_v2_checkpoint_contract_and_versioned_job_graphs(self) -> None:
+        camera = {
+            "camera_height": 128,
+            "camera_width": 160,
+            "camera_channel_order": "RGB",
+            "camera_vertical_flip": True,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "hfra.pt"
+            torch.save(
+                {
+                    "schema_version": "wm_adapter_checkpoint_v2",
+                    "method_name": "hfra",
+                    "method_config": {"rank": 4},
+                    "peft_state_dict": {},
+                    "trainable_parameter_count": 17024,
+                    "cache_fingerprint": "cache",
+                    "base_checkpoint_sha256": "base",
+                    "dinov3_checkpoint_sha256": "dino",
+                    "upstream_commits": {},
+                    "loss_name": "unified_trajectory_mse",
+                    "max_optimizer_steps": 2000,
+                    "completed_optimizer_steps": 2000,
+                    "training_seed": 42,
+                    "training_config": {"seed": 42, "max_optimizer_steps": 2000},
+                    "goal_encoder": "frozen_base",
+                    "optimizer_config": {"name": "AdamW"},
+                    "scheduler_config": {"name": "cosine"},
+                    "data_metadata": {
+                        "benchmark": "libero",
+                        "task_key": "libero_goal_0",
+                        "action_transform": _transform().as_dict(),
+                        **camera,
+                    },
+                },
+                path,
+            )
+            validate_checkpoint_v2(
+                path,
+                "hfra",
+                "cache",
+                benchmark="libero",
+                task="libero_goal_0",
+                expected_training_seed=42,
+                expected_method_config={"name": "hfra", "rank": 4},
+                expected_optimizer_steps=2000,
+                expected_action_transform=_transform().as_dict(),
+                expected_camera_contract=camera,
+            )
+        root = Path(__file__).resolve().parents[1]
+        v1 = load_suite_config(root / "configs/experiment/cross_benchmark_v1.yaml")
+        v2 = load_suite_config(root / "configs/experiment/cross_benchmark_v2.yaml")
+        self.assertTrue(build_job_graph(v1))
+        self.assertTrue(any(job.kind == "protocol" for job in build_job_graph(v2)))
+
     def test_split_capacity_uses_requested_count(self) -> None:
         train, heldout = _validated_split_indices(50, 0.6, 42, 20)
         self.assertEqual((len(train), len(heldout)), (30, 20))

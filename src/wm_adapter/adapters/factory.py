@@ -6,6 +6,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from wm_adapter.adapters.base import BaseMethod, PEFTMethod
 from wm_adapter.adapters.dct_adapter import SequenceStableAdaptiveDCTAdapter
+from wm_adapter.adapters.hfra import HFRACoreOnlyAdapter, HybridFourierResidualAdapter
 from wm_adapter.adapters.lora import LastBlockAttentionLoRA
 from wm_adapter.adapters.token_mlp import TokenMLPAdapter
 
@@ -51,7 +52,23 @@ def build_method(
             alpha=float(values["alpha"]),
             dropout=float(values["dropout"]),
         )
+    elif method_name in {"hfra", "hfra_core_only"}:
+        adapter_class = (
+            HybridFourierResidualAdapter
+            if method_name == "hfra"
+            else HFRACoreOnlyAdapter
+        )
+        method = adapter_class(
+            embed_dim=backend.token_dim,
+            grid_height=backend.grid_height,
+            grid_width=backend.grid_width,
+            num_encoder_blocks=backend.num_encoder_blocks,
+            rank=int(values["rank"]),
+        )
     else:
-        raise ValueError(f"Unknown method {method_name!r}; expected base, dct_adapter, token_mlp, or lora")
+        raise ValueError(
+            f"Unknown method {method_name!r}; expected base, dct_adapter, "
+            "token_mlp, lora, hfra, or hfra_core_only"
+        )
     method.attach_backend(backend)
     return method

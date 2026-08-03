@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import math
+import hashlib
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -247,6 +248,7 @@ class LiberoWindowDataset(Dataset[dict[str, Tensor]]):
         frameskip: int,
         appearance_seed: int,
         appearance_severity: float,
+        appearance_severity_range: tuple[float, float] | None = None,
     ) -> None:
         self.source = source
         self.selections = selections
@@ -254,6 +256,7 @@ class LiberoWindowDataset(Dataset[dict[str, Tensor]]):
         self.frameskip = frameskip
         self.appearance_seed = appearance_seed
         self.appearance_severity = appearance_severity
+        self.appearance_severity_range = appearance_severity_range
         self.appearance = ComposedPhotometricShift()
 
     def __len__(self) -> int:
@@ -268,8 +271,20 @@ class LiberoWindowDataset(Dataset[dict[str, Tensor]]):
             raise RuntimeError(
                 f"LIBERO action window must be {(self.num_frames, 7)}, received {tuple(actions.shape)}"
             )
-        spec_seed = int(self.appearance_seed + index)
-        spec = self.appearance.sample_spec(spec_seed, self.appearance_severity)
+        if self.appearance_severity_range is None:
+            spec_seed = int(self.appearance_seed + index)
+            severity = self.appearance_severity
+        else:
+            low, high = self.appearance_severity_range
+            if not 0.0 <= low <= high:
+                raise ValueError(f"Invalid appearance severity range {(low, high)}")
+            digest = hashlib.sha256(
+                f"{self.appearance_seed}:{trajectory}:{start}".encode("utf-8")
+            ).digest()
+            spec_seed = int.from_bytes(digest[:8], "little") % (2**63 - 1)
+            unit = int.from_bytes(digest[8:16], "little") / float(2**64 - 1)
+            severity = low + (high - low) * unit
+        spec = self.appearance.sample_spec(spec_seed, severity)
         return {
             "clean_images": clean,
             "ood_images": self.appearance.apply(clean, spec),
@@ -277,6 +292,7 @@ class LiberoWindowDataset(Dataset[dict[str, Tensor]]):
             "episode_id": torch.tensor(trajectory, dtype=torch.int64),
             "window_id": torch.tensor(start, dtype=torch.int64),
             "appearance_seed": torch.tensor(spec_seed, dtype=torch.int64),
+            "appearance_severity": torch.tensor(severity, dtype=torch.float32),
         }
 
 
@@ -1231,6 +1247,7 @@ class LiberoBenchmark(BenchmarkAdapter):
         frameskip: int,
         appearance_seed: int,
         appearance_severity: float,
+        appearance_severity_range: tuple[float, float] | None = None,
     ) -> LiberoWindowDataset:
         return LiberoWindowDataset(
             source_dataset,
@@ -1239,6 +1256,7 @@ class LiberoBenchmark(BenchmarkAdapter):
             frameskip=frameskip,
             appearance_seed=appearance_seed,
             appearance_severity=appearance_severity,
+            appearance_severity_range=appearance_severity_range,
         )
 
     def build_evaluation_manifest(

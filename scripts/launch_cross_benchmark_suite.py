@@ -15,11 +15,11 @@ from wm_adapter.experiments.cross_benchmark import load_suite_config
 from wm_adapter.utils.reproducibility import project_root, resolve_path
 
 
-DEFAULT_CONFIG = "configs/experiment/cross_benchmark_v1.yaml"
+DEFAULT_CONFIG = "configs/experiment/cross_benchmark_v2.yaml"
 
 
 def _args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Launch or attach to cross_benchmark_v1")
+    parser = argparse.ArgumentParser(description="Launch or attach to a cross-benchmark suite")
     parser.add_argument("--config", default=DEFAULT_CONFIG)
     action = parser.add_mutually_exclusive_group()
     action.add_argument("--stop", action="store_true")
@@ -87,6 +87,7 @@ def _monitor(state: Path, config: str, *, once: bool) -> int:
 def main() -> None:
     args = _args()
     suite = load_suite_config(args.config)
+    suite_name = str(suite.suite_name)
     pid_path, state_path, runner_log = _paths(suite, args.self_test)
     pid = _read_pid(pid_path)
     running = _alive(pid)
@@ -104,7 +105,7 @@ def main() -> None:
         raise SystemExit(_monitor(state_path, args.config, once=True))
     if args.stop:
         if not running or pid is None:
-            print("cross_benchmark_v1 runner is not active")
+            print(f"{suite_name} runner is not active")
             return
         os.killpg(os.getpgid(pid), signal.SIGTERM)
         for _ in range(50):
@@ -114,11 +115,11 @@ def main() -> None:
         if _alive(pid):
             raise RuntimeError(f"Runner process group did not stop after SIGTERM: pid={pid}")
         pid_path.unlink(missing_ok=True)
-        print(f"Stopped cross_benchmark_v1 runner pid={pid}")
+        print(f"Stopped {suite_name} runner pid={pid}")
         return
     if args.attach:
         if not running:
-            print("cross_benchmark_v1 runner is not active; showing the latest state")
+            print(f"{suite_name} runner is not active; showing the latest state")
         raise SystemExit(_monitor(state_path, args.config, once=False))
     if not running:
         pid_path.parent.mkdir(parents=True, exist_ok=True)
@@ -129,7 +130,7 @@ def main() -> None:
             competing_pid = _read_pid(pid_path)
             if _alive(competing_pid):
                 print(
-                    f"cross_benchmark_v1 was started concurrently with pid={competing_pid}; "
+                    f"{suite_name} was started concurrently with pid={competing_pid}; "
                     "attaching Dashboard"
                 )
                 raise SystemExit(_monitor(state_path, args.config, once=False))
@@ -151,9 +152,9 @@ def main() -> None:
             pid_path.unlink(missing_ok=True)
             raise
         os.close(lock_fd)
-        print(f"Started cross_benchmark_v1 runner pid={process.pid}; log={runner_log}")
+        print(f"Started {suite_name} runner pid={process.pid}; log={runner_log}")
     else:
-        print(f"cross_benchmark_v1 is already running with pid={pid}; attaching Dashboard")
+        print(f"{suite_name} is already running with pid={pid}; attaching Dashboard")
     raise SystemExit(_monitor(state_path, args.config, once=False))
 
 

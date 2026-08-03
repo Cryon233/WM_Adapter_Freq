@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -44,8 +45,25 @@ class PlanningResult:
     source_trajectory_ids: list[str] = field(default_factory=list)
     initialization_fingerprints: list[str] = field(default_factory=list)
     goal_fingerprints: list[str] = field(default_factory=list)
+    goal_base_latent_fingerprints: list[str] = field(default_factory=list)
     appearance_specs: list[dict[str, Any] | None] = field(default_factory=list)
     cem_seeds: list[int] = field(default_factory=list)
+
+
+@torch.inference_mode()
+def frozen_goal_latent_fingerprint(
+    backend: JEPAWMDroidBackend, goal_image: Tensor
+) -> str:
+    if goal_image.ndim != 3:
+        raise ValueError(
+            f"Goal fingerprint image must be [C,H,W], received {tuple(goal_image.shape)}"
+        )
+    latent = backend.encode_images_frozen_base(goal_image.unsqueeze(0).unsqueeze(0))
+    values = latent.detach().float().cpu().contiguous().numpy()
+    digest = hashlib.sha256()
+    digest.update(str(values.shape).encode("ascii"))
+    digest.update(values.tobytes())
+    return digest.hexdigest()
 
 
 class _FixedRoboCasaSegment:
@@ -151,7 +169,13 @@ class JEPAWMPlanningModel(nn.Module):
         images = self._current_only_shift(observations)
         batch, time_steps = images.shape[:2]
         with self._inference_context():
-            latents = self.backend.encode_images(images, self.method, batch, time_steps)
+            latents = (
+                self.backend.encode_images_frozen_base(images)
+                if self._encoding_goal
+                else self.backend.encode_images(
+                    images, self.method, batch, time_steps
+                )
+            )
             return self.backend.planning_latents(latents)
 
     @torch.inference_mode()
@@ -470,6 +494,7 @@ def run_robocasa_planning(
     source_trajectory_ids: list[str] = []
     initialization_fingerprints: list[str] = []
     goal_fingerprints: list[str] = []
+    goal_base_latent_fingerprints: list[str] = []
     appearance_specs: list[dict[str, Any] | None] = []
     cem_seeds: list[int] = []
     job_error: Exception | None = None
@@ -522,6 +547,9 @@ def run_robocasa_planning(
                 actual_goal = array_sha256(
                     selected_observation["visual"][-1].numpy()
                 )
+                goal_base_latent_fingerprint = frozen_goal_latent_fingerprint(
+                    backend, selected_observation["visual"][-1]
+                )
                 if actual_initialization != str(instance["initialization_fingerprint"]) or actual_goal != str(instance["goal_fingerprint"]):
                     raise RuntimeError(
                         "RoboCasa evaluation instance fingerprint changed: "
@@ -562,6 +590,7 @@ def run_robocasa_planning(
                     str(instance["initialization_fingerprint"])
                 )
                 goal_fingerprints.append(str(instance["goal_fingerprint"]))
+                goal_base_latent_fingerprints.append(goal_base_latent_fingerprint)
                 appearance_specs.append(
                     planning_model.appearance_spec.as_dict()
                     if domain_name == "ood"
@@ -657,6 +686,7 @@ def run_robocasa_planning(
         source_trajectory_ids=source_trajectory_ids,
         initialization_fingerprints=initialization_fingerprints,
         goal_fingerprints=goal_fingerprints,
+        goal_base_latent_fingerprints=goal_base_latent_fingerprints,
         appearance_specs=appearance_specs,
         cem_seeds=cem_seeds,
     )

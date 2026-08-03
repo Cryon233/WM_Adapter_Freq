@@ -10,6 +10,8 @@ from wm_adapter.adapters.factory import build_method
 from wm_adapter.appearance.composed_photometric import ComposedPhotometricShift
 from wm_adapter.backends.jepa_wm_droid import JEPAWMDroidBackend
 from wm_adapter.benchmarks.factory import build_benchmark
+from wm_adapter.data.feature_cache import CACHE_SCHEMA_VERSION
+from wm_adapter.data.feature_cache_v2 import CACHE_SCHEMA_VERSION_V2
 from wm_adapter.planning.jepa_wm_planner import (
     EVALUATION_PROTOCOL_DIRECTORY,
     EVALUATION_PROTOCOL_VERSION,
@@ -56,6 +58,7 @@ def main() -> None:
     if method_name != "base":
         checkpoint_path = resolve_path(cfg.paths.method_checkpoint)
         checkpoint = load_method_checkpoint(checkpoint_path)
+        checkpoint_v2 = checkpoint.get("schema_version") == "wm_adapter_checkpoint_v2"
         if checkpoint["method_name"] != method_name:
             raise RuntimeError(
                 f"Method checkpoint is for {checkpoint['method_name']!r}, requested {method_name!r}: {checkpoint_path}"
@@ -71,7 +74,7 @@ def main() -> None:
             raise RuntimeError(f"Method checkpoint DINOv3 fingerprint mismatch: {checkpoint_path}")
         if checkpoint["upstream_commits"] != backend.upstream_commits:
             raise RuntimeError(f"Method checkpoint upstream commit mismatch: {checkpoint_path}")
-        if checkpoint["appearance_metadata"] != training_appearance:
+        if not checkpoint_v2 and checkpoint["appearance_metadata"] != training_appearance:
             raise RuntimeError(f"Method checkpoint training appearance mismatch: {checkpoint_path}")
         data_metadata = dict(checkpoint.get("data_metadata", {}))
         actual_identity = (
@@ -83,18 +86,25 @@ def main() -> None:
             "checkpoints/cross_benchmark_v1/"
             f"{resolved_task.benchmark}/{resolved_task.task_key}/{method_name}_final.pt"
         )
-        legacy_place = (
+        legacy_place = (not checkpoint_v2 and
             resolved_task.benchmark == "robocasa"
             and resolved_task.task_key == "robocasa_place"
             and checkpoint_path != standard_checkpoint
             and actual_identity == ("", "")
         )
         checkpoint_training = dict(checkpoint.get("training_config", {}))
-        expected_training = {
-            "seed": int(cfg.training.seed),
-            "canonical_weight": float(cfg.training.get("canonical_weight", 1.0)),
-            "dynamics_weight": float(cfg.training.get("dynamics_weight", 1.0)),
-        }
+        expected_training = (
+            {
+                "seed": int(cfg.training.seed),
+                "canonical_weight": float(cfg.training.get("canonical_weight", 1.0)),
+                "dynamics_weight": float(cfg.training.get("dynamics_weight", 1.0)),
+            }
+            if not checkpoint_v2
+            else {
+                "seed": int(cfg.training.seed),
+                "max_optimizer_steps": int(cfg.training.max_optimizer_steps),
+            }
+        )
         actual_training = {
             key: checkpoint_training.get(
                 key,
@@ -124,7 +134,7 @@ def main() -> None:
                 "Method checkpoint benchmark/task mismatch: "
                 f"expected={expected_identity}, actual={actual_identity}, path={checkpoint_path}"
             )
-        if not legacy_place:
+        if not legacy_place and not checkpoint_v2:
             checkpoint_contract = {
                 "task_manifest_sha256": task_manifest["task_manifest_sha256"],
                 "dataset_sha256": resolved_task.dataset_sha256,
@@ -152,6 +162,19 @@ def main() -> None:
                 raise RuntimeError(
                     f"Method checkpoint task/data contract mismatch: {contract_mismatch}"
                 )
+        if checkpoint_v2:
+            expected_v2 = {
+                "loss_name": "unified_trajectory_mse",
+                "goal_encoder": "frozen_base",
+                "completed_optimizer_steps": int(cfg.training.max_optimizer_steps),
+            }
+            mismatch = {
+                key: {"expected": value, "actual": checkpoint.get(key)}
+                for key, value in expected_v2.items()
+                if checkpoint.get(key) != value
+            }
+            if mismatch:
+                raise RuntimeError(f"V2 planning checkpoint contract mismatch: {mismatch}")
         checkpoint_fingerprint = sha256_file(checkpoint_path)
         cache_fingerprint = str(checkpoint["cache_fingerprint"])
     configured_cache = resolve_path(cfg.paths.feature_cache)
@@ -160,7 +183,19 @@ def main() -> None:
             f"Planning requires the task feature cache contract: {configured_cache}"
         )
     with h5py.File(configured_cache, "r", libver="latest", swmr=True) as cache:
+        cache_schema = str(cache.attrs.get("schema_version", ""))
         configured_cache_fingerprint = str(cache.attrs["cache_fingerprint"])
+    expected_cache_schema = (
+        CACHE_SCHEMA_VERSION_V2
+        if str(cfg.training.get("loss_name", "")) == "unified_trajectory_mse"
+        else CACHE_SCHEMA_VERSION
+    )
+    if cache_schema != expected_cache_schema:
+        raise RuntimeError(
+            "Planning feature-cache schema mismatch: "
+            f"expected={expected_cache_schema}, actual={cache_schema}, "
+            f"path={configured_cache}"
+        )
     if cache_fingerprint is not None and cache_fingerprint != configured_cache_fingerprint:
         raise RuntimeError(
             "Planning method checkpoint and feature cache fingerprints differ: "
@@ -266,11 +301,21 @@ def main() -> None:
         "runtime_seconds": result.elapsed_seconds,
         "evaluation_protocol_version": EVALUATION_PROTOCOL_VERSION,
         "method": method_name,
+        "goal_encoder": "frozen_base",
+        "current_encoder": "configured_method",
+        "goal_base_latent_fingerprint": result.goal_base_latent_fingerprints,
         "method_parameter_count": method.parameter_count(),
         "base_checkpoint_sha256": backend.base_checkpoint_sha256,
         "dinov3_checkpoint_sha256": backend.dinov3_checkpoint_sha256,
         "method_checkpoint_sha256": checkpoint_fingerprint,
         "cache_fingerprint": cache_fingerprint,
+        "cache_schema_version": cache_schema,
+        "checkpoint_schema_version": (
+            "base" if method_name == "base" else
+            "wm_adapter_checkpoint_v2"
+            if str(cfg.training.get("loss_name", "")) == "unified_trajectory_mse"
+            else "wm_adapter_checkpoint_v1"
+        ),
         "upstream_commits": backend.upstream_commits,
         "benchmark_upstream_commits": resolved_task.upstream_commits,
         "training_appearance": training_appearance,

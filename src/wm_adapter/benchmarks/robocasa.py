@@ -698,6 +698,7 @@ class RoboCasaBenchmark(BenchmarkAdapter):
         frameskip: int,
         appearance_seed: int,
         appearance_severity: float,
+        appearance_severity_range: tuple[float, float] | None = None,
     ) -> RoboCasaWindowDataset:
         return RoboCasaWindowDataset(
             source_dataset,
@@ -706,6 +707,7 @@ class RoboCasaBenchmark(BenchmarkAdapter):
             frameskip=frameskip,
             appearance_seed=appearance_seed,
             appearance_severity=appearance_severity,
+            appearance_severity_range=appearance_severity_range,
         )
 
     def build_evaluation_manifest(
