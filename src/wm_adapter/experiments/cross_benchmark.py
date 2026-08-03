@@ -364,6 +364,10 @@ def validate_cache_v2(
             "context_frames": 3,
             "future_frames": 3,
         }
+        expected_scalars = {
+            key: _decoded_hdf5_attr(value)
+            for key, value in expected_scalars.items()
+        }
         mismatch = {
             key: {"expected": value, "actual": _decoded_hdf5_attr(handle.attrs.get(key))}
             for key, value in expected_scalars.items()
@@ -692,10 +696,12 @@ def validate_checkpoint_v2(
         **expected_data_contract,
     }
     for key, value in expected_metadata.items():
-        if metadata.get(key) != value:
+        normalized_expected = _decoded_hdf5_attr(value)
+        normalized_actual = _decoded_hdf5_attr(metadata.get(key))
+        if normalized_actual != normalized_expected:
             mismatch[f"data_metadata.{key}"] = {
-                "expected": value,
-                "actual": metadata.get(key),
+                "expected": normalized_expected,
+                "actual": normalized_actual,
             }
     parameter_count = int(payload.get("trainable_parameter_count", -1))
     if parameter_count <= 0:

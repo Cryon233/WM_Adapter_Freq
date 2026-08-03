@@ -726,6 +726,16 @@ def _validate_job(
                     "task_upstream_commits": dict(
                         task_manifest.get("upstream_commits", {})
                     ),
+                    "dataset_format": task_manifest.get("dataset_format"),
+                    "dataset_source_identifier": task_manifest.get(
+                        "dataset_source_identifier"
+                    ),
+                    "dataset_revision": task_manifest.get("dataset_revision"),
+                    "robot": task_manifest.get("robot"),
+                    "gripper": task_manifest.get("gripper"),
+                    "controller_contract": task_manifest.get(
+                        "controller_contract"
+                    ),
                 },
             )
         return validate_checkpoint(

@@ -488,6 +488,12 @@ class CrossBenchmarkContractTest(unittest.TestCase):
                         "dataset_sha256": "dataset",
                         "camera_key": "agentview_rgb",
                         "task_upstream_commits": {"libero": "commit"},
+                        "dataset_format": "hdf5",
+                        "dataset_source_identifier": "official",
+                        "dataset_revision": "revision",
+                        "robot": "robot",
+                        "gripper": "gripper",
+                        "controller_contract": {"type": "OSC_POSE"},
                         **camera,
                     },
                 }
@@ -507,6 +513,12 @@ class CrossBenchmarkContractTest(unittest.TestCase):
                     "dataset_sha256": "dataset",
                     "camera_key": "agentview_rgb",
                     "task_upstream_commits": {"libero": "commit"},
+                    "dataset_format": "hdf5",
+                    "dataset_source_identifier": "official",
+                    "dataset_revision": "revision",
+                    "robot": "robot",
+                    "gripper": "gripper",
+                    "controller_contract": json.dumps({"type": "OSC_POSE"}),
                 },
             )
             payload["optimizer_config"] = dict(payload["optimizer_config"])
@@ -528,6 +540,14 @@ class CrossBenchmarkContractTest(unittest.TestCase):
                         "dataset_sha256": "dataset",
                         "camera_key": "agentview_rgb",
                         "task_upstream_commits": {"libero": "commit"},
+                        "dataset_format": "hdf5",
+                        "dataset_source_identifier": "official",
+                        "dataset_revision": "revision",
+                        "robot": "robot",
+                        "gripper": "gripper",
+                        "controller_contract": json.dumps(
+                            {"type": "OSC_POSE"}
+                        ),
                     },
                 )
         root = Path(__file__).resolve().parents[1]
