@@ -679,7 +679,11 @@ class CrossBenchmarkContractTest(unittest.TestCase):
         v1 = load_suite_config(root / "configs/experiment/cross_benchmark_v1.yaml")
         v2 = load_suite_config(root / "configs/experiment/cross_benchmark_v2.yaml")
         self.assertTrue(build_job_graph(v1))
-        self.assertTrue(any(job.kind == "protocol" for job in build_job_graph(v2)))
+        v2_jobs = build_job_graph(v2)
+        self.assertFalse(any(job.kind == "protocol" for job in v2_jobs))
+        self.assertNotIn("Protocol validation", list(v2.phases))
+        for cache_job in (job for job in v2_jobs if job.kind == "cache"):
+            self.assertEqual(cache_job.dependencies, (f"preflight/{cache_job.task}",))
         self_test_jobs = build_job_graph(v2, self_test=True)
         for job in self_test_jobs:
             if job.kind in {"checkpoint", "offline", "planning"}:

@@ -1,6 +1,6 @@
 suite_name: cross_benchmark_v2
 protocol: paired_visual_goal_hfra_v2
-phases: [Task and resource preflight, Protocol validation, Feature caches, Main adapter training, Main offline evaluation, Main closed-loop planning, Training-seed stability, OOD severity, HFRA ablations, Final analysis]
+phases: [Task and resource preflight, Feature caches, Main adapter training, Main offline evaluation, Main closed-loop planning, Training-seed stability, OOD severity, HFRA ablations, Final analysis]
 state_path: logs/cross_benchmark_v2/state.json
 pid_path: logs/cross_benchmark_v2/runner.pid
 runner_log: logs/cross_benchmark_v2/runner.log
@@ -8,7 +8,6 @@ log_root: logs/cross_benchmark_v2/jobs
 output_root: outputs/cross_benchmark_v2
 analysis_root: outputs/cross_benchmark_v2/analysis
 manifest_root: outputs/cross_benchmark_v2/manifests
-protocol_validation_root: outputs/cross_benchmark_v2/protocol_validation
 storage_root: storage/feature_cache/cross_benchmark_v2
 checkpoint_root: checkpoints/cross_benchmark_v2
 tasks:
@@ -52,4 +51,3 @@ self_test:
     output_root: outputs/cross_benchmark_v2_self_test
     analysis_root: outputs/cross_benchmark_v2_self_test/analysis
     manifest_root: outputs/cross_benchmark_v2_self_test/manifests
-    protocol_validation_root: outputs/cross_benchmark_v2_self_test/protocol_validation

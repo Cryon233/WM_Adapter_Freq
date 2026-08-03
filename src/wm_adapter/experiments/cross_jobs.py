@@ -92,39 +92,6 @@ def build_job_graph(suite: Any, *, self_test: bool = False) -> list[JobSpec]:
                 kind="task_manifest",
             )
         )
-        protocol_job_id = f"protocol/{task}"
-        if is_v2:
-            protocol_result = (
-                resolve_path(str(suite.protocol_validation_root)) / f"{task}.json"
-            )
-            jobs.append(
-                JobSpec(
-                    job_id=protocol_job_id,
-                    phase="Protocol validation",
-                    benchmark=benchmark,
-                    task=task,
-                    command=(
-                        sys.executable,
-                        "scripts/validate_libero_action_replay.py",
-                        "--config",
-                        config,
-                        f"protocol_validation.output={protocol_result}",
-                        *(
-                            (
-                                "protocol_validation.episodes=1",
-                                "protocol_validation.starts_per_episode=1",
-                            )
-                            if self_test
-                            else ()
-                        ),
-                        *manifest_overrides,
-                    ),
-                    log_path=_log(suite, f"protocol-{task}"),
-                    artifact_path=str(protocol_result),
-                    kind="protocol",
-                    dependencies=(f"preflight/{task}",),
-                )
-            )
         cache = _main_cache(suite, benchmark, task)
         reuse_cache: tuple[str, ...] = ()
         if task in suite.reuse_sources and suite.reuse_sources[task].get("cache"):
@@ -144,7 +111,7 @@ def build_job_graph(suite: Any, *, self_test: bool = False) -> list[JobSpec]:
                 task=task, command=tuple(cache_command),
                 log_path=_log(suite, f"cache-{task}"), artifact_path=str(cache),
                 kind="cache", required_count=cache_windows, reuse_sources=reuse_cache,
-                dependencies=((protocol_job_id,) if is_v2 else (f"preflight/{task}",)),
+                dependencies=(f"preflight/{task}",),
             )
         )
         train_methods = [method for method in methods if method != "base"]

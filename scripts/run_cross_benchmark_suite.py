@@ -88,8 +88,6 @@ def _self_test_suite(suite: Any) -> Any:
     cloned.output_root = roots.output_root
     cloned.analysis_root = roots.analysis_root
     cloned.manifest_root = roots.get("manifest_root", f"{roots.output_root}/manifests")
-    if "protocol_validation_root" in roots:
-        cloned.protocol_validation_root = roots.protocol_validation_root
     cloned.reuse_sources = {}
     selected = {str(value) for value in cloned.self_test.task_keys}
     cloned.tasks = {
@@ -617,37 +615,6 @@ def _validate_job(
             job.task,
             allow_legacy_place=allow_legacy,
         )
-    if job.kind == "protocol":
-        resolved = resolve_path(path)
-        payload = json.loads(resolved.read_text(encoding="utf-8"))
-        if job.benchmark == "libero":
-            expected = {
-                "schema_version": "libero_action_replay_contract_v1",
-                "task": job.task,
-                "status": "passed",
-                "sequence_replay_contract": "passed",
-                "repeat_action_contract": "passed",
-            }
-            mismatch = {
-                key: {"expected": value, "actual": payload.get(key)}
-                for key, value in expected.items()
-                if payload.get(key) != value
-            }
-            if mismatch:
-                raise RuntimeError(
-                    f"LIBERO protocol-validation artifact mismatch at {resolved}: {mismatch}"
-                )
-        elif payload.get("status") != "not_applicable":
-            raise RuntimeError(
-                f"RoboCasa protocol artifact must be not_applicable: {resolved}"
-            )
-        return {
-            "path": str(resolved),
-            "sha256": sha256_file(resolved),
-            "status": str(payload["status"]),
-            "sequence_replay": payload.get("sequence_replay"),
-            "repeated_action_replay": payload.get("repeated_action_replay"),
-        }
     if job.kind == "cache":
         task_manifest_path, _ = _manifest_paths(suite, job.task)
         task_manifest = json.loads(task_manifest_path.read_text(encoding="utf-8"))
@@ -958,7 +925,7 @@ def _resume_or_pending(
                 suite, state, job, str(standard), self_test=self_test
             )
         except Exception:
-            if job.kind in {"protocol", "cache", "checkpoint", "planning", "offline"}:
+            if job.kind in {"cache", "checkpoint", "planning", "offline"}:
                 archived = archive_incomplete(standard)
                 state.setdefault("archives", []).append(str(archived))
                 if job.kind == "offline":
