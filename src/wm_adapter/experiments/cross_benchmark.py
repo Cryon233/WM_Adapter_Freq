@@ -284,7 +284,8 @@ def validate_cache(
         }
 
 
-def _decoded_hdf5_attr(value: Any) -> Any:
+def normalize_metadata_contract(value: Any) -> Any:
+    """Normalize JSON-backed metadata without weakening its semantic content."""
     if hasattr(value, "item"):
         value = value.item()
     if isinstance(value, bytes):
@@ -292,6 +293,10 @@ def _decoded_hdf5_attr(value: Any) -> Any:
     if isinstance(value, str) and value[:1] in {"{", "["}:
         return json.loads(value)
     return value
+
+
+def _decoded_hdf5_attr(value: Any) -> Any:
+    return normalize_metadata_contract(value)
 
 
 def validate_cache_v2(

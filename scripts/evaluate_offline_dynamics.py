@@ -21,6 +21,7 @@ from wm_adapter.backends.jepa_wm_droid import JEPAWMDroidBackend
 from wm_adapter.backends.frozen_projection import frozen_base_projection
 from wm_adapter.benchmarks.factory import build_benchmark
 from wm_adapter.experiments.cross_benchmark import (
+    normalize_metadata_contract,
     training_contract_mismatches_v2,
     training_contract_v2,
 )
@@ -220,12 +221,24 @@ def main() -> None:
                 "camera_vertical_flip": resolved_task.camera_vertical_flip,
                 "action_convention": resolved_task.action_convention,
                 "action_transform": resolved_task.action_transform,
+                "dataset_format": resolved_task.dataset_format,
+                "dataset_source_identifier": resolved_task.dataset_source_identifier,
+                "dataset_revision": resolved_task.dataset_revision,
+                "robot": resolved_task.robot,
+                "gripper": resolved_task.gripper,
+                "controller_contract": resolved_task.controller_contract,
                 "task_upstream_commits": resolved_task.upstream_commits,
             }
             mismatch = {
-                key: {"expected": value, "actual": checkpoint_data_metadata.get(key)}
+                key: {
+                    "expected": normalize_metadata_contract(value),
+                    "actual": normalize_metadata_contract(
+                        checkpoint_data_metadata.get(key)
+                    ),
+                }
                 for key, value in expected_contract.items()
-                if checkpoint_data_metadata.get(key) != value
+                if normalize_metadata_contract(checkpoint_data_metadata.get(key))
+                != normalize_metadata_contract(value)
             }
             if mismatch:
                 raise RuntimeError(

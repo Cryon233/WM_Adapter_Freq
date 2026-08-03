@@ -13,6 +13,7 @@ from wm_adapter.benchmarks.factory import build_benchmark
 from wm_adapter.data.feature_cache import CACHE_SCHEMA_VERSION
 from wm_adapter.data.feature_cache_v2 import CACHE_SCHEMA_VERSION_V2
 from wm_adapter.experiments.cross_benchmark import (
+    normalize_metadata_contract,
     training_contract_mismatches_v2,
     training_contract_v2,
 )
@@ -158,9 +159,13 @@ def main() -> None:
                 "task_upstream_commits": resolved_task.upstream_commits,
             }
             contract_mismatch = {
-                key: {"expected": value, "actual": data_metadata.get(key)}
+                key: {
+                    "expected": normalize_metadata_contract(value),
+                    "actual": normalize_metadata_contract(data_metadata.get(key)),
+                }
                 for key, value in checkpoint_contract.items()
-                if data_metadata.get(key) != value
+                if normalize_metadata_contract(data_metadata.get(key))
+                != normalize_metadata_contract(value)
             }
             if contract_mismatch:
                 raise RuntimeError(
