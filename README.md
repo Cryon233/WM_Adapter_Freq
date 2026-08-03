@@ -335,4 +335,4 @@ Status snapshot: `bash scripts/run_cross_benchmark_suite.sh --status`
 
 Explicit stop: `bash scripts/run_cross_benchmark_suite.sh --stop`
 
-Leaving the Dashboard with `q` or `Ctrl+C` only detaches it; the runner remains in its independent process group. The formal CEM settings remain 15 iterations, 300 candidates, 10 elites, horizon 3, and one executed action step for every method within a task.
+The Dashboard wraps long status and error lines to the live terminal width. Leaving it with `q` or `Ctrl+C` only detaches it; the runner remains in its independent process group. Uppercase `X` verifies the runner PID and terminates its complete process group, including active GPU child jobs, before exiting the Dashboard. The formal CEM settings remain 15 iterations, 300 candidates, 10 elites, horizon 3, and one executed action step for every method within a task.

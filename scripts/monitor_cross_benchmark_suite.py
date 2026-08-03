@@ -4,7 +4,10 @@ from __future__ import annotations
 import argparse
 import curses
 import json
+import os
+import signal
 import time
+import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +20,7 @@ from wm_adapter.utils.reproducibility import project_root, resolve_path
 
 DEFAULT_STATE = project_root() / "logs/cross_benchmark_v1/state.json"
 DEFAULT_SUITE = project_root() / "configs/experiment/cross_benchmark_v1.yaml"
+RUNNER_COMMAND = "scripts/run_cross_benchmark_suite.py"
 
 
 def _state(path: Path) -> dict[str, Any]:
@@ -91,6 +95,31 @@ def _progress_line(label: str, progress: progress_core.Progress, width: int) -> 
         f"[{progress_core.bar(progress.percent, bar_width, active)}] "
         f"{progress_core.clamp(progress.percent):6.2f}%  {progress.detail}"
     )
+
+
+def _wrap_dashboard_lines(lines: list[str], width: int) -> list[str]:
+    usable = max(8, width - 1)
+    wrapped: list[str] = []
+    for line in lines:
+        if not line:
+            wrapped.append("")
+            continue
+        if set(line) == {"="}:
+            wrapped.append("=" * usable)
+            continue
+        leading = len(line) - len(line.lstrip(" "))
+        continuation = " " * min(leading + 2, max(0, usable - 1))
+        pieces = textwrap.wrap(
+            line,
+            width=usable,
+            subsequent_indent=continuation,
+            break_long_words=True,
+            break_on_hyphens=False,
+            replace_whitespace=False,
+            drop_whitespace=True,
+        )
+        wrapped.extend(pieces or [""])
+    return wrapped
 
 
 def _expected(suite_path: Path, state: dict[str, Any]) -> dict[str, int]:
@@ -183,8 +212,108 @@ def dashboard_lines(
             lines.append(f"  [{tag}] {key} | {detail}")
     age = progress_core.file_age(state_path)
     age_text = "state not created" if age is None else f"state updated {progress_core.human_duration(age)} ago"
-    lines.extend(["", f"{age_text} | refresh {refresh:.1f}s | q/Ctrl+C detach Dashboard (runner continues)"])
-    return lines
+    lines.extend([
+        "",
+        f"{age_text} | refresh {refresh:.1f}s | "
+        "q/Ctrl+C detach | X terminate all suite processes and exit",
+    ])
+    return _wrap_dashboard_lines(lines, width)
+
+
+def _read_runner_pid(path: Path) -> int | None:
+    try:
+        value = int(path.read_text(encoding="utf-8").strip())
+    except (FileNotFoundError, ValueError):
+        return None
+    return value if value > 1 else None
+
+
+def _process_group_alive(process_group: int) -> bool:
+    proc = Path("/proc")
+    if proc.is_dir():
+        for candidate in proc.iterdir():
+            if not candidate.name.isdigit():
+                continue
+            try:
+                stat = (candidate / "stat").read_text(encoding="utf-8")
+            except (FileNotFoundError, PermissionError, ProcessLookupError):
+                continue
+            suffix = stat[stat.rfind(")") + 2 :].split()
+            if len(suffix) >= 3:
+                state, group = suffix[0], suffix[2]
+                if int(group) == process_group and state != "Z":
+                    return True
+        return False
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _runner_pid_path(suite_path: Path, state: dict[str, Any]) -> Path:
+    suite = load_suite_config(suite_path)
+    if bool(state.get("self_test", False)):
+        return resolve_path(str(suite.self_test.roots.pid_path))
+    return resolve_path(str(suite.pid_path))
+
+
+def _mark_stopped(state_path: Path) -> None:
+    state = _state(state_path)
+    stopped = time.time()
+    state.update(
+        status="stopped",
+        stopped_at_unix=stopped,
+        error="suite terminated explicitly from the Dashboard",
+    )
+    for entry in state.get("jobs", {}).values():
+        if entry.get("status") == "running":
+            entry.update(
+                status="stopped",
+                end_time=stopped,
+                error="terminated explicitly from the Dashboard",
+            )
+    from wm_adapter.benchmarks.base import atomic_json
+
+    atomic_json(state_path, state)
+
+
+def _terminate_suite(state_path: Path, suite_path: Path) -> str:
+    state = _state(state_path)
+    pid_path = _runner_pid_path(suite_path, state)
+    pid = _read_runner_pid(pid_path)
+    if pid is None:
+        return f"No active runner PID was found at {pid_path}"
+    command_path = Path(f"/proc/{pid}/cmdline")
+    try:
+        command = command_path.read_bytes().replace(b"\0", b" ").decode(
+            "utf-8", errors="replace"
+        )
+    except FileNotFoundError:
+        pid_path.unlink(missing_ok=True)
+        return f"Runner PID {pid} is no longer active"
+    if RUNNER_COMMAND not in command:
+        raise RuntimeError(
+            "Refusing to terminate a PID that is not the cross-benchmark runner: "
+            f"pid={pid}, command={command!r}, pid_file={pid_path}"
+        )
+    process_group = os.getpgid(pid)
+    os.killpg(process_group, signal.SIGTERM)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and _process_group_alive(process_group):
+        time.sleep(0.1)
+    if _process_group_alive(process_group):
+        os.killpg(process_group, signal.SIGKILL)
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and _process_group_alive(process_group):
+            time.sleep(0.05)
+    if _process_group_alive(process_group):
+        raise RuntimeError(
+            f"Runner process group remains active after SIGKILL: pgid={process_group}"
+        )
+    pid_path.unlink(missing_ok=True)
+    _mark_stopped(state_path)
+    return f"Terminated runner process group {process_group}"
 
 
 def _add(screen: Any, row: int, line: str, width: int, attr: int = 0) -> None:
@@ -213,10 +342,31 @@ def _curses(screen: Any, state: Path, suite: Path, refresh: float) -> None:
             heading = line in {"PIPELINE", "GPU TASKS", "RUNNING JOBS", "FAILURES", "RECENTLY COMPLETED"}
             _add(screen, row, line, width, curses.A_BOLD if row == 0 or heading else 0)
         if len(lines) > height:
-            _add(screen, height - 1, "Terminal too small; enlarge it to see lower-priority sections | q detach", width, curses.A_REVERSE)
+            _add(
+                screen,
+                height - 1,
+                "Terminal too small; enlarge to see more | q detach | X terminate suite",
+                width,
+                curses.A_REVERSE,
+            )
         screen.noutrefresh()
         curses.doupdate()
-        if screen.getch() in {ord("q"), ord("Q"), 3}:
+        key = screen.getch()
+        if key in {ord("q"), ord("Q"), 3}:
+            return
+        if key == ord("X"):
+            try:
+                message = _terminate_suite(state, suite)
+            except Exception as error:
+                message = f"Termination refused: {type(error).__name__}: {error}"
+                _add(screen, height - 1, message, width, curses.A_REVERSE)
+                screen.refresh()
+                time.sleep(2.0)
+                continue
+            screen.erase()
+            _add(screen, 0, message, width, curses.A_BOLD)
+            screen.refresh()
+            time.sleep(0.5)
             return
 
 
