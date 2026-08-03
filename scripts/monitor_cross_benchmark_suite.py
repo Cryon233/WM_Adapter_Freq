@@ -228,20 +228,27 @@ def _read_runner_pid(path: Path) -> int | None:
     return value if value > 1 else None
 
 
+def _process_identity(pid: int) -> tuple[str, int, int] | None:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return None
+    suffix = stat[stat.rfind(")") + 2 :].split()
+    if len(suffix) < 4:
+        raise RuntimeError(f"Cannot parse process identity from /proc/{pid}/stat")
+    return suffix[0], int(suffix[2]), int(suffix[3])
+
+
 def _process_group_alive(process_group: int) -> bool:
     proc = Path("/proc")
     if proc.is_dir():
         for candidate in proc.iterdir():
             if not candidate.name.isdigit():
                 continue
-            try:
-                stat = (candidate / "stat").read_text(encoding="utf-8")
-            except (FileNotFoundError, PermissionError, ProcessLookupError):
-                continue
-            suffix = stat[stat.rfind(")") + 2 :].split()
-            if len(suffix) >= 3:
-                state, group = suffix[0], suffix[2]
-                if int(group) == process_group and state != "Z":
+            identity = _process_identity(int(candidate.name))
+            if identity is not None:
+                state, group, _ = identity
+                if group == process_group and state != "Z":
                     return True
         return False
     try:
@@ -284,6 +291,11 @@ def _terminate_suite(state_path: Path, suite_path: Path) -> str:
     pid = _read_runner_pid(pid_path)
     if pid is None:
         return f"No active runner PID was found at {pid_path}"
+    identity = _process_identity(pid)
+    if identity is None:
+        pid_path.unlink(missing_ok=True)
+        return f"Runner PID {pid} is no longer active; removed stale PID file"
+    process_state, process_group, session = identity
     command_path = Path(f"/proc/{pid}/cmdline")
     try:
         command = command_path.read_bytes().replace(b"\0", b" ").decode(
@@ -292,13 +304,26 @@ def _terminate_suite(state_path: Path, suite_path: Path) -> str:
     except FileNotFoundError:
         pid_path.unlink(missing_ok=True)
         return f"Runner PID {pid} is no longer active"
-    if RUNNER_COMMAND not in command:
+    zombie_session_leader = (
+        process_state == "Z" and process_group == pid and session == pid
+    )
+    if RUNNER_COMMAND not in command and not zombie_session_leader:
         raise RuntimeError(
             "Refusing to terminate a PID that is not the cross-benchmark runner: "
-            f"pid={pid}, command={command!r}, pid_file={pid_path}"
+            f"pid={pid}, state={process_state}, command={command!r}, "
+            f"pid_file={pid_path}"
         )
-    process_group = os.getpgid(pid)
-    os.killpg(process_group, signal.SIGTERM)
+    if not _process_group_alive(process_group):
+        pid_path.unlink(missing_ok=True)
+        return (
+            f"Runner PID {pid} is already inactive; removed stale PID file "
+            f"(state={process_state})"
+        )
+    try:
+        os.killpg(process_group, signal.SIGTERM)
+    except ProcessLookupError:
+        pid_path.unlink(missing_ok=True)
+        return f"Runner process group {process_group} exited before termination"
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline and _process_group_alive(process_group):
         time.sleep(0.1)

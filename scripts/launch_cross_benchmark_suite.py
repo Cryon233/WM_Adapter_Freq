@@ -56,6 +56,16 @@ def _alive(pid: int | None) -> bool:
     if pid is None:
         return False
     try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False
+    except PermissionError:
+        stat = ""
+    if stat:
+        suffix = stat[stat.rfind(")") + 2 :].split()
+        if suffix and suffix[0] == "Z":
+            return False
+    try:
         os.kill(pid, 0)
         return True
     except ProcessLookupError:
