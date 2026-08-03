@@ -633,6 +633,16 @@ def _validate_job(
                 expected_task_upstream_commits=dict(
                     task_manifest.get("upstream_commits", {})
                 ),
+                expected_dataset_format=task_manifest.get("dataset_format"),
+                expected_dataset_source_identifier=task_manifest.get(
+                    "dataset_source_identifier"
+                ),
+                expected_dataset_revision=task_manifest.get("dataset_revision"),
+                expected_robot=task_manifest.get("robot"),
+                expected_gripper=task_manifest.get("gripper"),
+                expected_controller_contract=task_manifest.get(
+                    "controller_contract"
+                ),
                 expected_action_transform=task_manifest.get("action_transform"),
                 expected_camera_contract=camera_contract,
                 expected_base_checkpoint_sha256=str(resources["jepa_checkpoint_sha256"]),
