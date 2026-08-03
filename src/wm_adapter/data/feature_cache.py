@@ -24,8 +24,23 @@ ARRAY_KEYS = FEATURE_KEYS + ("actions", "episode_id", "window_id", "appearance_s
 CACHE_SCHEMA_VERSION = "jepa_wm_robocasa_feature_cache_v2"
 
 
+def _json_default(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    raise TypeError(
+        f"Feature-cache metadata contains a non-JSON value: {type(value).__name__}"
+    )
+
+
 def _json_value(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=_json_default,
+    )
 
 
 class FeatureCacheWriter:
