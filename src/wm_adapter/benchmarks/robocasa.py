@@ -726,23 +726,21 @@ class RoboCasaBenchmark(BenchmarkAdapter):
                 f"subtask={self.cfg.planning.get('subtask')!r}, "
                 f"selected={len(selected)}, unique={unique_selected}"
             )
-        if len(selected) != max_windows:
-            allowed = {
-                int(trajectory) for trajectory in allowed_trajectories.tolist()
-            }
-            available_unique = len(
-                {
-                    (int(trajectory), int(start))
-                    for trajectory, start in candidates
-                    if int(trajectory) in allowed
-                }
-            )
+        if len(selected) == max_windows:
+            return selected
+        training_windows = int(self.cfg.data.get("num_train_windows", -1))
+        if max_windows != training_windows:
+            # Offline evaluation uses every available unique held-out window and
+            # reports the actual count rather than duplicating physical windows.
+            return selected
+        if not selected:
             raise RuntimeError(
-                "RoboCasa subtask has insufficient unique windows for the fixed "
-                f"budget: subtask={self.cfg.planning.get('subtask')!r}, "
-                f"requested={max_windows}, available_unique={available_unique}"
+                "RoboCasa subtask filtering produced no training windows: "
+                f"subtask={self.cfg.planning.get('subtask')!r}"
             )
-        return selected
+        # Training keeps its fixed optimizer data budget. Reuse is explicit in
+        # the cache metadata and never applies to held-out Offline evaluation.
+        return [selected[index % len(selected)] for index in range(max_windows)]
 
     def make_window_dataset(
         self,

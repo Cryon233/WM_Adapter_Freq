@@ -384,6 +384,8 @@ def _build_v2(cfg: Any) -> None:
         raise RuntimeError(
             f"V2 requested {cfg.data.num_train_windows} windows, selected {len(selected)}"
         )
+    unique_window_count = len(set(selected))
+    sampling_with_replacement = unique_window_count != len(selected)
     severity_range = (
         float(cfg.appearance.training_severity_min),
         float(cfg.appearance.training_severity_max),
@@ -481,8 +483,14 @@ def _build_v2(cfg: Any) -> None:
         "window_selection": {
             "strategy": WINDOW_SELECTION_STRATEGY,
             "seed": int(cfg.data.window_seed),
+            "requested_window_count": int(cfg.data.num_train_windows),
+            "unique_window_count": unique_window_count,
+            "sampling_with_replacement": sampling_with_replacement,
             "selected_sha256": _sha256_array(np.asarray(selected, dtype=np.int64)),
         },
+        "requested_window_count": int(cfg.data.num_train_windows),
+        "unique_window_count": unique_window_count,
+        "sampling_with_replacement": sampling_with_replacement,
     }
     writer = FeatureCacheV2Writer(output_path, metadata)
     completed = 0

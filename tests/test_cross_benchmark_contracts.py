@@ -241,21 +241,26 @@ class CrossBenchmarkContractTest(unittest.TestCase):
                 Source(), 3, 2, segment_code=2
             )
             self.assertEqual(reach, [(0, 0), (0, 1), (0, 2), (0, 3)])
-            self.assertEqual(place, [(0, 12), (0, 13), (0, 14), (0, 15)])
+            self.assertEqual(
+                place, [(0, 12), (0, 13), (0, 14), (0, 15), (0, 16)]
+            )
             benchmark = RoboCasaBenchmark(
                 OmegaConf.create(
                     {
                         "suite": {"name": "cross_backend_adapter_v1"},
                         "planning": {"subtask": "reach"},
+                        "data": {"num_train_windows": 6},
                     }
                 )
             )
             selected = benchmark.select_windows(reach, np.asarray([0]), 4, 42)
             self.assertEqual(len(selected), len(set(selected)))
-            with self.assertRaisesRegex(
-                RuntimeError, "requested=5, available_unique=4"
-            ):
-                benchmark.select_windows(reach, np.asarray([0]), 5, 42)
+            offline = benchmark.select_windows(reach, np.asarray([0]), 5, 42)
+            self.assertEqual(len(offline), 4)
+            self.assertEqual(len(offline), len(set(offline)))
+            training = benchmark.select_windows(reach, np.asarray([0]), 6, 42)
+            self.assertEqual(len(training), 6)
+            self.assertEqual(len(set(training)), 4)
 
     def test_cross_backend_matrix_and_method_contract(self) -> None:
         root = Path(__file__).resolve().parents[1]

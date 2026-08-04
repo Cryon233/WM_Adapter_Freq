@@ -174,7 +174,11 @@ class RoboCasaWindowDataset(Dataset[dict[str, Tensor]]):
         candidates: list[tuple[int, int]] = []
         for episode in range(len(source_dataset)):
             length = int(source_dataset.get_seq_length(episode))
-            latest_start = length - num_frames * frameskip
+            latest_start = (
+                length - num_frames * frameskip
+                if segment_code is None
+                else length - 1 - (num_frames - 1) * frameskip
+            )
             if latest_start < 0:
                 continue
             starts = range(latest_start + 1)

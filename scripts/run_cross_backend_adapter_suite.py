@@ -109,17 +109,39 @@ def _validate_cache(job: JobSpec) -> dict[str, Any]:
             "backend": str(handle.attrs.get("backend", "")),
             "task": str(handle.attrs.get("task_key", "")),
             "windows": int(handle[V2_FIRST_KEY].shape[0]),
+            "requested_windows": int(handle.attrs.get("requested_window_count", -1)),
+            "unique_windows": int(handle.attrs.get("unique_window_count", -1)),
+            "sampling_with_replacement": bool(
+                handle.attrs.get("sampling_with_replacement", False)
+            ),
         }
     expected = {
         "schema": CACHE_SCHEMA_VERSION_V2,
         "backend": str(job.backend),
         "task": job.task,
         "windows": int(job.required_count or 0),
+        "requested_windows": int(job.required_count or 0),
     }
-    if actual != expected:
-        raise RuntimeError(
-            f"Cross-backend cache contract mismatch: expected={expected}, actual={actual}"
+    scalar_actual = {
+        key: actual[key]
+        for key in (
+            "schema",
+            "backend",
+            "task",
+            "windows",
+            "requested_windows",
         )
+    }
+    if scalar_actual != expected:
+        raise RuntimeError(
+            f"Cross-backend cache contract mismatch: expected={expected}, actual={scalar_actual}"
+        )
+    if not 0 < actual["unique_windows"] <= actual["windows"]:
+        raise RuntimeError(f"Cross-backend cache unique-window count is invalid: {actual}")
+    if actual["sampling_with_replacement"] != (
+        actual["unique_windows"] < actual["windows"]
+    ):
+        raise RuntimeError(f"Cross-backend cache replacement metadata is inconsistent: {actual}")
     return {**verified, **actual, "path": str(resolve_path(job.artifact_path))}
 
 
@@ -192,7 +214,7 @@ def _validate_offline(state: dict[str, Any], job: JobSpec) -> dict[str, Any]:
         "task": job.task,
         "method": str(job.method),
         "training_seed": expected_seed,
-        "window_count": int(job.required_count or 0),
+        "requested_window_count": int(job.required_count or 0),
         "cache_fingerprint": str(cache["cache_fingerprint"]),
         "cache_file_sha256": str(cache["cache_file_sha256"]),
     }
@@ -200,6 +222,22 @@ def _validate_offline(state: dict[str, Any], job: JobSpec) -> dict[str, Any]:
     if actual != expected:
         raise RuntimeError(
             f"Cross-backend offline contract mismatch: expected={expected}, actual={actual}"
+        )
+    actual_windows = int(payload.get("window_count", -1))
+    unique_windows = int(payload.get("unique_window_count", -1))
+    replacement = bool(payload.get("sampling_with_replacement", True))
+    allow_fewer = job.task in {"robocasa_reach", "robocasa_place"}
+    if (
+        actual_windows <= 0
+        or actual_windows > int(job.required_count or 0)
+        or unique_windows != actual_windows
+        or replacement
+        or (not allow_fewer and actual_windows != int(job.required_count or 0))
+    ):
+        raise RuntimeError(
+            "Cross-backend Offline unique-window contract mismatch: "
+            f"requested={job.required_count}, actual={actual_windows}, "
+            f"unique={unique_windows}, sampling_with_replacement={replacement}"
         )
     required_metrics = {
         "h1_autoregressive_latent_mse",
@@ -220,6 +258,9 @@ def _validate_offline(state: dict[str, Any], job: JobSpec) -> dict[str, Any]:
     return {
         "path": str(resolve_path(job.artifact_path)),
         "sha256": sha256_file(job.artifact_path),
+        "window_count": actual_windows,
+        "unique_window_count": unique_windows,
+        "sampling_with_replacement": replacement,
         **expected,
     }
 

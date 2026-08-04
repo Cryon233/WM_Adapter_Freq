@@ -282,11 +282,25 @@ def main() -> None:
         int(cfg.offline.num_windows),
         offline_seed,
     )
-    if len(selected) != int(cfg.offline.num_windows):
+    unique_window_count = len(set(selected))
+    if unique_window_count != len(selected):
+        raise RuntimeError(
+            "Offline evaluation selected duplicate physical windows: "
+            f"selected={len(selected)}, unique={unique_window_count}"
+        )
+    allow_available_unique = (
+        str(cfg.get("suite", {}).get("name", ""))
+        == "cross_backend_adapter_v1"
+        and resolved_task.benchmark == "robocasa"
+        and str(cfg.planning.get("subtask", "")) in {"reach", "place"}
+    )
+    if len(selected) != int(cfg.offline.num_windows) and not allow_available_unique:
         raise RuntimeError(
             f"Offline evaluation requested {cfg.offline.num_windows} held-out windows, "
             f"but selected {len(selected)}"
         )
+    if not selected:
+        raise RuntimeError("Offline evaluation has no eligible unique windows")
     negative_count = int(cfg.offline.get("negative_actions", 0))
     action_bank: list[tuple[int, Tensor]] = []
     if negative_count:
@@ -571,7 +585,10 @@ def main() -> None:
         "goal_encoder": "frozen_base",
         "loss_name": str(cfg.training.get("loss_name", "legacy_canonical_dynamics")),
         "task": resolved_task.task_key,
+        "requested_window_count": int(cfg.offline.num_windows),
         "window_count": len(selected),
+        "unique_window_count": unique_window_count,
+        "sampling_with_replacement": False,
         "window_identities": [list(pair) for pair in selected],
         "episode_partition": "eval",
         "action_shuffle": (
