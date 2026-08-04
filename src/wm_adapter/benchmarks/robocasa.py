@@ -720,9 +720,20 @@ class RoboCasaBenchmark(BenchmarkAdapter):
     ) -> dict[str, Any]:
         source = self.build_source_dataset(output_environment_info=True)
         _, evaluation = self.split_trajectory_ids(source)
-        goal_span = int(self.cfg.evaluation.goal_span_steps)
+        configured_goal_span = self.cfg.evaluation.get("goal_span_steps")
+        goal_span = (
+            int(configured_goal_span)
+            if configured_goal_span is not None
+            else 0
+        )
         subtask = self.cfg.planning.get("subtask")
-        if task.task_key == "robocasa_place" and str(subtask) == "place":
+        official_segment_codes = {"reach": 0, "place": 2}
+        if str(subtask) in official_segment_codes and task.task_key in {
+            "robocasa_reach",
+            "robocasa_place",
+        }:
+            subtask_name = str(subtask)
+            segment_code = official_segment_codes[subtask_name]
             generator = torch.Generator(device="cpu").manual_seed(seed)
             instances: list[EvaluationInstance] = []
             for position in range(count):
@@ -736,7 +747,9 @@ class RoboCasaBenchmark(BenchmarkAdapter):
                     )
                     trajectory = int(evaluation[subset_index])
                     try:
-                        result = source.__getitem__(trajectory, subtask="place")
+                        result = source.__getitem__(
+                            trajectory, subtask=subtask_name
+                        )
                     except ValueError as error:
                         errors.append(str(error))
                         continue
@@ -744,14 +757,14 @@ class RoboCasaBenchmark(BenchmarkAdapter):
                     break
                 if selected is None:
                     raise RuntimeError(
-                        "RoboCasa Place compatibility manifest could not reproduce "
+                        f"RoboCasa {subtask_name} compatibility manifest could not reproduce "
                         f"the pinned evaluator sampling after 100 attempts: {errors[-3:]}"
                     )
                 trajectory, result = selected
                 observation, _, states, _, trajectory_info = result
                 if states is None:
                     raise RuntimeError(
-                        f"RoboCasa Place trajectory {trajectory} returned no simulator state"
+                        f"RoboCasa {subtask_name} trajectory {trajectory} returned no simulator state"
                     )
                 trajectory_path = Path(str(trajectory_info["file_path"]))
                 with h5py.File(trajectory_path, "r") as handle:
@@ -759,18 +772,19 @@ class RoboCasaBenchmark(BenchmarkAdapter):
                     segments = np.asarray(
                         group["meta_data_info/current_task_segment"]
                     )
-                frame_indices = np.flatnonzero(segments == 2)
+                frame_indices = np.flatnonzero(segments == segment_code)
                 if frame_indices.size == 0 or not np.array_equal(
                     frame_indices,
                     np.arange(frame_indices[0], frame_indices[-1] + 1),
                 ):
                     raise RuntimeError(
-                        "RoboCasa Place compatibility requires one contiguous place "
-                        f"segment: trajectory={trajectory}, indices={frame_indices.tolist()}"
+                        f"RoboCasa {subtask_name} compatibility requires one contiguous "
+                        f"segment code {segment_code}: trajectory={trajectory}, "
+                        f"indices={frame_indices.tolist()}"
                     )
                 if int(observation["visual"].shape[0]) != int(frame_indices.size):
                     raise RuntimeError(
-                        f"RoboCasa Place filtered length mismatch for trajectory {trajectory}"
+                        f"RoboCasa {subtask_name} filtered length mismatch for trajectory {trajectory}"
                     )
                 source_id = str(trajectory_info.get("demo_key", trajectory))
                 identity = {
@@ -810,7 +824,9 @@ class RoboCasaBenchmark(BenchmarkAdapter):
                     "trajectory stream; repeated trajectories are clustered."
                     ),
                     "cem_seed_mode": "continuous_generator_stream",
-                    "legacy_place_reuse_compatible": True,
+                    "legacy_place_reuse_compatible": subtask_name == "place",
+                    "official_subtask": subtask_name,
+                    "official_subtask_segment_code": segment_code,
                 },
             )
         primary_candidates: list[tuple[int, int, int]] = []

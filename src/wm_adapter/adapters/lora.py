@@ -74,11 +74,11 @@ class LastBlockAttentionLoRA(PEFTMethod):
         attention = backend.last_block.attn
         if not hasattr(attention, "qkv"):
             raise TypeError(
-                f"DINOv3 last-block attention has no fused qkv projection: {type(attention).__name__}"
+                f"Visual encoder last-block attention has no fused qkv projection: {type(attention).__name__}"
             )
         if isinstance(attention.qkv, FusedQKVLoRA):
             if attention.qkv is not self.qkv_lora:
-                raise RuntimeError("The DINOv3 last block is already attached to another LoRA method")
+                raise RuntimeError("The visual encoder last block is already attached to another LoRA method")
             return
         original_qkv = attention.qkv
         qkv_lora = FusedQKVLoRA(original_qkv, self.embed_dim, self.rank, self.alpha)
@@ -118,7 +118,7 @@ class LastBlockAttentionLoRA(PEFTMethod):
 
     def trainable_parameters(self) -> Iterable[nn.Parameter]:
         if self.qkv_lora is None:
-            raise RuntimeError("LoRA must be attached to the JEPA-WM backend before use")
+            raise RuntimeError("LoRA must be attached to a supported world-model backend before use")
         return (
             parameter
             for name, parameter in self.qkv_lora.named_parameters()

@@ -18,7 +18,22 @@ class DinoEncoder(nn.Module):
         super().__init__()
         self.name = name
         if self.name.startswith("dinov2"):
-            self.base_model = torch.hub.load("facebookresearch/dinov2", name)
+            dinov2_path = os.environ.get("JEPAWM_DINOV2_HOME")
+            dinov2_weights = os.environ.get("JEPAWM_DINOV2_WEIGHTS")
+            if dinov2_path:
+                if not dinov2_weights:
+                    raise RuntimeError(
+                        "JEPAWM_DINOV2_WEIGHTS must point to the local DINOv2 "
+                        "ViT-S/14 checkpoint when JEPAWM_DINOV2_HOME is set"
+                    )
+                self.base_model = torch.hub.load(
+                    dinov2_path,
+                    name,
+                    source="local",
+                    weights=dinov2_weights,
+                )
+            else:
+                self.base_model = torch.hub.load("facebookresearch/dinov2", name)
         elif self.name.startswith("dinov3"):
             pretrained_ckpt_root = os.environ.get("JEPAWM_OSSCKPT")
             dinov3_path = os.path.join(os.environ.get("JEPAWM_HOME", os.path.expanduser("~")), "dinov3")

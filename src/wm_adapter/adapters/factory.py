@@ -29,6 +29,16 @@ def build_method(
     declared_name = str(values.pop("name", method_name))
     if declared_name != method_name:
         raise ValueError(f"Requested method {method_name!r}, but config declares {declared_name!r}")
+    backend_name = str(getattr(backend, "backend_name", "jepa_wm_droid"))
+    if backend_name == "dino_wm_droid" and method_name in {
+        "dct_adapter",
+        "token_mlp",
+    }:
+        raise ValueError(
+            f"Method {method_name!r} is not supported by backend "
+            "'dino_wm_droid'; supported methods are base, lora, hfra, "
+            "and hfra_core_only"
+        )
     if method_name == "base":
         method: PEFTMethod = BaseMethod()
     elif method_name == "dct_adapter":

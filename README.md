@@ -360,3 +360,44 @@ One-shot status: `bash scripts/run_cross_benchmark_v2.sh --status`
 Explicit stop: `bash scripts/run_cross_benchmark_v2.sh --stop`
 
 The generic v1 entry remains available as `bash scripts/run_cross_benchmark_suite.sh --config configs/experiment/cross_benchmark_v1.yaml`. The Dashboard derives its title, protocol, phase list, state path, and job counts from the selected suite and parses structured cache, optimizer-step, offline, and planning progress while retaining legacy v1 log parsing.
+
+# Active cross-backend adapter suite (`cross_backend_adapter_v1`)
+
+`cross_backend_adapter_v1` supersedes `cross_benchmark_v1` and
+`cross_benchmark_v2` for new experiments. Those older suites and all of their
+artifacts are retained as read-only legacy records; in particular,
+`robocasa_articulated` is excluded from the active task matrix. See
+`docs/legacy_experiment_suites.md`.
+
+The active tasks are RoboCasa Reach, RoboCasa Place, LIBERO Spatial task 0, and
+LIBERO Goal task 0. The official JEPA-WM DROID backend compares Base, DCT
+Adapter, Token MLP, LoRA, and HFRA. The official DINO-WM DROID backend compares
+Base, LoRA, and HFRA. Each clean/OOD condition uses 20 paired episodes at
+training/evaluation seeds 42, 7, and 2026. Full HFRA is reused for the sole
+closed-loop ablation; only six additional JEPA-WM `hfra_core_only` OOD jobs are
+created. The formal graph therefore contains exactly 198 planning jobs and
+3,960 closed-loop episodes.
+
+DINO-WM is loaded from the pinned local JEPA-WMs implementation at commit
+`13cf1d9c7e476f53c17714d2e0f1dc239a883ce0`. Its official DINOv2 source checkout
+is pinned at `7764ea0f912e53c92e82eb78a2a1631e92725fc8`. Set
+`DINO_WM_DROID_CKPT` to the official `droid_dino-wm_noprop.pth.tar` and
+`DINOV2_VITS14_CKPT` to the official DINOv2 ViT-S/14 weights. Missing source or
+weights is a hard error; the backend never downloads weights or falls back to
+JEPA-WM.
+
+Lightweight graph check: `bash scripts/run_cross_backend_adapter_v1.sh --dry-run`
+
+Formal start: `bash scripts/run_cross_backend_adapter_v1.sh`
+
+Attach Dashboard: `bash scripts/run_cross_backend_adapter_v1.sh --attach`
+
+One-shot status: `bash scripts/run_cross_backend_adapter_v1.sh --status`
+
+Explicit stop: `bash scripts/run_cross_backend_adapter_v1.sh --stop`
+
+All active artifacts are isolated below
+`storage/feature_cache/cross_backend_adapter_v1/`,
+`checkpoints/cross_backend_adapter_v1/`, `outputs/cross_backend_adapter_v1/`,
+and `logs/cross_backend_adapter_v1/`. Cache identity includes backend and task;
+checkpoint and result identity additionally includes method and seed.

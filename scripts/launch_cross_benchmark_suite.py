@@ -17,6 +17,12 @@ from wm_adapter.utils.reproducibility import project_root, resolve_path
 DEFAULT_CONFIG = "configs/experiment/cross_benchmark_v2.yaml"
 
 
+def _runner_script(suite: Any) -> str:
+    if str(suite.suite_name) == "cross_backend_adapter_v1":
+        return "scripts/run_cross_backend_adapter_suite.py"
+    return "scripts/run_cross_benchmark_suite.py"
+
+
 def _args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Launch or attach to a cross-benchmark suite")
     parser.add_argument("--config", default=DEFAULT_CONFIG)
@@ -87,6 +93,12 @@ def main() -> None:
     args = _args()
     suite = load_suite_config(args.config)
     suite_name = str(suite.suite_name)
+    runner_script = _runner_script(suite)
+    if args.self_test and suite_name == "cross_backend_adapter_v1":
+        raise ValueError(
+            "cross_backend_adapter_v1 has no synthetic self-test lifecycle; "
+            "use --dry-run for its lightweight contract check"
+        )
     pid_path, state_path, runner_log = _paths(suite, args.self_test)
     if args.stop:
         result = terminate_suite(
@@ -110,7 +122,7 @@ def main() -> None:
     if args.dry_run:
         command = [
             sys.executable,
-            "scripts/run_cross_benchmark_suite.py",
+            runner_script,
             "--config",
             args.config,
             "--dry-run",
@@ -144,7 +156,7 @@ def main() -> None:
                 raise SystemExit(_monitor(state_path, args.config, once=False))
             raise RuntimeError(f"Stale or incomplete runner lock appeared concurrently: {pid_path}")
         command = [
-            sys.executable, "scripts/run_cross_benchmark_suite.py", "--config", args.config,
+            sys.executable, runner_script, "--config", args.config,
         ]
         if args.self_test:
             command.append("--self-test")

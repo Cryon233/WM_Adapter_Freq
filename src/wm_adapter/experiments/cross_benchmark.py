@@ -60,6 +60,7 @@ class JobSpec:
     log_path: str
     artifact_path: str
     kind: str
+    backend: str | None = None
     method: str | None = None
     domain: str | None = None
     seed: int | None = None

@@ -15,5 +15,11 @@ export ROBOCASA_OPEN_DRAWER_LEROBOT="/absolute/path/to/robocasa365/v1.0/pretrain
 # Optional official task-level HDF5 fallback:
 export ROBOCASA_OPEN_DRAWER_HDF5=""
 
+# cross_backend_adapter_v1 uses the official DINO-WM DROID predictor and the
+# DINOv2 ViT-S/14 visual checkpoint. Both files are supplied locally; the suite
+# never downloads model weights.
+export DINO_WM_DROID_CKPT="/absolute/path/to/droid_dino-wm_noprop.pth.tar"
+export DINOV2_VITS14_CKPT="/absolute/path/to/dinov2_vits14_pretrain.pth"
+
 # Camera dimensions and the action/controller transform are discovered from the
 # selected HDF5 and live official LIBERO environment; do not configure them here.

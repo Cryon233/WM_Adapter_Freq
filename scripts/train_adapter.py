@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader
 
 from wm_adapter.adapters.factory import build_method
 from wm_adapter.appearance.composed_photometric import ComposedPhotometricShift
+from wm_adapter.backends.factory import build_backend
 from wm_adapter.backends.jepa_wm_droid import JEPAWMDroidBackend
 from wm_adapter.data.feature_cache import FeatureCacheDataset
 from wm_adapter.data.feature_cache_v2 import (
@@ -23,15 +24,7 @@ from wm_adapter.utils.reproducibility import load_experiment_config, resolve_pat
 
 
 def _backend(cfg: Any) -> JEPAWMDroidBackend:
-    return JEPAWMDroidBackend(
-        third_party_root=cfg.model.third_party_root,
-        jepa_checkpoint=cfg.model.jepa_checkpoint,
-        dinov3_checkpoint=cfg.model.dinov3_checkpoint,
-        official_planning_config=cfg.model.official_planning_config,
-        device=cfg.device,
-        planning_tag=cfg.model.get("planning_tag"),
-        planning_subtask=cfg.model.get("planning_subtask"),
-    )
+    return build_backend(cfg.model, device=cfg.device)
 
 
 def _train_v2(cfg: Any, backend: JEPAWMDroidBackend, method: Any) -> None:
@@ -44,6 +37,22 @@ def _train_v2(cfg: Any, backend: JEPAWMDroidBackend, method: Any) -> None:
             cfg.cache.get("content_verification_chunk_windows", 8)
         ),
     )
+    cache_backend = str(dataset.metadata.get("backend", "jepa_wm_droid"))
+    if cache_backend != backend.backend_name:
+        raise RuntimeError(
+            "Training feature-cache backend mismatch: "
+            f"expected={backend.backend_name}, actual={cache_backend}, path={dataset.path}"
+        )
+    cache_encoder = str(
+        dataset.metadata.get(
+            "encoder_checkpoint_sha256",
+            dataset.metadata.get("dinov3_checkpoint_sha256", ""),
+        )
+    )
+    if cache_encoder != backend.encoder_checkpoint_sha256:
+        raise RuntimeError(
+            f"Training feature-cache visual-encoder fingerprint mismatch: {dataset.path}"
+        )
     expected_cache_file_sha256 = cache_file_sha256_from_verified_state_v2(
         dataset.path,
         expected_sha256=cfg.cache.get("expected_file_sha256"),

@@ -155,7 +155,7 @@ class HybridFourierResidualAdapter(PEFTMethod):
         super().__init__()
         if num_encoder_blocks < 2:
             raise ValueError(
-                "HFRA requires at least two DINOv3 blocks, "
+                "HFRA requires at least two visual-transformer blocks, "
                 f"received {num_encoder_blocks}"
             )
         if method_name not in {"hfra", "hfra_core_only"}:

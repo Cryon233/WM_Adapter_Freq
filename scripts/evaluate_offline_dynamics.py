@@ -17,6 +17,7 @@ from tqdm import tqdm
 from wm_adapter.adapters.base import BaseMethod, PEFTMethod
 from wm_adapter.adapters.factory import build_method
 from wm_adapter.appearance.composed_photometric import ComposedPhotometricShift
+from wm_adapter.backends.factory import build_backend
 from wm_adapter.backends.jepa_wm_droid import JEPAWMDroidBackend
 from wm_adapter.backends.frozen_projection import frozen_base_projection
 from wm_adapter.benchmarks.factory import build_benchmark
@@ -46,15 +47,7 @@ def _atomic_json(path: Path, payload: Any) -> None:
 
 
 def _backend(cfg: Any) -> JEPAWMDroidBackend:
-    return JEPAWMDroidBackend(
-        third_party_root=cfg.model.third_party_root,
-        jepa_checkpoint=cfg.model.jepa_checkpoint,
-        dinov3_checkpoint=cfg.model.dinov3_checkpoint,
-        official_planning_config=cfg.model.official_planning_config,
-        device=cfg.device,
-        planning_tag=cfg.model.get("planning_tag"),
-        planning_subtask=cfg.model.get("planning_subtask"),
-    )
+    return build_backend(cfg.model, device=cfg.device)
 
 
 def _load_method(
@@ -73,6 +66,21 @@ def _load_method(
             f"cache-file integrity contract: {checkpoint_path}"
         )
     checkpoint_v2 = checkpoint.get("schema_version") == CHECKPOINT_SCHEMA_V2
+    checkpoint_backend = str(checkpoint.get("backend", "jepa_wm_droid"))
+    if checkpoint_backend != backend.backend_name:
+        raise RuntimeError(
+            "Offline checkpoint backend mismatch: "
+            f"expected={backend.backend_name}, actual={checkpoint_backend}, "
+            f"path={checkpoint_path}"
+        )
+    checkpoint_encoder = checkpoint.get(
+        "encoder_checkpoint_sha256",
+        checkpoint.get("dinov3_checkpoint_sha256"),
+    )
+    if checkpoint_encoder != backend.encoder_checkpoint_sha256:
+        raise RuntimeError(
+            f"Offline checkpoint visual-encoder fingerprint mismatch: {checkpoint_path}"
+        )
     data_metadata = dict(checkpoint.get("data_metadata", {}))
     actual_identity = (
         str(data_metadata.get("benchmark", "")),
@@ -97,6 +105,10 @@ def _load_method(
         "method_config": method.config_dict(),
         "base_checkpoint_sha256": backend.base_checkpoint_sha256,
         "dinov3_checkpoint_sha256": backend.dinov3_checkpoint_sha256,
+        "backend": backend.backend_name,
+        "encoder_checkpoint_sha256": backend.encoder_checkpoint_sha256,
+        "encoder_name": backend.encoder_name,
+        "predictor_depth": backend.predictor_depth,
         "upstream_commits": backend.upstream_commits,
     }
     if not checkpoint_v2:
@@ -192,6 +204,8 @@ def _action_shuffle_permutation(shuffle_seed: int) -> Tensor:
 
 def main() -> None:
     cfg = load_experiment_config()
+    metric_profile = str(cfg.offline.get("metric_profile", "legacy_dynamics"))
+    standard_cross_backend = metric_profile == "cross_backend_mse_v1"
     offline_seed = int(cfg.offline.get("seed", cfg.evaluation.eval_seed))
     shuffle_seed = int(cfg.offline.get("shuffle_seed", offline_seed + 100003))
     shuffle_permutation = _action_shuffle_permutation(shuffle_seed)
@@ -356,10 +370,11 @@ def main() -> None:
             batch_size = clean.shape[0]
             actions = batch["actions"].to(backend.device, non_blocking=True).float()
             rollout_actions = actions[:, 2:5]
-            shuffled_rollout_actions = rollout_actions.index_select(
-                1, shuffle_permutation.to(device=actions.device)
-            )
-            zero_rollout_actions = torch.zeros_like(rollout_actions)
+            if not standard_cross_backend:
+                shuffled_rollout_actions = rollout_actions.index_select(
+                    1, shuffle_permutation.to(device=actions.device)
+                )
+                zero_rollout_actions = torch.zeros_like(rollout_actions)
             with frozen_base_projection(backend), autocast():
                 clean_latent = backend.encode_images(
                     clean, base_method, batch_size, num_frames
@@ -372,9 +387,44 @@ def main() -> None:
                         images[:, :3], method, batch_size, 3
                     )
                     canonical = _sample_mse(adapted_context, clean_latent[:, :3])
-                    per_step = _rollout_errors(
-                        backend, adapted_context, clean_target, rollout_actions
+                    predicted_future = backend.differentiable_unroll(
+                        adapted_context, rollout_actions
                     )
+                    per_step = torch.stack(
+                        [
+                            _sample_mse(
+                                predicted_future[:, index],
+                                clean_target[:, index],
+                            )
+                            for index in range(3)
+                        ],
+                        dim=1,
+                    )
+                terminal_h1, terminal_h2, terminal_h3 = per_step.unbind(dim=1)
+                mean_h1 = terminal_h1
+                mean_h2 = per_step[:, :2].mean(dim=1)
+                mean_h3 = per_step.mean(dim=1)
+                if standard_cross_backend:
+                    predicted_trajectory = torch.cat(
+                        (
+                            adapted_context.float(),
+                            predicted_future.float(),
+                        ),
+                        dim=1,
+                    )
+                    trajectory_target = clean_latent[:, :6].float()
+                    trajectory_mse = _sample_mse(
+                        predicted_trajectory, trajectory_target
+                    )
+                    tensors = {
+                        "h1_autoregressive_latent_mse": terminal_h1,
+                        "h2_autoregressive_latent_mse": terminal_h2,
+                        "h3_autoregressive_latent_mse": terminal_h3,
+                        "future_mean_mse": per_step.mean(dim=1),
+                        "terminal_mse": terminal_h3,
+                        "unified_6frame_trajectory_mse": trajectory_mse,
+                    }
+                else:
                     shuffled_steps = _rollout_errors(
                         backend,
                         adapted_context,
@@ -382,15 +432,14 @@ def main() -> None:
                         shuffled_rollout_actions,
                     )
                     zero_steps = _rollout_errors(
-                        backend, adapted_context, clean_target, zero_rollout_actions
+                        backend,
+                        adapted_context,
+                        clean_target,
+                        zero_rollout_actions,
                     )
-                terminal_h1, terminal_h2, terminal_h3 = per_step.unbind(dim=1)
-                mean_h1 = terminal_h1
-                mean_h2 = per_step[:, :2].mean(dim=1)
-                mean_h3 = per_step.mean(dim=1)
-                shuffled = shuffled_steps.mean(dim=1)
-                zero = zero_steps.mean(dim=1)
-                tensors = {
+                    shuffled = shuffled_steps.mean(dim=1)
+                    zero = zero_steps.mean(dim=1)
+                    tensors = {
                     "canonical_mse": canonical,
                     "terminal_h1_mse": terminal_h1,
                     "terminal_h2_mse": terminal_h2,
@@ -408,7 +457,7 @@ def main() -> None:
                     "zero_action_mse": zero,
                     "action_shuffle_gap": shuffled - mean_h3,
                     "zero_action_gap": zero - mean_h3,
-                }
+                    }
                 if negative_count:
                     ranks: list[Tensor] = []
                     negative_means: list[Tensor] = []
@@ -481,7 +530,11 @@ def main() -> None:
         domain: {key: value / counts[domain] for key, value in totals[domain].items()}
         for domain in domains
     }
-    if "clean" in domain_metrics and "ood" in domain_metrics:
+    if (
+        not standard_cross_backend
+        and "clean" in domain_metrics
+        and "ood" in domain_metrics
+    ):
         clean_mse = domain_metrics["clean"]["mean_through_h3_mse"]
         domain_metrics["ood"]["ood_clean_degradation_ratio"] = (
             domain_metrics["ood"]["mean_through_h3_mse"] / clean_mse
@@ -490,11 +543,14 @@ def main() -> None:
         )
     metrics = {
         "schema_version": (
-            "jepa_wm_offline_metrics_v2"
+            "cross_backend_offline_mse_v1"
+            if standard_cross_backend
+            else "jepa_wm_offline_metrics_v2"
             if str(cfg.training.get("loss_name", "")) == "unified_trajectory_mse"
             else "jepa_wm_offline_metrics_v1"
         ),
         "benchmark": resolved_task.benchmark,
+        "backend": backend.backend_name,
         "benchmark_suite": resolved_task.suite,
         "task_id": resolved_task.task_id,
         "task_name": resolved_task.task_name,
@@ -508,17 +564,25 @@ def main() -> None:
         "action_convention": resolved_task.action_convention,
         "action_transform": resolved_task.action_transform,
         "method": method.method_name,
+        "training_seed": (
+            None if method.method_name == "base" else int(cfg.training.seed)
+        ),
+        "metric_profile": metric_profile,
         "goal_encoder": "frozen_base",
         "loss_name": str(cfg.training.get("loss_name", "legacy_canonical_dynamics")),
         "task": resolved_task.task_key,
         "window_count": len(selected),
         "window_identities": [list(pair) for pair in selected],
         "episode_partition": "eval",
-        "action_shuffle": {
-            "seed": shuffle_seed,
-            "suffix_source_indices": [2, 3, 4],
-            "permutation": shuffle_permutation.tolist(),
-        },
+        "action_shuffle": (
+            None
+            if standard_cross_backend
+            else {
+                "seed": shuffle_seed,
+                "suffix_source_indices": [2, 3, 4],
+                "permutation": shuffle_permutation.tolist(),
+            }
+        ),
         "cross_episode_action_negatives": negative_count,
         "domains": domain_metrics,
         "method_parameter_count": method.parameter_count(),
@@ -535,6 +599,9 @@ def main() -> None:
         "cache_file_sha256": cache_file_sha256,
         "base_checkpoint_sha256": backend.base_checkpoint_sha256,
         "dinov3_checkpoint_sha256": backend.dinov3_checkpoint_sha256,
+        "encoder_checkpoint_sha256": backend.encoder_checkpoint_sha256,
+        "encoder_name": backend.encoder_name,
+        "predictor_depth": backend.predictor_depth,
         "upstream_commits": backend.upstream_commits,
         "task_upstream_commits": resolved_task.upstream_commits,
         "appearance": ComposedPhotometricShift.metadata(

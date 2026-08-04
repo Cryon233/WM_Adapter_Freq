@@ -52,6 +52,7 @@ class JEPAWMDroidBackend(nn.Module):
         planning_subtask: str | None = None,
     ) -> None:
         super().__init__()
+        self.backend_name = "jepa_wm_droid"
         self.device = torch.device(device)
         self.third_party_root = resolve_path(third_party_root)
         self.upstream_commits = verify_upstream_commits(self.third_party_root)
@@ -165,6 +166,9 @@ class JEPAWMDroidBackend(nn.Module):
         self._token_layout: TokenLayout | None = None
         self.base_checkpoint_sha256 = sha256_file(self.jepa_checkpoint)
         self.dinov3_checkpoint_sha256 = sha256_file(self.dinov3_checkpoint)
+        self.encoder_checkpoint_sha256 = self.dinov3_checkpoint_sha256
+        self.encoder_name = "dinov3_vitl16"
+        self.predictor_depth = int(model_config["predictor"]["pred_depth"])
         self._validate_checkpoint_parameters()
         self.requires_grad_(False)
         self.eval()

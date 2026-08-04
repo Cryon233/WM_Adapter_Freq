@@ -12,6 +12,7 @@ from tqdm import tqdm
 
 from wm_adapter.adapters.base import BaseMethod
 from wm_adapter.appearance.composed_photometric import ComposedPhotometricShift
+from wm_adapter.backends.factory import build_backend
 from wm_adapter.backends.jepa_wm_droid import JEPAWMDroidBackend
 from wm_adapter.benchmarks.base import (
     EPISODE_SPLIT_STRATEGY,
@@ -31,15 +32,7 @@ def _sha256_array(array: np.ndarray) -> str:
 
 
 def _backend(cfg: Any) -> JEPAWMDroidBackend:
-    return JEPAWMDroidBackend(
-        third_party_root=cfg.model.third_party_root,
-        jepa_checkpoint=cfg.model.jepa_checkpoint,
-        dinov3_checkpoint=cfg.model.dinov3_checkpoint,
-        official_planning_config=cfg.model.official_planning_config,
-        device=cfg.device,
-        planning_tag=cfg.model.get("planning_tag"),
-        planning_subtask=cfg.model.get("planning_subtask"),
-    )
+    return build_backend(cfg.model, device=cfg.device)
 
 
 @torch.no_grad()
@@ -216,7 +209,7 @@ def _build_v1(cfg: Any) -> None:
         "source_channel_order": resolved_task.camera_channel_order,
     }
     metadata = {
-        "backend": "jepa_wm_droid",
+        "backend": backend.backend_name,
         "benchmark": resolved_task.benchmark,
         "benchmark_suite": resolved_task.suite,
         "task_id": resolved_task.task_id,
@@ -256,6 +249,9 @@ def _build_v1(cfg: Any) -> None:
         },
         "base_checkpoint_sha256": backend.base_checkpoint_sha256,
         "dinov3_checkpoint_sha256": backend.dinov3_checkpoint_sha256,
+        "encoder_checkpoint_sha256": backend.encoder_checkpoint_sha256,
+        "encoder_name": backend.encoder_name,
+        "predictor_depth": backend.predictor_depth,
         "upstream_commits": backend.upstream_commits,
         "task_upstream_commits": resolved_task.upstream_commits,
         "appearance_metadata": appearance_metadata,
@@ -423,7 +419,7 @@ def _build_v2(cfg: Any) -> None:
             f"task={resolved_task.task_key}, dataset={resolved_task.dataset_path}"
         )
     metadata = {
-        "backend": "jepa_wm_droid",
+        "backend": backend.backend_name,
         "benchmark": resolved_task.benchmark,
         "benchmark_suite": resolved_task.suite,
         "task_id": resolved_task.task_id,
@@ -436,6 +432,9 @@ def _build_v2(cfg: Any) -> None:
         "dataset_revision": resolved_task.dataset_revision,
         "base_checkpoint_sha256": backend.base_checkpoint_sha256,
         "dinov3_checkpoint_sha256": backend.dinov3_checkpoint_sha256,
+        "encoder_checkpoint_sha256": backend.encoder_checkpoint_sha256,
+        "encoder_name": backend.encoder_name,
+        "predictor_depth": backend.predictor_depth,
         "upstream_commits": backend.upstream_commits,
         "middle_site_index": middle_site,
         "late_site_index": late_site,

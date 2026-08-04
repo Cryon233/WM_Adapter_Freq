@@ -8,7 +8,7 @@ from omegaconf import OmegaConf
 
 from wm_adapter.adapters.factory import build_method
 from wm_adapter.appearance.composed_photometric import ComposedPhotometricShift
-from wm_adapter.backends.jepa_wm_droid import JEPAWMDroidBackend
+from wm_adapter.backends.factory import build_backend
 from wm_adapter.benchmarks.factory import build_benchmark
 from wm_adapter.data.feature_cache import CACHE_SCHEMA_VERSION
 from wm_adapter.data.feature_cache_v2 import (
@@ -30,16 +30,8 @@ from wm_adapter.utils.checkpoints import load_method_checkpoint, sha256_file
 from wm_adapter.utils.reproducibility import load_experiment_config, resolve_path, seed_everything
 
 
-def _backend(cfg: Any) -> JEPAWMDroidBackend:
-    return JEPAWMDroidBackend(
-        third_party_root=cfg.model.third_party_root,
-        jepa_checkpoint=cfg.model.jepa_checkpoint,
-        dinov3_checkpoint=cfg.model.dinov3_checkpoint,
-        official_planning_config=cfg.model.official_planning_config,
-        device=cfg.device,
-        planning_tag=cfg.model.get("planning_tag"),
-        planning_subtask=cfg.model.get("planning_subtask"),
-    )
+def _backend(cfg: Any) -> Any:
+    return build_backend(cfg.model, device=cfg.device)
 
 
 def main() -> None:
@@ -73,6 +65,21 @@ def main() -> None:
                 f"integrity contract: {checkpoint_path}"
             )
         checkpoint_v2 = checkpoint.get("schema_version") == CHECKPOINT_SCHEMA_V2
+        checkpoint_backend = str(checkpoint.get("backend", "jepa_wm_droid"))
+        if checkpoint_backend != backend.backend_name:
+            raise RuntimeError(
+                "Method checkpoint backend mismatch: "
+                f"expected={backend.backend_name}, actual={checkpoint_backend}, "
+                f"path={checkpoint_path}"
+            )
+        checkpoint_encoder = checkpoint.get(
+            "encoder_checkpoint_sha256",
+            checkpoint.get("dinov3_checkpoint_sha256"),
+        )
+        if checkpoint_encoder != backend.encoder_checkpoint_sha256:
+            raise RuntimeError(
+                f"Method checkpoint visual-encoder fingerprint mismatch: {checkpoint_path}"
+            )
         if checkpoint["method_name"] != method_name:
             raise RuntimeError(
                 f"Method checkpoint is for {checkpoint['method_name']!r}, requested {method_name!r}: {checkpoint_path}"
@@ -199,6 +206,22 @@ def main() -> None:
     with h5py.File(configured_cache, "r", libver="latest", swmr=True) as cache:
         cache_schema = str(cache.attrs.get("schema_version", ""))
         configured_cache_fingerprint = str(cache.attrs["cache_fingerprint"])
+        cache_backend = str(cache.attrs.get("backend", "jepa_wm_droid"))
+        cache_encoder_sha = str(
+            cache.attrs.get(
+                "encoder_checkpoint_sha256",
+                cache.attrs.get("dinov3_checkpoint_sha256", ""),
+            )
+        )
+    if cache_backend != backend.backend_name:
+        raise RuntimeError(
+            "Planning feature-cache backend mismatch: "
+            f"expected={backend.backend_name}, actual={cache_backend}, path={configured_cache}"
+        )
+    if cache_encoder_sha != backend.encoder_checkpoint_sha256:
+        raise RuntimeError(
+            f"Planning feature-cache visual-encoder fingerprint mismatch: {configured_cache}"
+        )
     cache_file_sha256 = (
         cache_file_sha256_from_verified_state_v2(
             configured_cache,
@@ -256,7 +279,7 @@ def main() -> None:
         if configured_run_directory
         else (
             resolve_path(cfg.output.root_dir)
-            / "jepa_wm_droid"
+            / backend.backend_name
             / resolved_task.benchmark
             / EVALUATION_PROTOCOL_DIRECTORY
             / task
@@ -305,7 +328,7 @@ def main() -> None:
         candidate_chunk_size=int(cfg.planning.candidate_chunk_size),
     )
     metadata = {
-        "backend": "jepa_wm_droid",
+        "backend": backend.backend_name,
         "benchmark": resolved_task.benchmark,
         "benchmark_suite": resolved_task.suite,
         "task_id": resolved_task.task_id,
@@ -332,6 +355,7 @@ def main() -> None:
         "number_of_episodes": result.total_episodes,
         "severity": float(cfg.appearance.severity),
         "seeds": {
+            "training": int(cfg.training.seed),
             "evaluation": int(cfg.evaluation.eval_seed),
             "appearance": int(cfg.appearance.seed),
             "cem": result.cem_seeds or [int(cfg.evaluation.eval_seed)],
@@ -348,6 +372,9 @@ def main() -> None:
         "method_parameter_count": method.parameter_count(),
         "base_checkpoint_sha256": backend.base_checkpoint_sha256,
         "dinov3_checkpoint_sha256": backend.dinov3_checkpoint_sha256,
+        "encoder_checkpoint_sha256": backend.encoder_checkpoint_sha256,
+        "encoder_name": backend.encoder_name,
+        "predictor_depth": backend.predictor_depth,
         "method_checkpoint_sha256": checkpoint_fingerprint,
         "cache_fingerprint": cache_fingerprint,
         "cache_file_sha256": cache_file_sha256,

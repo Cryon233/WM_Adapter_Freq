@@ -43,6 +43,17 @@ def _main_result(
 
 
 def build_job_graph(suite: Any, *, self_test: bool = False) -> list[JobSpec]:
+    if str(suite.suite_name) == "cross_backend_adapter_v1":
+        if self_test:
+            raise ValueError(
+                "cross_backend_adapter_v1 uses --dry-run rather than a synthetic "
+                "self-test graph"
+            )
+        from wm_adapter.experiments.cross_backend_jobs import (
+            build_cross_backend_job_graph,
+        )
+
+        return build_cross_backend_job_graph(suite)
     is_v2 = str(suite.suite_name) == "cross_benchmark_v2"
     ablation_phase = "HFRA ablations" if is_v2 else "DCT ablations"
     suite_config_path = str(

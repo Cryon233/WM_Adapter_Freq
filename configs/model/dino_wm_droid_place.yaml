@@ -1,0 +1,16 @@
+name: dino_wm_droid
+environment: droid_and_robocasa
+encoder: dinov2_vits14
+image_size: 224
+patch_size: 14
+predictor_depth: 6
+third_party_root: third_party
+dinov2_root: third_party/dinov2
+dino_wm_checkpoint: ${oc.env:DINO_WM_DROID_CKPT,''}
+dinov2_checkpoint: ${oc.env:DINOV2_VITS14_CKPT,''}
+official_planning_config: third_party/jepa-wms/configs/evals/simu_env_planning/rcasa_custom/dino-wm/reach_L2_cem_sourcedset_H3_nas1_maxnorm005_scaleact_repeat5_fskip5_max60_ctxt2_r224_alpha0_ep32_decode.yaml
+planning_tag: online_gc_zeroshot/place_L2_cem_sourcedset_H3_nas1_maxnorm005_scaleact_repeat5_fskip5_max60_ctxt2_r224_alpha0_ep32_decode/epoch-315-plan-only
+planning_subtask: place
+upstream_commits:
+  jepa-wms: 13cf1d9c7e476f53c17714d2e0f1dc239a883ce0
+  dinov2: 7764ea0f912e53c92e82eb78a2a1631e92725fc8

@@ -52,3 +52,7 @@ dist/
 *.pth.tar
 *.bin
 *.onnx
+
+# Independently pinned source checkout used only by the DINO-WM backend.  It is
+# synchronized to compute servers as a checkout, not vendored into this repo.
+/third_party/dinov2/

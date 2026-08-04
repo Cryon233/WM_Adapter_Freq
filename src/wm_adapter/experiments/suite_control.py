@@ -12,7 +12,10 @@ from wm_adapter.benchmarks.base import atomic_json
 from wm_adapter.utils.reproducibility import resolve_path
 
 
-RUNNER_COMMAND = "scripts/run_cross_benchmark_suite.py"
+RUNNER_COMMANDS = {
+    "cross_backend_adapter_v1.yaml": "scripts/run_cross_backend_adapter_suite.py",
+}
+DEFAULT_RUNNER_COMMAND = "scripts/run_cross_benchmark_suite.py"
 _TERMINAL_SUITE_STATES = {"completed", "completed_with_failures"}
 
 
@@ -156,6 +159,10 @@ def terminate_suite(
     pid_file = resolve_path(pid_path)
     state_file = resolve_path(state_path)
     target_config = resolve_path(suite_config_path)
+    expected_runner = RUNNER_COMMANDS.get(
+        target_config.name,
+        DEFAULT_RUNNER_COMMAND,
+    )
     pid = _read_pid(pid_file)
     if pid is None or not _process_alive(pid):
         removed = pid_file.exists()
@@ -181,10 +188,11 @@ def terminate_suite(
                 f"Runner pid={pid} exited during termination; stale PID cleaned",
             )
         raise
-    if not any(RUNNER_COMMAND in value for value in command):
+    if not any(expected_runner in value for value in command):
         raise RuntimeError(
             "Refusing to terminate a PID that is not the cross-benchmark runner: "
-            f"pid={pid}, command={command!r}, pid_file={pid_file}"
+            f"pid={pid}, expected_runner={expected_runner!r}, "
+            f"command={command!r}, pid_file={pid_file}"
         )
     command_is_self_test = "--self-test" in command
     if self_test is not None and command_is_self_test != self_test:

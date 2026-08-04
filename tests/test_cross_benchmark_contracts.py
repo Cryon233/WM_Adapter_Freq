@@ -39,6 +39,11 @@ from wm_adapter.experiments.cross_benchmark import (
     validate_task_manifest,
 )
 from wm_adapter.experiments.cross_jobs import build_job_graph
+from wm_adapter.experiments.cross_backend_jobs import (
+    build_cross_backend_job_graph,
+    cross_backend_rollout_counts,
+)
+from wm_adapter.adapters.factory import build_method
 from wm_adapter.adapters.hfra import (
     HFRACoreOnlyAdapter,
     HybridFourierResidualAdapter,
@@ -205,6 +210,32 @@ def _task(*, benchmark: str, transform: dict[str, object] | None) -> ResolvedTas
 
 
 class CrossBenchmarkContractTest(unittest.TestCase):
+    def test_cross_backend_matrix_and_method_contract(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        suite = load_suite_config(
+            root / "configs/experiment/cross_backend_adapter_v1.yaml"
+        )
+        jobs = build_cross_backend_job_graph(suite)
+        counts = cross_backend_rollout_counts(jobs)
+        self.assertEqual(
+            counts,
+            {
+                "planning_jobs": 198,
+                "closed_loop_episodes": 3960,
+                "main_planning_jobs": 192,
+                "core_only_planning_jobs": 6,
+            },
+        )
+        self.assertFalse(any(job.task == "robocasa_articulated" for job in jobs))
+        dino_backend = nn.Module()
+        dino_backend.backend_name = "dino_wm_droid"
+        with self.assertRaisesRegex(ValueError, "not supported"):
+            build_method("dct_adapter", dino_backend, {"name": "dct_adapter"})
+        self.assertEqual(
+            launcher_module._runner_script(suite),
+            "scripts/run_cross_backend_adapter_suite.py",
+        )
+
     def test_repeated_incomplete_artifacts_are_archived_without_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             artifact = Path(directory) / "protocol.json"
