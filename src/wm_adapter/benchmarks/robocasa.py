@@ -685,9 +685,52 @@ class RoboCasaBenchmark(BenchmarkAdapter):
         num_frames: int,
         frameskip: int,
     ) -> list[tuple[int, int]]:
+        segment_code: int | None = None
+        suite = self.cfg.get("suite", {})
+        if str(suite.get("name", "")) == "cross_backend_adapter_v1":
+            subtask = str(self.cfg.planning.get("subtask", ""))
+            segment_codes = {"reach": 0, "place": 2}
+            if subtask not in segment_codes:
+                raise ValueError(
+                    "cross_backend_adapter_v1 RoboCasa windows require planning.subtask "
+                    f"to be reach or place, received {subtask!r}"
+                )
+            segment_code = segment_codes[subtask]
         return RoboCasaWindowDataset.all_candidates(
-            source_dataset, num_frames, frameskip
+            source_dataset,
+            num_frames,
+            frameskip,
+            segment_code=segment_code,
         )
+
+    def select_windows(
+        self,
+        candidates: list[tuple[int, int]],
+        allowed_trajectories: np.ndarray,
+        max_windows: int,
+        seed: int,
+    ) -> list[tuple[int, int]]:
+        selected = super().select_windows(
+            candidates,
+            allowed_trajectories,
+            max_windows,
+            seed,
+        )
+        suite = self.cfg.get("suite", {})
+        if (
+            str(suite.get("name", "")) != "cross_backend_adapter_v1"
+            or len(selected) == max_windows
+        ):
+            return selected
+        if not selected:
+            raise RuntimeError(
+                "RoboCasa subtask filtering produced no windows in the requested "
+                f"trajectory partition: subtask={self.cfg.planning.get('subtask')!r}"
+            )
+        # The official PnPCounterTop release contains fewer unique per-subtask
+        # windows than the fixed paper budget. Cycle the deterministic balanced
+        # order so the configured 2000/200 window counts remain exact.
+        return [selected[index % len(selected)] for index in range(max_windows)]
 
     def make_window_dataset(
         self,

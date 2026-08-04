@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import h5py
 import numpy as np
 import torch
 from torch import Tensor
@@ -163,13 +164,55 @@ class RoboCasaWindowDataset(Dataset[dict[str, Tensor]]):
         self.appearance = ComposedPhotometricShift()
 
     @staticmethod
-    def all_candidates(source_dataset: Any, num_frames: int, frameskip: int) -> list[tuple[int, int]]:
+    def all_candidates(
+        source_dataset: Any,
+        num_frames: int,
+        frameskip: int,
+        *,
+        segment_code: int | None = None,
+    ) -> list[tuple[int, int]]:
         candidates: list[tuple[int, int]] = []
         for episode in range(len(source_dataset)):
             length = int(source_dataset.get_seq_length(episode))
             latest_start = length - num_frames * frameskip
-            if latest_start >= 0:
-                candidates.extend((episode, start) for start in range(latest_start + 1))
+            if latest_start < 0:
+                continue
+            starts = range(latest_start + 1)
+            if segment_code is None:
+                candidates.extend((episode, start) for start in starts)
+                continue
+
+            try:
+                trajectory = source_dataset.trajectories[episode]
+                file_path = Path(str(trajectory["file_path"])).resolve()
+                demo_key = str(trajectory["demo_key"])
+            except (AttributeError, IndexError, KeyError, TypeError) as error:
+                raise RuntimeError(
+                    "RoboCasa subtask window filtering requires HDF5 trajectory "
+                    f"metadata with file_path and demo_key: episode={episode}"
+                ) from error
+            with h5py.File(file_path, "r") as handle:
+                segment_path = (
+                    f"data/{demo_key}/meta_data_info/current_task_segment"
+                )
+                if segment_path not in handle:
+                    raise RuntimeError(
+                        "RoboCasa trajectory lacks the official subtask segment "
+                        f"dataset {segment_path}: file={file_path}"
+                    )
+                segments = np.asarray(handle[segment_path][:]).reshape(-1)
+            if int(segments.shape[0]) != length:
+                raise RuntimeError(
+                    "RoboCasa subtask segment length does not match the trajectory: "
+                    f"episode={episode}, segment_shape={tuple(segments.shape)}, "
+                    f"trajectory_length={length}, file={file_path}"
+                )
+            span = (num_frames - 1) * frameskip + 1
+            candidates.extend(
+                (episode, start)
+                for start in starts
+                if np.all(segments[start : start + span] == segment_code)
+            )
         return candidates
 
     def __len__(self) -> int:

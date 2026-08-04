@@ -222,9 +222,15 @@ class DinoWMDroidBackend(JEPAWMDroidBackend):
         self.encoder_checkpoint_sha256 = self.dinov2_checkpoint_sha256
         self.encoder_name = "dinov2_vits14"
         self.predictor_depth = int(predictor_config["pred_depth"])
+        dino_loader = self.jepa_repo / "app/plan_common/models/dino.py"
+        if not dino_loader.is_file():
+            raise FileNotFoundError(
+                f"Pinned JEPA-WMs DINO loader does not exist: {dino_loader}"
+            )
         self.upstream_commits = {
             **pinned_environment_commits,
             "dinov2": actual_dinov2_commit,
+            "jepa-wms-dino-loader-sha256": sha256_file(dino_loader),
         }
         self._validate_checkpoint_parameters()
         self.requires_grad_(False)

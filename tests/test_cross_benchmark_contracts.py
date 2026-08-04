@@ -54,6 +54,7 @@ from wm_adapter.data.feature_cache_v2 import (
     FeatureCacheV2Writer,
     verify_cache_content_v2,
 )
+from wm_adapter.data.robocasa_windows import RoboCasaWindowDataset
 from wm_adapter.backends.jepa_wm_droid import JEPAWMDroidBackend
 from wm_adapter.adapters.lora import LastBlockAttentionLoRA
 from wm_adapter.backends.frozen_projection import frozen_base_projection
@@ -210,6 +211,36 @@ def _task(*, benchmark: str, transform: dict[str, object] | None) -> ResolvedTas
 
 
 class CrossBenchmarkContractTest(unittest.TestCase):
+    def test_robocasa_subtask_windows_do_not_cross_segment_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "segments.hdf5"
+            segments = np.asarray([0] * 8 + [1] * 4 + [2] * 9, dtype=np.int64)
+            with h5py.File(path, "w") as handle:
+                handle.create_dataset(
+                    "data/demo_0/meta_data_info/current_task_segment",
+                    data=segments,
+                )
+
+            class Source:
+                trajectories = [{"file_path": str(path), "demo_key": "demo_0"}]
+
+                @staticmethod
+                def get_seq_length(index: int) -> int:
+                    self.assertEqual(index, 0)
+                    return int(segments.shape[0])
+
+                def __len__(self) -> int:
+                    return 1
+
+            reach = RoboCasaWindowDataset.all_candidates(
+                Source(), 3, 2, segment_code=0
+            )
+            place = RoboCasaWindowDataset.all_candidates(
+                Source(), 3, 2, segment_code=2
+            )
+            self.assertEqual(reach, [(0, 0), (0, 1), (0, 2), (0, 3)])
+            self.assertEqual(place, [(0, 12), (0, 13), (0, 14), (0, 15)])
+
     def test_cross_backend_matrix_and_method_contract(self) -> None:
         root = Path(__file__).resolve().parents[1]
         suite = load_suite_config(
