@@ -364,7 +364,7 @@ def _initialize_state(suite: Any, jobs: list[JobSpec]) -> dict[str, Any]:
         "suite": str(suite.suite_name),
         "protocol": str(suite.protocol),
         "suite_config_path": str(resolve_path(str(suite._suite_config_path))),
-        "status": "running",
+        "status": "initializing",
         "started_at_unix": old.get("started_at_unix", time.time()),
         "last_started_at_unix": time.time(),
         "restart_count": int(old.get("restart_count", 0)) + bool(old),
@@ -384,22 +384,57 @@ def _initialize_state(suite: Any, jobs: list[JobSpec]) -> dict[str, Any]:
         "gpu_ids": _gpu_ids(suite),
         "self_test": False,
     }
+    # Publish a fresh lifecycle immediately. Deep validation of an existing
+    # cache can take minutes; keeping the previous state until it finishes
+    # makes a healthy restart look stuck on stale failures.
+    state["jobs"] = {
+        job.job_id: _state_entry(job, "pending") for job in jobs
+    }
+    state["phase_summary"] = phase_summary(state, jobs)
+    atomic_json(state_path, state)
     for job in jobs:
         artifact = resolve_path(job.artifact_path)
         if artifact.is_file():
             # Dependencies are rebuilt in graph order, so referenced cache and
             # checkpoint validation records are available before consumers.
+            validating = _state_entry(job, "running")
+            validating.update(
+                pid=os.getpid(),
+                gpu=None,
+                start_time=time.time(),
+                error="validating existing artifact for reuse",
+            )
+            state["jobs"][job.job_id] = validating
+            state["phase_summary"] = phase_summary(state, jobs)
+            atomic_json(state_path, state)
+            print(
+                f"RESUME_VALIDATION status=started job={job.job_id} "
+                f"artifact={artifact}",
+                flush=True,
+            )
             try:
                 validation = _validate(state, job)
-            except Exception:
+            except Exception as error:
                 _archive_invalid(job)
                 state["jobs"][job.job_id] = _state_entry(job, "pending")
+                print(
+                    f"RESUME_VALIDATION status=rebuild job={job.job_id} "
+                    f"error_type={type(error).__name__}",
+                    flush=True,
+                )
             else:
                 entry = _state_entry(job, "reused")
                 entry["artifact_validation"] = validation
                 state["jobs"][job.job_id] = entry
+                print(
+                    f"RESUME_VALIDATION status=reused job={job.job_id}",
+                    flush=True,
+                )
         else:
             state["jobs"][job.job_id] = _state_entry(job, "pending")
+        state["phase_summary"] = phase_summary(state, jobs)
+        atomic_json(state_path, state)
+    state["status"] = "running"
     state["phase_summary"] = phase_summary(state, jobs)
     atomic_json(state_path, state)
     return state
