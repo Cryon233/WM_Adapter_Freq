@@ -12,6 +12,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from scipy.spatial.transform import Rotation
 from torch import Tensor
 
 from wm_adapter.benchmarks.base import ActionTransform
@@ -45,6 +46,45 @@ _ACTION_SEGMENTS = {
     "end_effector_rotation": (8, 11),
     "gripper_close": (11, 12),
 }
+
+
+def _policy_state_to_droid_proprio(policy_states: np.ndarray) -> np.ndarray:
+    """Convert RoboCasa365's 16-D policy state to the planner's 7-D proprio."""
+
+    states = np.asarray(policy_states)
+    if states.ndim < 1 or states.shape[-1] != 16:
+        raise ValueError(
+            "RoboCasa365 policy state must end in 16 values before conversion "
+            f"to planning proprio, received shape={states.shape}"
+        )
+    if not np.isfinite(states).all():
+        raise ValueError("RoboCasa365 policy state contains NaN or infinite values")
+
+    # modality.json defines EEF position [7:10], WXYZ quaternion [10:14],
+    # and two gripper joints [14:16]. This matches the conversion used by the
+    # pinned JEPA-WM RoboCasa wrapper for live simulator observations.
+    eef_position = states[..., 7:10]
+    quaternion_wxyz = states[..., 10:14]
+    quaternion_norm = np.linalg.norm(quaternion_wxyz, axis=-1)
+    if np.any(quaternion_norm <= np.finfo(np.float32).eps):
+        raise ValueError("RoboCasa365 policy state contains a zero EEF quaternion")
+    quaternion_xyzw = np.concatenate(
+        (quaternion_wxyz[..., 1:4], quaternion_wxyz[..., 0:1]),
+        axis=-1,
+    )
+    eef_euler = Rotation.from_quat(
+        quaternion_xyzw.reshape(-1, 4)
+    ).as_euler("xyz", degrees=False).reshape(states.shape[:-1] + (3,))
+    gripper_state = states[..., 14:15] - states[..., 15:16]
+    planning_proprio = np.concatenate(
+        (eef_position, eef_euler, gripper_state), axis=-1
+    ).astype(np.float32, copy=False)
+    if planning_proprio.shape != states.shape[:-1] + (7,):
+        raise RuntimeError(
+            "RoboCasa365 planning proprio conversion produced an invalid shape: "
+            f"input={states.shape}, output={planning_proprio.shape}"
+        )
+    return planning_proprio
 
 
 @lru_cache(maxsize=1)
@@ -529,6 +569,7 @@ class RoboCasaLeRobotDataset:
             policy_states = np.stack(frames["observation.state"].to_numpy()).astype(
                 np.float32
             )
+            planning_proprios = _policy_state_to_droid_proprio(policy_states)
             rewards = np.asarray(frames["next.reward"], dtype=np.float32)
             video_path = _episode_path(
                 self.root,
@@ -547,6 +588,7 @@ class RoboCasaLeRobotDataset:
                     "actions": canonical_actions,
                     "raw_actions": raw_actions,
                     "policy_states": policy_states,
+                    "planning_proprios": planning_proprios,
                     "rewards": rewards,
                     "video_path": str(video_path),
                     "state_path": str(extras / "states.npz"),
@@ -661,7 +703,9 @@ class RoboCasaLeRobotDataset:
             )
         images = self._decode_frames(trajectory, indices)
         actions = torch.from_numpy(trajectory["actions"][indices]).float()
-        proprio = torch.from_numpy(trajectory["policy_states"][indices]).float()
+        proprio = torch.from_numpy(
+            trajectory["planning_proprios"][indices]
+        ).float()
         rewards = torch.from_numpy(trajectory["rewards"][indices]).float()
         simulator_states: Tensor | None = None
         environment_info: dict[str, Any] = trajectory
