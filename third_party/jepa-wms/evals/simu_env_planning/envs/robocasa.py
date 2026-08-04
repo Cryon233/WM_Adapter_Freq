@@ -158,6 +158,15 @@ class RoboCasaWrapper(gym.Wrapper):
             info = self.subtask_success(info)
         return obs, info
 
+    def _get_current_environment_info(self):
+        if hasattr(self.env, "_get_observation"):
+            return self.env._get_observation()
+        if hasattr(self.env, "_get_observations"):
+            return self.env._get_observations(force_update=True)
+        raise RuntimeError(
+            "RoboCasa environment cannot provide observations from the current simulator"
+        )
+
     def subtask_success(self, info):
         """
         Evaluate success for specific subtasks (reach, pick, place, or combinations).
@@ -208,6 +217,16 @@ class RoboCasaWrapper(gym.Wrapper):
         """
         Reset the environment and return the initial observation.
         """
+        if getattr(self.env, "_external_model_xml_replay", False):
+            # PlanEvaluator immediately replaces this simulator with the next
+            # episode's model_xml in prepare(). Rebuilding a stale dummy task
+            # here can reference dataset-only layout IDs before that happens.
+            logger.info(
+                "Skipping dummy RoboCasa model rebuild before external XML replay"
+            )
+            return self.get_obs_proprio_succ_from_info(
+                self._get_current_environment_info()
+            )
         info = self.env.reset()
         return self.get_obs_proprio_succ_from_info(info)
 
@@ -371,14 +390,7 @@ class RoboCasaWrapper(gym.Wrapper):
         if hasattr(self.env, "update_state"):
             self.env.update_state()
 
-        if hasattr(self.env, "_get_observation"):
-            current_info = self.env._get_observation()
-        elif hasattr(self.env, "_get_observations"):
-            current_info = self.env._get_observations(force_update=True)
-        else:
-            raise RuntimeError(
-                "RoboCasa environment cannot provide observations after state restore"
-            )
+        current_info = self._get_current_environment_info()
         obs, info = self.get_obs_proprio_succ_from_info(current_info)
 
         logger.info(f"robocasa env.prepare() took {time.time() - prep_start_time:.2f} seconds")
