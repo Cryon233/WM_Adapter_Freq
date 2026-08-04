@@ -4,27 +4,28 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-CONDA_SH="${CONDA_SH:-$HOME/anaconda3/etc/profile.d/conda.sh}"
-if [[ ! -f "$CONDA_SH" ]]; then
-    echo "Conda activation script not found: $CONDA_SH" >&2
-    exit 1
-fi
-source "$CONDA_SH"
-if [[ -n "${WM_ADAPTER_CONDA_ENV:-}" ]]; then
-    TARGET_CONDA_ENV="$WM_ADAPTER_CONDA_ENV"
-elif [[ -n "${CONDA_DEFAULT_ENV:-}" && "${CONDA_DEFAULT_ENV}" != "base" ]]; then
+if [[ -n "${CONDA_PREFIX:-}" && -n "${CONDA_DEFAULT_ENV:-}" && "${CONDA_DEFAULT_ENV}" != "base" ]]; then
+    # Respect the caller's active environment. This also avoids an unrelated
+    # inherited override replacing an environment that is already working.
     TARGET_CONDA_ENV="$CONDA_DEFAULT_ENV"
-else
-    TARGET_CONDA_ENV="wm-a100"
-fi
-set +u
-if [[ "${CONDA_DEFAULT_ENV:-}" != "$TARGET_CONDA_ENV" ]]; then
+elif [[ -n "${WM_ADAPTER_CONDA_ENV:-}" ]]; then
+    TARGET_CONDA_ENV="$WM_ADAPTER_CONDA_ENV"
+    CONDA_SH="${CONDA_SH:-$HOME/anaconda3/etc/profile.d/conda.sh}"
+    if [[ ! -f "$CONDA_SH" ]]; then
+        echo "Conda activation script not found: $CONDA_SH" >&2
+        exit 1
+    fi
+    source "$CONDA_SH"
+    set +u
     if ! conda activate "$TARGET_CONDA_ENV"; then
         echo "Could not activate cross-benchmark Conda environment: $TARGET_CONDA_ENV" >&2
         exit 1
     fi
+    set -u
+else
+    echo "No non-base Conda environment is active. Activate the desired environment or set WM_ADAPTER_CONDA_ENV." >&2
+    exit 1
 fi
-set -u
 if [[ ! -f ./env_jepa.sh ]]; then
     echo "Required JEPA-WM environment file not found: $ROOT/env_jepa.sh" >&2
     exit 1
