@@ -717,20 +717,32 @@ class RoboCasaBenchmark(BenchmarkAdapter):
             seed,
         )
         suite = self.cfg.get("suite", {})
-        if (
-            str(suite.get("name", "")) != "cross_backend_adapter_v1"
-            or len(selected) == max_windows
-        ):
+        if str(suite.get("name", "")) != "cross_backend_adapter_v1":
             return selected
-        if not selected:
+        unique_selected = len(set(selected))
+        if unique_selected != len(selected):
             raise RuntimeError(
-                "RoboCasa subtask filtering produced no windows in the requested "
-                f"trajectory partition: subtask={self.cfg.planning.get('subtask')!r}"
+                "RoboCasa subtask window selection produced duplicate window IDs: "
+                f"subtask={self.cfg.planning.get('subtask')!r}, "
+                f"selected={len(selected)}, unique={unique_selected}"
             )
-        # The official PnPCounterTop release contains fewer unique per-subtask
-        # windows than the fixed paper budget. Cycle the deterministic balanced
-        # order so the configured 2000/200 window counts remain exact.
-        return [selected[index % len(selected)] for index in range(max_windows)]
+        if len(selected) != max_windows:
+            allowed = {
+                int(trajectory) for trajectory in allowed_trajectories.tolist()
+            }
+            available_unique = len(
+                {
+                    (int(trajectory), int(start))
+                    for trajectory, start in candidates
+                    if int(trajectory) in allowed
+                }
+            )
+            raise RuntimeError(
+                "RoboCasa subtask has insufficient unique windows for the fixed "
+                f"budget: subtask={self.cfg.planning.get('subtask')!r}, "
+                f"requested={max_windows}, available_unique={available_unique}"
+            )
+        return selected
 
     def make_window_dataset(
         self,

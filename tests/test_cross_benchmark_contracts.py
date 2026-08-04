@@ -14,6 +14,7 @@ import h5py
 import numpy as np
 import torch
 from einops import rearrange
+from omegaconf import OmegaConf
 from torch import nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -27,6 +28,7 @@ from wm_adapter.benchmarks.libero import (
     _camera_contract_from_shape,
     _validated_split_indices,
 )
+from wm_adapter.benchmarks.robocasa import RoboCasaBenchmark
 from wm_adapter.experiments.cross_benchmark import (
     JobSpec,
     archive_incomplete,
@@ -240,6 +242,20 @@ class CrossBenchmarkContractTest(unittest.TestCase):
             )
             self.assertEqual(reach, [(0, 0), (0, 1), (0, 2), (0, 3)])
             self.assertEqual(place, [(0, 12), (0, 13), (0, 14), (0, 15)])
+            benchmark = RoboCasaBenchmark(
+                OmegaConf.create(
+                    {
+                        "suite": {"name": "cross_backend_adapter_v1"},
+                        "planning": {"subtask": "reach"},
+                    }
+                )
+            )
+            selected = benchmark.select_windows(reach, np.asarray([0]), 4, 42)
+            self.assertEqual(len(selected), len(set(selected)))
+            with self.assertRaisesRegex(
+                RuntimeError, "requested=5, available_unique=4"
+            ):
+                benchmark.select_windows(reach, np.asarray([0]), 5, 42)
 
     def test_cross_backend_matrix_and_method_contract(self) -> None:
         root = Path(__file__).resolve().parents[1]
