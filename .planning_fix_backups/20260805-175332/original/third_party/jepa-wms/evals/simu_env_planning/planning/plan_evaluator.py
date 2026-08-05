@@ -35,44 +35,6 @@ from src.utils.logging import get_logger
 log = get_logger(__name__)
 
 
-ROBOCASA_PLANNING_INPUT_CONTRACT = "raw_rgb_uint8_or_unit_float_v1"
-ROBOCASA_SUCCESS_AGGREGATION = "episode_any_low_level_step_v1"
-
-
-def _raw_rgb_to_uint8(frames: torch.Tensor) -> torch.Tensor:
-    """Convert raw RGB to uint8 without applying an inverse normalization.
-
-    The WM Adapter benchmark constructs the RoboCasa source dataset with
-    ``transform=None``. Its RGB tensors are therefore either uint8 or floats in
-    [0, 1], not mean/std-normalized tensors. Calling the upstream
-    ``inverse_transform`` on these values corrupts the model input contract.
-    """
-    values = torch.as_tensor(frames)
-    if values.ndim not in {3, 4}:
-        raise ValueError(
-            "Raw planning RGB must be [C,H,W] or [T,C,H,W], "
-            f"received {tuple(values.shape)}"
-        )
-    if values.shape[-3] != 3:
-        raise ValueError(
-            f"Raw planning RGB must have three channels, received {tuple(values.shape)}"
-        )
-    if values.dtype == torch.uint8:
-        return values.detach().clone()
-    values = values.detach().float()
-    if not torch.isfinite(values).all():
-        raise ValueError("Raw planning RGB contains non-finite values")
-    minimum = float(values.amin())
-    maximum = float(values.amax())
-    tolerance = 1.0e-6
-    if minimum < -tolerance or maximum > 1.0 + tolerance:
-        raise ValueError(
-            "Raw planning float RGB must be in [0,1], "
-            f"found [{minimum}, {maximum}]"
-        )
-    return values.clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8)
-
-
 class PlanEvaluator:
     def __init__(self, cfg, agent):
         self.cfg = cfg
@@ -176,8 +138,6 @@ class PlanEvaluator:
         """
         done = False
         ep_reward = 0
-        episode_success = False
-        state_dist = float("inf")
         td = obs
         ep_obs_proprio_td_list = [td]
         infos_list = []
@@ -250,38 +210,21 @@ class PlanEvaluator:
                 plt.close()
                 log.info(f"Last iteration frames saved to {agent_gt_path}")
 
-            # Evaluate success. RoboCasa success is an event that can occur at
-            # any low-level step inside an action-repeat block. Preserve it for
-            # the whole episode instead of overwriting it with the final step.
-            task_name = str(self.cfg.task_specification.task)
+            # Evaluate success
             if (
-                any(pref in task_name for pref in ["mw", "robocasa"])
+                any(pref in self.cfg.task_specification.task for pref in ["mw", "robocasa"])
                 and self.cfg.task_specification.succ_def == "simu"
             ):
-                step_success = any(
-                    bool(step_info.get("success", False)) for step_info in infos
-                )
-                if task_name.startswith("robocasa-"):
-                    subtask = str(
-                        self.cfg.task_specification.env.get("subtask", "")
-                    )
-                    distance_key = (
-                        "obj_goal_dist" if "place" in subtask else "hand_obj_dist"
-                    )
-                    current_state_dist = float(
-                        infos[-1].get(distance_key, float("inf"))
-                    )
+                success = infos[-1]["success"]
+                if str(self.cfg.task_specification).startswith("robocasa-"):
+                    state_dist = infos[-1]["hand_obj_dist"]
                 else:
-                    current_state_dist = float(
-                        np.linalg.norm(self.state_g - infos[-1]["state"])
-                    )
+                    state_dist = np.linalg.norm(self.state_g - infos[-1]["state"])
             else:
                 eval_results = env.eval_state(self.state_g, infos[-1]["state"])
-                step_success = bool(eval_results["success"])
-                current_state_dist = float(eval_results["state_dist"])
-            episode_success = episode_success or step_success
-            state_dist = min(state_dist, current_state_dist)
-            if episode_success and self.cfg.task_specification.done_at_succ:
+                success = eval_results["success"]
+                state_dist = eval_results["state_dist"]
+            if success and self.cfg.task_specification.done_at_succ:
                 done = True
             ep_reward += reward
             for obs, info in zip(obses, infos):
@@ -293,7 +236,7 @@ class PlanEvaluator:
                 {
                     "near_object": infos[-1]["near_object"],
                     "obj_goal_dist": infos[-1].get("obj_goal_dist", -1.0),
-                    "success": episode_success,
+                    "success": success,
                     "obj_lift": infos[-1].get("obj_lift", -1.0),
                 }
             )
@@ -309,14 +252,7 @@ class PlanEvaluator:
                 done = True
 
         pbar.close()
-        return (
-            ep_obs_proprio_td_list,
-            ep_reward,
-            actions,
-            infos_list,
-            episode_success,
-            state_dist,
-        )
+        return ep_obs_proprio_td_list, ep_reward, actions, infos_list, success, state_dist
 
     def sample_traj_segment_from_dset(
         self,
@@ -457,7 +393,9 @@ class PlanEvaluator:
                     expert_obses.append(
                         TensorDict(
                             {
-                                "visual": _raw_rgb_to_uint8(observations["visual"][i : i + 1]),
+                                "visual": (
+                                    self.agent.preprocessor.inverse_transform(observations["visual"][i : i + 1]) * 255
+                                ).to(torch.uint8),
                                 "proprio": torch.as_tensor(observations["proprio"][i : i + 1], dtype=torch.float32),
                             }
                         )
@@ -491,7 +429,10 @@ class PlanEvaluator:
                         expert_obses.append(
                             TensorDict(
                                 {
-                                    "visual": _raw_rgb_to_uint8(observations["visual"][i : i + 1]),
+                                    "visual": (
+                                        self.agent.preprocessor.inverse_transform(observations["visual"][i : i + 1])
+                                        * 255
+                                    ).to(torch.uint8),
                                     "proprio": torch.as_tensor(
                                         observations["proprio"][i : i + 1], dtype=torch.float32
                                     ),
@@ -499,17 +440,11 @@ class PlanEvaluator:
                             )
                         )
                     self.state_g = states[-1]
-                # Important: reprepare env back to the same initial state.
-                # Use the simulator render as the current observation so the
-                # first and subsequent history frames share one camera/size path.
-                reset_vis, reset_info = env.prepare(
-                    ep_seed, init_state, env_info=env_info
-                )
-                init_obs = make_td(reset_vis, reset_info)
+                # Important: reprepare env back to same initial state
+                reset_vis, reset_info = env.prepare(ep_seed, init_state, env_info=env_info)
                 if "max_episode_steps" in cfg.task_specification:
                     env.set_max_steps(cfg.task_specification.max_episode_steps)
-            if "droid" in cfg.task_specification.task:
-                init_obs = expert_obses[0]
+            init_obs = expert_obses[0]
             # since expert_obses is obtained by stepping all exec_actions, there is no skip and
             goal_obs = expert_obses[-1]
             expert_success = 1
@@ -614,45 +549,29 @@ class PlanEvaluator:
             end_distance_closure = total_delta_traj[6:].sum().item()
             end_distance = end_distance_xyz + end_distance_orientation + end_distance_closure
         else:
-            if cfg.logging.optional_plots:
-                if cfg.task_specification.num_frames > agent.model.tubelet_size_enc:
-                    # Keep the minimal last state
-                    for x in episode_obses:
-                        x["visual"] = x["visual"][-agent.model.tubelet_size_enc :]
-                agent_goal_video_path = str(
-                    vis_work_dir / f"video_agent_goal_{'succ' if success else 'fail'}"
-                )
-                frames_list = [x["visual"] for x in episode_obses]
-                make_video(
-                    frames_list,
-                    30,
-                    agent_goal_video_path,
-                    obs_concat_channels=env.obs_concat_channels,
-                )
-                make_video_pdf(
-                    frames_list[:: self.cfg.frameskip],
-                    agent_goal_video_path + ".pdf",
-                    obs_concat_channels=env.obs_concat_channels,
-                )
-                coord_diffs, _repr_diffs = analyze_distances(
-                    agent,
-                    episode_obses,
-                    goal_obs,
-                    str(dist_work_dir / "agent"),
-                    objective=agent.objective,
-                )
-                success_dist = float(coord_diffs[-1] < 0.05)
-                end_distance = float(coord_diffs[-1])
-            else:
-                # Formal sweeps disable optional plots. Avoid video encoding and
-                # an additional full latent-distance pass for every episode.
-                success_dist = float(success)
-                end_distance = float(state_dist)
-            end_distance_xyz, end_distance_orientation, end_distance_closure = (
-                -1.0,
-                -1.0,
-                -1.0,
+            if cfg.logging.optional_plots and cfg.task_specification.num_frames > agent.model.tubelet_size_enc:
+                # Keep the minimal last state
+                for x in episode_obses:
+                    x["visual"] = x["visual"][-agent.model.tubelet_size_enc :]
+            agent_goal_video_path = str(vis_work_dir / f"video_agent_goal_{'succ' if success else 'fail'}")
+            frames_list = [x["visual"] for x in episode_obses]
+            make_video(frames_list, 30, agent_goal_video_path, obs_concat_channels=env.obs_concat_channels)
+            make_video_pdf(
+                frames_list[:: self.cfg.frameskip],
+                agent_goal_video_path + ".pdf",
+                obs_concat_channels=env.obs_concat_channels,
             )
+
+            coord_diffs, _repr_diffs = analyze_distances(
+                agent,
+                episode_obses,
+                goal_obs,
+                str(dist_work_dir / "agent"),
+                objective=agent.objective,
+            )
+            success_dist = float(coord_diffs[-1] < 0.05)
+            end_distance = coord_diffs[-1]
+            end_distance_xyz, end_distance_orientation, end_distance_closure = -1.0, -1.0, -1.0
         if cfg.logging.optional_plots:
             plot_losses(
                 self.prev_losses,

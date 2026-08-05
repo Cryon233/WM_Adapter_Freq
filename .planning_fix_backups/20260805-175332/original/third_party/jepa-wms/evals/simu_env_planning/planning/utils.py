@@ -23,40 +23,6 @@ log = get_logger(__name__)
 FIGSIZE_BASE = (4.0, 3.0)
 
 
-def _video_frame_to_uint8(image, *, obs_concat_channels=True):
-    """Convert one raw RGB observation to HWC uint8 without per-frame scaling."""
-    if isinstance(image, torch.Tensor):
-        values = image.detach().cpu().numpy()
-    else:
-        values = np.asarray(image)
-    if values.ndim == 4:
-        values = values[-3:] if obs_concat_channels else values[-1]
-    if values.ndim != 3:
-        raise ValueError(f"Video frame must be 3-D after selection, got {values.shape}")
-    if values.shape[0] == 3:
-        values = values.transpose(1, 2, 0)
-    elif values.shape[-1] != 3:
-        raise ValueError(f"Video frame must have three RGB channels, got {values.shape}")
-    if values.dtype == np.uint8:
-        return np.ascontiguousarray(values)
-    values = values.astype(np.float32, copy=False)
-    if not np.isfinite(values).all():
-        raise ValueError("Video frame contains non-finite values")
-    minimum = float(values.min())
-    maximum = float(values.max())
-    tolerance = 1.0e-6
-    if minimum >= -tolerance and maximum <= 1.0 + tolerance:
-        values = np.rint(np.clip(values, 0.0, 1.0) * 255.0)
-    elif minimum >= -tolerance and maximum <= 255.0 + tolerance:
-        values = np.rint(np.clip(values, 0.0, 255.0))
-    else:
-        raise ValueError(
-            "Video RGB must be uint8, [0,1] float, or [0,255] float; "
-            f"found [{minimum}, {maximum}]"
-        )
-    return np.ascontiguousarray(values.astype(np.uint8))
-
-
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -87,11 +53,11 @@ def make_video_mp4(images, fps, output_path, obs_concat_channels=True):
     """
     writer = imageio.get_writer(output_path, fps=fps, codec="libx264")
     for img in images:
-        writer.append_data(
-            _video_frame_to_uint8(
-                img, obs_concat_channels=obs_concat_channels
-            )
-        )
+        img = (img[-3:] if obs_concat_channels else img[-1]).numpy() if isinstance(img, torch.Tensor) else img
+        img = img.transpose(1, 2, 0)
+        img = ((img - img.min()) / (img.max() - img.min()) * 255).astype(np.uint8)
+        # img: H W C
+        writer.append_data(img)
 
     writer.close()
     log.info(f"🎬 Video saved to {output_path}")
@@ -100,11 +66,10 @@ def make_video_mp4(images, fps, output_path, obs_concat_channels=True):
 def make_video_gif(images, fps, output_path, obs_concat_channels=True):
     writer = imageio.get_writer(output_path, fps=fps, format="GIF", loop=10000)
     for img in images:
-        writer.append_data(
-            _video_frame_to_uint8(
-                img, obs_concat_channels=obs_concat_channels
-            )
-        )
+        img = (img[-3:] if obs_concat_channels else img[-1]).numpy() if isinstance(img, torch.Tensor) else img
+        img = img.transpose(1, 2, 0)
+        img = ((img - img.min()) / (img.max() - img.min()) * 255).astype(np.uint8)
+        writer.append_data(img)
 
     writer.close()
     log.info(f"🎞️  GIF saved to {output_path}")
@@ -119,13 +84,15 @@ def make_video_pdf(images, output_path, obs_concat_channels=True):
         output_path: Path to save the PDF
         obs_concat_channels: Whether the observation has concatenated channels
     """
-    # Process images with the same fixed RGB contract as MP4/GIF output.
-    processed_images = [
-        _video_frame_to_uint8(
-            image, obs_concat_channels=obs_concat_channels
-        )
-        for image in images
-    ]
+    # Process images to consistent format
+    processed_images = []
+    for img in images:
+        if isinstance(img, torch.Tensor):
+            img = (img[-3:] if obs_concat_channels else img[-1]).detach().cpu().numpy()
+
+        # Convert to HWC format
+        img = img.transpose(1, 2, 0)
+        processed_images.append(img)
 
     # Create a single horizontal image by concatenating all frames
     concat_img = np.concatenate(processed_images, axis=1)

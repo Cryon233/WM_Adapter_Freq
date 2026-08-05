@@ -25,8 +25,8 @@ from wm_adapter.benchmarks.factory import build_benchmark
 from wm_adapter.utils.reproducibility import resolve_path, seed_everything
 
 
-EVALUATION_PROTOCOL_VERSION = "2.1"
-EVALUATION_PROTOCOL_DIRECTORY = "protocol_v2_1"
+EVALUATION_PROTOCOL_VERSION = "2.0"
+EVALUATION_PROTOCOL_DIRECTORY = "protocol_v2"
 LOGGER = logging.getLogger(__name__)
 
 
@@ -48,26 +48,6 @@ class PlanningResult:
     goal_base_latent_fingerprints: list[str] = field(default_factory=list)
     appearance_specs: list[dict[str, Any] | None] = field(default_factory=list)
     cem_seeds: list[int] = field(default_factory=list)
-
-
-def _raw_rgb_frame_to_uint8(frame: Tensor) -> Tensor:
-    """Match the exact uint8 goal representation used by PlanEvaluator."""
-    if frame.ndim != 3 or frame.shape[0] != 3:
-        raise ValueError(
-            f"Raw goal RGB must be [3,H,W], received {tuple(frame.shape)}"
-        )
-    if frame.dtype == torch.uint8:
-        return frame.detach().clone()
-    values = frame.detach().float()
-    if not torch.isfinite(values).all():
-        raise ValueError("Raw goal RGB contains non-finite values")
-    minimum = float(values.amin())
-    maximum = float(values.amax())
-    if minimum < -1.0e-6 or maximum > 1.0 + 1.0e-6:
-        raise ValueError(
-            f"Raw goal float RGB must be in [0,1], found [{minimum}, {maximum}]"
-        )
-    return values.clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8)
 
 
 @torch.inference_mode()
@@ -250,15 +230,6 @@ def _build_official_agent(
                     f"received {tuple(obs.shape)}"
                 )
             current = obs[-1].detach().clone()
-            if self._current_history and tuple(current.shape) != tuple(
-                self._current_history[-1].shape
-            ):
-                raise RuntimeError(
-                    "Planning history changed image shape between replans: "
-                    f"previous={tuple(self._current_history[-1].shape)}, "
-                    f"current={tuple(current.shape)}. The initial observation must "
-                    "come from the restored simulator render, not the dataset RGB."
-                )
             self._current_history.append(current)
             self._current_history = self._current_history[-self.current_history_len :]
             history = [self._current_history[0]] * (
@@ -449,8 +420,13 @@ def run_robocasa_planning(
                 f"RoboCasa evaluation manifest has {len(manifest_instances)} instances; "
                 f"{total_episodes} are required: {manifest_path}"
             )
-        # Protocol 2.1 requires the configured fixed goal span. Variable-length
-        # legacy Place segments are invalid and must be rebuilt.
+        # The pinned Place evaluator samples the complete contiguous
+        # ``subtask=place`` slice.  Compatibility manifests preserve that exact
+        # official sampling stream; fixed-span validation applies to every
+        # other v2 manifest.
+        variable_official_place_segment = bool(
+            manifest.get("legacy_place_reuse_compatible", False)
+        ) and str(experiment_config.benchmark.task_key) == "robocasa_place"
         invalid_spans = (
             [
                 {
@@ -462,7 +438,7 @@ def run_robocasa_planning(
                 if int(instance["segment_end"]) - int(instance["segment_start"])
                 != goal_span_steps
             ]
-            if goal_span_steps is not None
+            if goal_span_steps is not None and not variable_official_place_segment
             else []
         )
         if invalid_spans:
@@ -579,10 +555,7 @@ def run_robocasa_planning(
                     selected_observation["visual"][-1].numpy()
                 )
                 goal_base_latent_fingerprint = frozen_goal_latent_fingerprint(
-                    backend,
-                    _raw_rgb_frame_to_uint8(
-                        selected_observation["visual"][-1]
-                    ),
+                    backend, selected_observation["visual"][-1]
                 )
                 if actual_initialization != str(instance["initialization_fingerprint"]) or actual_goal != str(instance["goal_fingerprint"]):
                     raise RuntimeError(

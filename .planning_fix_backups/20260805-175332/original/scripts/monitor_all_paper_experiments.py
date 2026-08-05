@@ -310,21 +310,13 @@ def parse_training(text: str, heartbeat: str) -> Progress | None:
 
 
 def artifact_detail(entry: dict[str, Any]) -> str:
-    artifact = entry.get("artifact_validation", entry.get("artifact"))
+    artifact = entry.get("artifact")
     if not isinstance(artifact, dict):
         if entry.get("status") == "reused":
             return "existing artifact reused"
         return "artifact validated"
     if "success_count" in artifact:
-        used = int(
-            artifact.get(
-                "episodes",
-                artifact.get(
-                    "used_episodes",
-                    artifact.get("available_episodes", 0),
-                ),
-            )
-        )
+        used = int(artifact.get("used_episodes", artifact.get("available_episodes", 0)))
         success = int(artifact["success_count"])
         return f"completed {used}/{used} | success {success}/{used}"
     if "window_count" in artifact:

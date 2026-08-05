@@ -31,9 +31,6 @@ from wm_adapter.experiments.cross_benchmark import (
     phase_summary,
     run_gpu_phase,
 )
-from wm_adapter.planning.jepa_wm_planner import (
-    EVALUATION_PROTOCOL_VERSION,
-)
 from wm_adapter.utils.checkpoints import git_commit, sha256_file
 from wm_adapter.utils.reproducibility import project_root, resolve_path
 
@@ -96,24 +93,6 @@ def _validate_evaluation_manifest(job: JobSpec) -> dict[str, Any]:
         raise RuntimeError(
             f"Evaluation manifest has too few instances: {job.artifact_path}"
         )
-    fixed_goal_span_steps = payload.get("fixed_goal_span_steps")
-    if job.task == "robocasa_place":
-        spans = [
-            int(instance["segment_end"]) - int(instance["segment_start"])
-            for instance in instances[: int(job.required_count or 0)]
-        ]
-        if (
-            set(spans) != {25}
-            or fixed_goal_span_steps != 25
-            or bool(payload.get("legacy_place_reuse_compatible", False))
-        ):
-            raise RuntimeError(
-                "RoboCasa Place evaluation manifest is not protocol-2.1 fixed-span: "
-                f"spans={sorted(set(spans))}, "
-                f"fixed_goal_span_steps={fixed_goal_span_steps}, "
-                f"legacy={payload.get('legacy_place_reuse_compatible')}, "
-                f"path={job.artifact_path}"
-            )
     return {
         "path": str(resolve_path(job.artifact_path)),
         "sha256": sha256_file(job.artifact_path),
@@ -301,7 +280,6 @@ def _validate_planning(state: dict[str, Any], job: JobSpec) -> dict[str, Any]:
         "evaluation_seed": int(job.seed),
         "cache_fingerprint": str(cache["cache_fingerprint"]),
         "cache_file_sha256": str(cache["cache_file_sha256"]),
-        "evaluation_protocol_version": EVALUATION_PROTOCOL_VERSION,
     }
     actual = {
         "backend": payload.get("backend"),
@@ -313,30 +291,10 @@ def _validate_planning(state: dict[str, Any], job: JobSpec) -> dict[str, Any]:
         "evaluation_seed": seeds.get("evaluation"),
         "cache_fingerprint": payload.get("cache_fingerprint"),
         "cache_file_sha256": payload.get("cache_file_sha256"),
-        "evaluation_protocol_version": payload.get(
-            "evaluation_protocol_version"
-        ),
     }
     if actual != expected:
         raise RuntimeError(
             f"Cross-backend planning contract mismatch: expected={expected}, actual={actual}"
-        )
-    computed_success_count = sum(bool(value) for value in success)
-    reported_success_count = int(payload.get("success_count", -1))
-    reported_total = int(payload.get("total_episodes", -1))
-    reported_rate = float(payload.get("success_rate", -1.0))
-    expected_rate = computed_success_count / len(success)
-    if (
-        reported_success_count != computed_success_count
-        or reported_total != len(success)
-        or abs(reported_rate - expected_rate) > 1.0e-12
-    ):
-        raise RuntimeError(
-            "Planning success summary is inconsistent with per_episode_success: "
-            f"reported_count={reported_success_count}, "
-            f"computed_count={computed_success_count}, "
-            f"reported_total={reported_total}, total={len(success)}, "
-            f"reported_rate={reported_rate}, expected_rate={expected_rate}"
         )
     cem = payload.get("cem", {})
     required_cem = {

@@ -1,0 +1,4 @@
+ m third_party_stable_worldmodel
+?? .local_backups/
+?? .local_patches/
+?? .planning_fix_backups/

@@ -825,64 +825,26 @@ class RoboCasaBenchmark(BenchmarkAdapter):
                     segments = np.asarray(
                         group["meta_data_info/current_task_segment"]
                     )
-                full_segment_indices = np.flatnonzero(segments == segment_code)
-                if full_segment_indices.size == 0 or not np.array_equal(
-                    full_segment_indices,
-                    np.arange(
-                        full_segment_indices[0],
-                        full_segment_indices[-1] + 1,
-                    ),
+                frame_indices = np.flatnonzero(segments == segment_code)
+                if frame_indices.size == 0 or not np.array_equal(
+                    frame_indices,
+                    np.arange(frame_indices[0], frame_indices[-1] + 1),
                 ):
                     raise RuntimeError(
                         f"RoboCasa {subtask_name} compatibility requires one contiguous "
                         f"segment code {segment_code}: trajectory={trajectory}, "
-                        f"indices={full_segment_indices.tolist()}"
+                        f"indices={frame_indices.tolist()}"
                     )
-                if goal_span > 0:
-                    required_frames = goal_span + 1
-                    if int(full_segment_indices.size) < required_frames:
-                        raise RuntimeError(
-                            f"RoboCasa {subtask_name} segment is shorter than the "
-                            f"configured goal span: trajectory={trajectory}, "
-                            f"segment_frames={full_segment_indices.size}, "
-                            f"required_frames={required_frames}"
-                        )
-                    selected_frame_indices = full_segment_indices[-required_frames:]
-                else:
-                    selected_frame_indices = full_segment_indices
-                selected_start = int(selected_frame_indices[0])
-                selected_end = int(selected_frame_indices[-1])
-                (
-                    selected_observation,
-                    _,
-                    selected_states,
-                    _,
-                    _,
-                ) = source.get_frames(
-                    trajectory,
-                    range(selected_start, selected_end + 1),
-                    subtask=subtask_name,
-                )
-                expected_frames = selected_end - selected_start + 1
-                if (
-                    selected_states is None
-                    or int(selected_observation["visual"].shape[0])
-                    != expected_frames
-                    or int(selected_states.shape[0]) != expected_frames
-                ):
+                if int(observation["visual"].shape[0]) != int(frame_indices.size):
                     raise RuntimeError(
-                        f"RoboCasa {subtask_name} selected span changed length: "
-                        f"trajectory={trajectory}, start={selected_start}, "
-                        f"end={selected_end}, expected={expected_frames}, "
-                        f"visual={selected_observation['visual'].shape}, "
-                        f"states={None if selected_states is None else selected_states.shape}"
+                        f"RoboCasa {subtask_name} filtered length mismatch for trajectory {trajectory}"
                     )
                 source_id = str(trajectory_info.get("demo_key", trajectory))
                 identity = {
                     "task": task.task_key,
                     "source": source_id,
-                    "start": selected_start,
-                    "end": selected_end,
+                    "start": int(frame_indices[0]),
+                    "end": int(frame_indices[-1]),
                     "evaluation_position": position,
                 }
                 instances.append(
@@ -890,13 +852,11 @@ class RoboCasaBenchmark(BenchmarkAdapter):
                         instance_id=canonical_sha256(identity)[:24],
                         source_trajectory_id=source_id,
                         source_trajectory_index=trajectory,
-                        segment_start=selected_start,
-                        segment_end=selected_end,
-                        initialization_fingerprint=array_sha256(
-                            selected_states[0].numpy()
-                        ),
+                        segment_start=int(frame_indices[0]),
+                        segment_end=int(frame_indices[-1]),
+                        initialization_fingerprint=array_sha256(states[0].numpy()),
                         goal_fingerprint=array_sha256(
-                            selected_observation["visual"][-1].numpy()
+                            observation["visual"][-1].numpy()
                         ),
                         environment_seed=int(
                             (seed * seed + position * seed) % (2**32 - 2)
@@ -917,10 +877,7 @@ class RoboCasaBenchmark(BenchmarkAdapter):
                     "trajectory stream; repeated trajectories are clustered."
                     ),
                     "cem_seed_mode": "continuous_generator_stream",
-                    "legacy_place_reuse_compatible": False,
-                    "fixed_goal_span_steps": (
-                        goal_span if goal_span > 0 else None
-                    ),
+                    "legacy_place_reuse_compatible": subtask_name == "place",
                     "official_subtask": subtask_name,
                     "official_subtask_segment_code": segment_code,
                 },
