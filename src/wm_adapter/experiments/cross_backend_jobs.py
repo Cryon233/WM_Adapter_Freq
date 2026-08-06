@@ -10,7 +10,7 @@ from wm_adapter.utils.reproducibility import resolve_path
 
 SUITE_NAME = "cross_backend_adapter_v1"
 EXPECTED_PLANNING_JOBS = 118
-EXPECTED_PLANNING_EPISODES = 1180
+EXPECTED_PLANNING_EPISODES = 3540
 
 
 def _path(root: Any, *parts: str) -> Path:
@@ -122,9 +122,9 @@ def _validate_planning_design(
             "The primary planning matrix must contain OOD only; "
             f"received domains={domains}"
         )
-    if int(suite.main.episodes) != 10:
+    if int(suite.main.episodes) != 30:
         raise RuntimeError(
-            "Fast planning design requires main.episodes=10, "
+            "Fast planning design requires main.episodes=30, "
             f"found {suite.main.episodes}"
         )
     guardrail = suite.clean_guardrail
@@ -147,9 +147,9 @@ def _validate_planning_design(
             "Clean guardrail must use owner seed [42], "
             f"found {guardrail_seeds}"
         )
-    if int(suite.ablations.episodes) != 10:
+    if int(suite.ablations.episodes) != 30:
         raise RuntimeError(
-            "Fast planning design requires ablations.episodes=10, "
+            "Fast planning design requires ablations.episodes=30, "
             f"found {suite.ablations.episodes}"
         )
     return guardrail_methods, guardrail_seeds, guardrail_domain

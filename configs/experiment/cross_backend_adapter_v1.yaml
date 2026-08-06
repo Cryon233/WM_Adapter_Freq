@@ -48,8 +48,8 @@ clean_guardrail:
   methods: [base, hfra]
   seeds: [42]
 
-# Every planning job uses the same ten manifest-selected episodes.
-main: {episodes: 10}
+# Every planning job uses the same thirty manifest-selected episodes.
+main: {episodes: 30}
 
 data: {num_train_windows: 2000, split_seed: 42, window_seed: 42}
 training: {max_optimizer_steps: 2000}
@@ -62,7 +62,7 @@ ablations:
   tasks: [robocasa_place, libero_goal_0]
   variants: [hfra, hfra_core_only]
   domain: ood
-  episodes: 10
+  episodes: 30
 
 gpu: {default_ids: [0, 1, 2, 3], one_heavy_job_per_gpu: true}
 reuse_sources: {}
