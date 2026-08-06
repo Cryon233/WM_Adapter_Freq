@@ -51,10 +51,11 @@ def main() -> None:
         cfg.paths.robocasa_hdf5 = resolved_task.dataset_path
     task_manifest = benchmark.write_task_manifest(resolved_task)
     method = build_method(method_name, backend, cfg.method_config).to(backend.device)
-    training_appearance = ComposedPhotometricShift.metadata(
-        float(cfg.appearance.get("training_severity", cfg.appearance.severity)),
-        int(cfg.appearance.training_seed),
-    )
+    training_appearance = {
+        "family": "identity",
+        "strength": 0.0,
+        "training_input_domain": "clean",
+    }
     checkpoint_fingerprint: str | None = None
     cache_fingerprint: str | None = None
     if method_name != "base":

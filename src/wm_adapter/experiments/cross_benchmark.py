@@ -473,7 +473,6 @@ def validate_cache_v2(
 
 
 def training_contract_v2(training: dict[str, Any]) -> dict[str, Any]:
-    """Return the single normalized contract used by v2 writer and validator."""
     required = {
         "max_optimizer_steps",
         "microbatch_windows",
@@ -497,9 +496,13 @@ def training_contract_v2(training: dict[str, Any]) -> dict[str, Any]:
     microbatch = int(training["microbatch_windows"])
     views = int(training["views_per_window"])
     accumulation = int(training["gradient_accumulation"])
+    if views != 1:
+        raise ValueError("Clean-only training requires views_per_window=1")
     return {
         "loss_name": str(training["loss_name"]),
         "goal_encoder": "frozen_base",
+        "training_input_domain": "clean",
+        "training_appearance_family": "identity",
         "max_optimizer_steps": int(training["max_optimizer_steps"]),
         "completed_optimizer_steps": int(training["max_optimizer_steps"]),
         "training_seed": int(training["seed"]),
@@ -537,7 +540,8 @@ def training_contract_v2(training: dict[str, Any]) -> dict[str, Any]:
 
 
 def training_contract_mismatches_v2(
-    payload: dict[str, Any], expected: dict[str, Any]
+    payload: dict[str, Any],
+    expected: dict[str, Any],
 ) -> dict[str, Any]:
     mismatch: dict[str, Any] = {}
     for key in (
@@ -546,6 +550,8 @@ def training_contract_mismatches_v2(
         "completed_optimizer_steps",
         "training_seed",
         "goal_encoder",
+        "training_input_domain",
+        "training_appearance_family",
     ):
         if payload.get(key) != expected[key]:
             mismatch[key] = {
@@ -561,7 +567,10 @@ def training_contract_mismatches_v2(
             }
     actual_training = dict(payload.get("training_config", {}))
     training_mismatch = {
-        key: {"expected": value, "actual": actual_training.get(key)}
+        key: {
+            "expected": value,
+            "actual": actual_training.get(key),
+        }
         for key, value in expected["training_config"].items()
         if actual_training.get(key) != value
     }
@@ -578,6 +587,7 @@ def training_contract_mismatches_v2(
             "actual": actual_effective_batch,
         }
     return mismatch
+
 
 
 def validate_checkpoint(

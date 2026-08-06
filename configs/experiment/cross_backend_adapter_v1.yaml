@@ -20,7 +20,7 @@ tasks:
 
 backends:
   jepa_wm_droid:
-    methods: [base, dct_adapter, token_mlp, lora, hfra]
+    methods: [base, token_mlp, lora, hfra]
     models:
       robocasa_reach: configs/model/jepa_wm_droid_reach.yaml
       robocasa_place: configs/model/jepa_wm_droid_place.yaml
@@ -34,35 +34,30 @@ backends:
       libero_spatial_0: configs/model/dino_wm_droid_reach.yaml
       libero_goal_0: configs/model/dino_wm_droid_reach.yaml
 
-# Primary statistical test: every supported method, every task, all three seeds,
-# OOD only.
-domains: [ood]
+training:
+  input_domain: clean
+  appearance_family: identity
+  max_optimizer_steps: 2000
+
+domains: [clean, ood]
 seeds: [42, 7, 2026]
-
-# Clean is a guardrail rather than a full factorial matrix. It is run only for
-# Base and HFRA at the owner seed and must not be interpreted as a three-seed
-# clean-domain superiority test.
-clean_guardrail:
-  enabled: true
-  domain: clean
-  methods: [base, hfra]
-  seeds: [42]
-
-# Every planning job uses the same ten manifest-selected episodes.
-main: {episodes: 10}
+main:
+  robocasa_episodes: 30
+  libero_episodes: 20
 
 data: {num_train_windows: 2000, split_seed: 42, window_seed: 42}
-training: {max_optimizer_steps: 2000}
 offline: {windows: 200}
-appearance: {pipeline_version: composed_photometric_v1, main_severity: 1.0, seed: 2026}
+appearance:
+  pipeline_version: composed_photometric_v1
+  evaluation_family: photometric
+  main_severity: 1.0
+  seed: 2026
 
-# Full HFRA is reused from the primary OOD matrix. Only core-only is added.
 ablations:
   backend: jepa_wm_droid
   tasks: [robocasa_place, libero_goal_0]
-  variants: [hfra, hfra_core_only]
-  domain: ood
-  episodes: 10
+  method: hfra_core_only
+  domains: [clean, ood]
 
 gpu: {default_ids: [0, 1, 2, 3], one_heavy_job_per_gpu: true}
 reuse_sources: {}

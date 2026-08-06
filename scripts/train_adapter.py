@@ -114,7 +114,7 @@ def _train_v2(cfg: Any, backend: JEPAWMDroidBackend, method: Any) -> None:
 def main() -> None:
     cfg = load_experiment_config()
     if str(cfg.method) == "base":
-        raise ValueError("method=base has no trainable parameters; choose dct_adapter, token_mlp, or lora")
+        raise ValueError("method=base has no trainable parameters; choose token_mlp, lora, hfra, or hfra_core_only")
     seed_everything(int(cfg.training.seed))
     backend = _backend(cfg)
     method = build_method(str(cfg.method), backend, cfg.method_config)

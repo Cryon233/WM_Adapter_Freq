@@ -34,6 +34,7 @@ from wm_adapter.experiments.cross_benchmark import (
 from wm_adapter.planning.jepa_wm_planner import (
     EVALUATION_PROTOCOL_VERSION,
 )
+from wm_adapter.training.trainer_v2 import CHECKPOINT_SCHEMA_V2
 from wm_adapter.utils.checkpoints import git_commit, sha256_file
 from wm_adapter.utils.reproducibility import project_root, resolve_path
 
@@ -187,25 +188,30 @@ def _checkpoint_dependency(job: JobSpec) -> str | None:
 def _validate_checkpoint(
     state: dict[str, Any], job: JobSpec
 ) -> dict[str, Any]:
-    payload = torch.load(resolve_path(job.artifact_path), map_location="cpu", weights_only=False)
+    payload = torch.load(
+        resolve_path(job.artifact_path),
+        map_location="cpu",
+        weights_only=False,
+    )
     cache = _cache_validation(state, job)
     expected = {
+        "schema_version": CHECKPOINT_SCHEMA_V2,
         "backend": str(job.backend),
         "method_name": str(job.method),
         "training_seed": int(job.seed),
+        "training_input_domain": "clean",
+        "training_appearance_family": "identity",
         "cache_fingerprint": str(cache["cache_fingerprint"]),
         "cache_file_sha256": str(cache["cache_file_sha256"]),
         "loss_name": "unified_trajectory_mse",
         "max_optimizer_steps": 2000,
         "completed_optimizer_steps": 2000,
     }
-    actual = {
-        key: payload.get(key)
-        for key in expected
-    }
+    actual = {key: payload.get(key) for key in expected}
     if actual != expected:
         raise RuntimeError(
-            f"Cross-backend checkpoint contract mismatch: expected={expected}, actual={actual}"
+            f"Cross-backend checkpoint contract mismatch: "
+            f"expected={expected}, actual={actual}"
         )
     data = dict(payload.get("data_metadata", {}))
     if data.get("backend") != job.backend or data.get("task_key") != job.task:
@@ -218,6 +224,9 @@ def _validate_checkpoint(
         "sha256": sha256_file(job.artifact_path),
         "cache_fingerprint": expected["cache_fingerprint"],
         "cache_file_sha256": expected["cache_file_sha256"],
+        "checkpoint_schema_version": CHECKPOINT_SCHEMA_V2,
+        "training_input_domain": "clean",
+        "training_appearance_family": "identity",
         "backend": job.backend,
         "task": job.task,
         "method": job.method,
@@ -225,10 +234,29 @@ def _validate_checkpoint(
     }
 
 
-def _validate_offline(state: dict[str, Any], job: JobSpec) -> dict[str, Any]:
+def _validate_offline(
+    state: dict[str, Any], job: JobSpec
+) -> dict[str, Any]:
     payload = _payload(job.artifact_path)
     cache = _cache_validation(state, job)
     expected_seed = None if job.method == "base" else int(job.seed)
+    if job.method == "base":
+        expected_checkpoint_sha = None
+        expected_checkpoint_schema = "base"
+    else:
+        dependency = _checkpoint_dependency(job)
+        if dependency is None:
+            raise RuntimeError(
+                f"Offline job lacks checkpoint dependency: {job.job_id}"
+            )
+        checkpoint = state["jobs"][dependency].get("artifact_validation")
+        if not isinstance(checkpoint, dict):
+            raise RuntimeError(
+                f"Offline checkpoint is not validated: {dependency}"
+            )
+        expected_checkpoint_sha = str(checkpoint["sha256"])
+        expected_checkpoint_schema = CHECKPOINT_SCHEMA_V2
+
     expected = {
         "schema_version": "cross_backend_offline_mse_v1",
         "backend": str(job.backend),
@@ -238,12 +266,16 @@ def _validate_offline(state: dict[str, Any], job: JobSpec) -> dict[str, Any]:
         "requested_window_count": int(job.required_count or 0),
         "cache_fingerprint": str(cache["cache_fingerprint"]),
         "cache_file_sha256": str(cache["cache_file_sha256"]),
+        "method_checkpoint_sha256": expected_checkpoint_sha,
+        "checkpoint_schema_version": expected_checkpoint_schema,
     }
     actual = {key: payload.get(key) for key in expected}
     if actual != expected:
         raise RuntimeError(
-            f"Cross-backend offline contract mismatch: expected={expected}, actual={actual}"
+            f"Cross-backend offline contract mismatch: "
+            f"expected={expected}, actual={actual}"
         )
+
     actual_windows = int(payload.get("window_count", -1))
     unique_windows = int(payload.get("unique_window_count", -1))
     replacement = bool(payload.get("sampling_with_replacement", True))
@@ -253,13 +285,17 @@ def _validate_offline(state: dict[str, Any], job: JobSpec) -> dict[str, Any]:
         or actual_windows > int(job.required_count or 0)
         or unique_windows != actual_windows
         or replacement
-        or (not allow_fewer and actual_windows != int(job.required_count or 0))
+        or (
+            not allow_fewer
+            and actual_windows != int(job.required_count or 0)
+        )
     ):
         raise RuntimeError(
             "Cross-backend Offline unique-window contract mismatch: "
             f"requested={job.required_count}, actual={actual_windows}, "
             f"unique={unique_windows}, sampling_with_replacement={replacement}"
         )
+
     required_metrics = {
         "h1_autoregressive_latent_mse",
         "h2_autoregressive_latent_mse",
@@ -270,11 +306,17 @@ def _validate_offline(state: dict[str, Any], job: JobSpec) -> dict[str, Any]:
     }
     domains = payload.get("domains")
     if not isinstance(domains, dict) or set(domains) != {"clean", "ood"}:
-        raise RuntimeError(f"Offline artifact lacks clean/OOD domains: {job.artifact_path}")
+        raise RuntimeError(
+            f"Offline artifact lacks clean/OOD domains: {job.artifact_path}"
+        )
     for domain, metrics in domains.items():
-        if not isinstance(metrics, dict) or not required_metrics.issubset(metrics):
+        if (
+            not isinstance(metrics, dict)
+            or not required_metrics.issubset(metrics)
+        ):
             raise RuntimeError(
-                f"Offline {domain} metrics are incomplete: required={sorted(required_metrics)}"
+                f"Offline {domain} metrics are incomplete: "
+                f"required={sorted(required_metrics)}"
             )
     return {
         "path": str(resolve_path(job.artifact_path)),
@@ -286,11 +328,32 @@ def _validate_offline(state: dict[str, Any], job: JobSpec) -> dict[str, Any]:
     }
 
 
-def _validate_planning(state: dict[str, Any], job: JobSpec) -> dict[str, Any]:
+def _validate_planning(
+    state: dict[str, Any], job: JobSpec
+) -> dict[str, Any]:
     payload = _payload(job.artifact_path)
     cache = _cache_validation(state, job)
     success = payload.get("per_episode_success")
     seeds = payload.get("seeds", {})
+
+    if job.method == "base":
+        expected_checkpoint_sha = None
+        expected_checkpoint_schema = "base"
+    else:
+        dependency = _checkpoint_dependency(job)
+        if dependency is None:
+            raise RuntimeError(
+                f"Planning job lacks checkpoint dependency: {job.job_id}"
+            )
+        checkpoint = state["jobs"][dependency].get("artifact_validation")
+        if not isinstance(checkpoint, dict):
+            raise RuntimeError(
+                f"Planning checkpoint is not validated: {dependency}"
+            )
+        expected_checkpoint_sha = str(checkpoint["sha256"])
+        expected_checkpoint_schema = CHECKPOINT_SCHEMA_V2
+
+    expected_family = "identity" if job.domain == "clean" else "photometric"
     expected = {
         "backend": str(job.backend),
         "task": job.task,
@@ -302,6 +365,10 @@ def _validate_planning(state: dict[str, Any], job: JobSpec) -> dict[str, Any]:
         "cache_fingerprint": str(cache["cache_fingerprint"]),
         "cache_file_sha256": str(cache["cache_file_sha256"]),
         "evaluation_protocol_version": EVALUATION_PROTOCOL_VERSION,
+        "method_checkpoint_sha256": expected_checkpoint_sha,
+        "checkpoint_schema_version": expected_checkpoint_schema,
+        "evaluation_family": expected_family,
+        "severity": float(job.severity or 0.0),
     }
     actual = {
         "backend": payload.get("backend"),
@@ -316,11 +383,30 @@ def _validate_planning(state: dict[str, Any], job: JobSpec) -> dict[str, Any]:
         "evaluation_protocol_version": payload.get(
             "evaluation_protocol_version"
         ),
+        "method_checkpoint_sha256": payload.get(
+            "method_checkpoint_sha256"
+        ),
+        "checkpoint_schema_version": payload.get(
+            "checkpoint_schema_version"
+        ),
+        "evaluation_family": payload.get("evaluation_family"),
+        "severity": float(payload.get("severity", -1.0)),
     }
     if actual != expected:
         raise RuntimeError(
-            f"Cross-backend planning contract mismatch: expected={expected}, actual={actual}"
+            f"Cross-backend planning contract mismatch: "
+            f"expected={expected}, actual={actual}"
         )
+
+    if payload.get("training_appearance") != {
+        "family": "identity",
+        "strength": 0.0,
+        "training_input_domain": "clean",
+    }:
+        raise RuntimeError(
+            "Planning artifact does not declare clean-only adapter training"
+        )
+
     computed_success_count = sum(bool(value) for value in success)
     reported_success_count = int(payload.get("success_count", -1))
     reported_total = int(payload.get("total_episodes", -1))
@@ -332,12 +418,9 @@ def _validate_planning(state: dict[str, Any], job: JobSpec) -> dict[str, Any]:
         or abs(reported_rate - expected_rate) > 1.0e-12
     ):
         raise RuntimeError(
-            "Planning success summary is inconsistent with per_episode_success: "
-            f"reported_count={reported_success_count}, "
-            f"computed_count={computed_success_count}, "
-            f"reported_total={reported_total}, total={len(success)}, "
-            f"reported_rate={reported_rate}, expected_rate={expected_rate}"
+            "Planning success summary is inconsistent with per_episode_success"
         )
+
     cem = payload.get("cem", {})
     required_cem = {
         "iterations": 15,
@@ -347,20 +430,27 @@ def _validate_planning(state: dict[str, Any], job: JobSpec) -> dict[str, Any]:
         "num_act_stepped": 1,
         "candidate_chunk_size": 300,
     }
-    actual_cem = {key: int(cem.get(key, -1)) for key in required_cem}
+    actual_cem = {
+        key: int(cem.get(key, -1))
+        for key in required_cem
+    }
     if actual_cem != required_cem:
         raise RuntimeError(
-            f"Formal CEM contract mismatch: expected={required_cem}, actual={actual_cem}"
+            f"Formal CEM contract mismatch: "
+            f"expected={required_cem}, actual={actual_cem}"
         )
     if payload.get("goal_encoder") != "frozen_base":
-        raise RuntimeError("Planning goal must use the frozen Base encoder")
+        raise RuntimeError(
+            "Planning goal must use the frozen Base encoder"
+        )
     return {
         "path": str(resolve_path(job.artifact_path)),
         "sha256": sha256_file(job.artifact_path),
-        "success_count": sum(bool(value) for value in success),
+        "success_count": computed_success_count,
         "episodes": len(success),
         **expected,
     }
+
 
 
 def _validate(

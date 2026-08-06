@@ -1,5 +1,5 @@
 model_config: configs/model/jepa_wm_droid.yaml
-method_configs: &methods {base: configs/method/base.yaml, dct_adapter: configs/method/dct_adapter.yaml, token_mlp: configs/method/token_mlp.yaml, lora: configs/method/lora.yaml, hfra: configs/method/hfra.yaml, hfra_core_only: configs/method/hfra_core_only.yaml}
+method_configs: &methods {base: configs/method/base.yaml, token_mlp: configs/method/token_mlp.yaml, lora: configs/method/lora.yaml, hfra: configs/method/hfra.yaml, hfra_core_only: configs/method/hfra_core_only.yaml}
 method: hfra
 domain: ood
 device: cuda
@@ -16,9 +16,9 @@ paths:
   task_manifest: outputs/cross_backend_adapter_v1/manifests/tasks/libero_spatial_0.json
   evaluation_manifest: outputs/cross_backend_adapter_v1/manifests/evaluation/libero_spatial_0/seed_42.json
 data: {task_name: registry_task_0, camera_view: agentview, num_frames: 6, context_frames: 3, future_frames: 3, frameskip: 5, num_train_windows: 2000, episode_disjoint: true, train_fraction: 0.6, split_seed: 42, window_seed: 42, vertical_flip: true}
-appearance: {name: composed_photometric, pipeline_version: composed_photometric_v1, training_severity_min: 0.5, training_severity_max: 1.5, severity: 1.0, training_seed: 42, seed: 2026}
+appearance: {name: composed_photometric, pipeline_version: composed_photometric_v1, training_severity_min: 0.5, training_severity_max: 1.5, severity: 1.0, training_seed: 42, seed: 2026, evaluation_family: photometric}
 cache: {schema_version: jepa_wm_feature_cache_v2.1, encoder_batch_size: 4, num_workers: 4, verify_content_on_reuse: true, content_verification_chunk_windows: 8}
-training: &training {loss_name: unified_trajectory_mse, max_optimizer_steps: 2000, microbatch_windows: 2, views_per_window: 2, gradient_accumulation: 8, lr: 3.0e-4, betas: [0.9, 0.95], epsilon: 1.0e-8, weight_decay: 1.0e-4, warmup_steps: 100, scheduler: cosine, minimum_lr: 3.0e-5, gradient_clip_norm: 1.0, precision: bf16, num_workers: 4, seed: 42}
+training: &training {input_domain: clean, appearance_family: identity, loss_name: unified_trajectory_mse, max_optimizer_steps: 2000, microbatch_windows: 4, views_per_window: 1, gradient_accumulation: 8, lr: 3.0e-4, betas: [0.9, 0.95], epsilon: 1.0e-8, weight_decay: 1.0e-4, warmup_steps: 100, scheduler: cosine, minimum_lr: 3.0e-5, gradient_clip_norm: 1.0, precision: bf16, num_workers: 4, seed: 42}
 planning: {task_slug: libero_spatial_0, history_len: 3, candidate_chunk_size: 300, inference_precision: bf16, compile_predictor: true, allow_tf32: true, self_test: {iterations: 1, num_samples: 8, num_elites: 2, horizon: 1, max_episode_steps: 5}}
 offline: {metric_profile: cross_backend_mse_v1, num_frames: 6, num_windows: 200, seed: 42, shuffle_seed: 100045, negative_actions: 0, batch_size: 1, num_workers: 2, output_directory: outputs/cross_backend_adapter_v1/offline}
 evaluation: {num_episodes: 20, eval_seed: 42, max_episode_steps: 600, goal_span_steps: 0, episode_cap_basis: paired official LIBERO protocol, tqdm_silent: false}
