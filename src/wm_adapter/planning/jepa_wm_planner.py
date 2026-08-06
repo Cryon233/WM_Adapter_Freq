@@ -14,10 +14,10 @@ from omegaconf import DictConfig, OmegaConf
 from torch import Tensor, nn
 
 from wm_adapter.adapters.base import PEFTMethod
-from wm_adapter.appearance.composed_photometric import (
-    APPEARANCE_PIPELINE_VERSION,
-    AppearanceShiftSpec,
-    ComposedPhotometricShift,
+from wm_adapter.appearance.composed_photometric import APPEARANCE_PIPELINE_VERSION
+from wm_adapter.appearance.evaluation_corruptions import (
+    EvaluationCorruption,
+    build_evaluation_corruption,
 )
 from wm_adapter.backends.jepa_wm_droid import JEPAWMDroidBackend
 from wm_adapter.benchmarks.base import array_sha256
@@ -140,7 +140,7 @@ class JEPAWMPlanningModel(nn.Module):
         method: PEFTMethod,
         *,
         domain: str,
-        appearance_spec: AppearanceShiftSpec,
+        appearance_spec: EvaluationCorruption,
         inference_precision: str,
     ) -> None:
         super().__init__()
@@ -149,7 +149,6 @@ class JEPAWMPlanningModel(nn.Module):
         self.backend = backend
         self.method = method
         self.domain = domain
-        self.appearance = ComposedPhotometricShift()
         self.appearance_spec = appearance_spec
         self.inference_precision = inference_precision
         self._encoding_goal = False
@@ -176,7 +175,7 @@ class JEPAWMPlanningModel(nn.Module):
     def _current_only_shift(self, images: Tensor) -> Tensor:
         if self.domain == "clean" or self._encoding_goal:
             return images
-        shifted = [self.appearance.apply(sequence, self.appearance_spec) for sequence in images]
+        shifted = [self.appearance_spec.apply(sequence) for sequence in images]
         return torch.stack(shifted, dim=0)
 
     @torch.inference_mode()
@@ -478,8 +477,15 @@ def run_robocasa_planning(
             )
     else:
         cem_seed_mode = "per_instance"
-    appearance_spec = ComposedPhotometricShift().sample_spec(
-        int(experiment_config.appearance.seed), float(experiment_config.appearance.severity)
+    appearance_family = str(
+        experiment_config.appearance.get(
+            "evaluation_family", "photometric"
+        )
+    )
+    appearance_spec = build_evaluation_corruption(
+        family=appearance_family,
+        seed=int(experiment_config.appearance.seed),
+        strength=float(experiment_config.appearance.severity),
     )
     planning_model = JEPAWMPlanningModel(
         backend,
@@ -594,9 +600,12 @@ def run_robocasa_planning(
                 if cem_seed_mode == "per_instance":
                     agent.local_generator.manual_seed(cem_seed)
                     agent.local_gpu_generator.manual_seed(cem_seed)
-                planning_model.appearance_spec = ComposedPhotometricShift().sample_spec(
-                    int(instance["appearance_seed"]),
-                    float(experiment_config.appearance.severity),
+                planning_model.appearance_spec = build_evaluation_corruption(
+                    family=appearance_family,
+                    seed=int(instance["appearance_seed"]),
+                    strength=float(
+                        experiment_config.appearance.severity
+                    ),
                 )
             episode_number = episode + 1
             episode_started = time.perf_counter()
