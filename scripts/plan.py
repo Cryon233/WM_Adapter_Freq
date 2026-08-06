@@ -8,6 +8,7 @@ from omegaconf import OmegaConf
 
 from wm_adapter.adapters.factory import build_method
 from wm_adapter.appearance.composed_photometric import ComposedPhotometricShift
+from wm_adapter.appearance.evaluation_corruptions import evaluation_corruption_metadata
 from wm_adapter.backends.factory import build_backend
 from wm_adapter.benchmarks.factory import build_benchmark
 from wm_adapter.data.feature_cache import CACHE_SCHEMA_VERSION
@@ -360,8 +361,17 @@ def main() -> None:
             "appearance": int(cfg.appearance.seed),
             "cem": result.cem_seeds or [int(cfg.evaluation.eval_seed)],
         },
-        "appearance_metadata": ComposedPhotometricShift.metadata(
-            float(cfg.appearance.severity), int(cfg.appearance.seed)
+        "evaluation_family": str(
+            cfg.appearance.get("evaluation_family", "photometric")
+        ),
+        "appearance_metadata": evaluation_corruption_metadata(
+            family=str(
+                cfg.appearance.get(
+                    "evaluation_family", "photometric"
+                )
+            ),
+            seed=int(cfg.appearance.seed),
+            strength=float(cfg.appearance.severity),
         ),
         "runtime_seconds": result.elapsed_seconds,
         "evaluation_protocol_version": EVALUATION_PROTOCOL_VERSION,
