@@ -126,9 +126,11 @@ def load_method_checkpoint(path: str | Path) -> dict[str, Any]:
         "cache_fingerprint",
         "training_config",
     }
-    if payload.get("schema_version") in {
+    schema_version = payload.get("schema_version")
+    if schema_version in {
         "wm_adapter_checkpoint_v2",
         "wm_adapter_checkpoint_v2.1",
+        "wm_adapter_checkpoint_v2.2_clean_only",
     }:
         required.update(
             {
@@ -141,8 +143,18 @@ def load_method_checkpoint(path: str | Path) -> dict[str, Any]:
                 "goal_encoder",
             }
         )
-        if payload.get("schema_version") == "wm_adapter_checkpoint_v2.1":
+        if schema_version in {
+            "wm_adapter_checkpoint_v2.1",
+            "wm_adapter_checkpoint_v2.2_clean_only",
+        }:
             required.add("cache_file_sha256")
+        if schema_version == "wm_adapter_checkpoint_v2.2_clean_only":
+            required.update(
+                {
+                    "training_input_domain",
+                    "training_appearance_family",
+                }
+            )
     else:
         required.add("appearance_metadata")
     missing = sorted(required.difference(payload))
